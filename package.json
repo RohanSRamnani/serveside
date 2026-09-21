@@ -9,7 +9,8 @@
     "test": "vitest run",
     "typecheck": "next typegen && tsc --noEmit",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate"
+    "db:migrate": "drizzle-kit migrate",
+    "db:app-user": "node scripts/create-app-user.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
