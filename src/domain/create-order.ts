@@ -211,6 +211,15 @@ const NO_DISCOUNT_CENTS = 0
  */
 const MAX_LINES_PER_ORDER = 100
 const MAX_QTY_PER_LINE = 999
+/**
+ * Length cap for the two optional free-text fields the client controls —
+ * `contact.email` and a line's `notes`. Not a business rule, same shape of guard
+ * as the two bounds above: nobody's email or special-instruction text is
+ * legitimately this long, so it is here to turn a wildly oversized string into a
+ * named rejection. No existing length cap elsewhere in this file to stay
+ * consistent with, so 500 is a generous, arbitrary bound.
+ */
+const MAX_TEXT_FIELD_LENGTH = 500
 
 export async function createOrder(input: CreateOrderInput): Promise<CreateOrderResult> {
   assertInputShape(input)
@@ -336,6 +345,13 @@ function assertInputShape(input: CreateOrderInput): void {
   if (input.fulfillment !== 'pickup') {
     throw new InvalidOrderInputError(`Only pickup orders are supported, got ${JSON.stringify(input.fulfillment)}`)
   }
+  // A different flavor of the same hazard: `channel` is a Postgres enum
+  // (`order_channel`), so an unrecognised value would not fail here at all — it
+  // would sail through the pricing read, burn a whole transaction, and only then
+  // 22P02 at the INSERT. Checked as a literal, like payment and fulfillment above.
+  if (input.channel !== 'web' && input.channel !== 'voice' && input.channel !== 'sms') {
+    throw new InvalidOrderInputError(`Unknown channel ${JSON.stringify(input.channel)}`)
+  }
   if (!Number.isSafeInteger(input.tipCents) || input.tipCents < 0) {
     throw new InvalidOrderInputError(`Tip must be a whole number of cents and not negative, got ${input.tipCents}`)
   }
@@ -343,6 +359,17 @@ function assertInputShape(input: CreateOrderInput): void {
   // chases a no-show pickup — so a blank one is not a valid order.
   if (input.contact.name.trim() === '') throw new InvalidOrderInputError('An order needs a contact name')
   if (input.contact.phone.trim() === '') throw new InvalidOrderInputError('An order needs a contact phone number')
+  // Lower stakes than channel — `contact_email` is a nullable text column, so
+  // there is no constraint for a wrong-typed value to violate — but still a value
+  // the client fully controls reaching storage with no shape check at all today.
+  if (input.contact.email !== undefined) {
+    if (typeof input.contact.email !== 'string') {
+      throw new InvalidOrderInputError('Contact email must be a string when present')
+    }
+    if (input.contact.email.length > MAX_TEXT_FIELD_LENGTH) {
+      throw new InvalidOrderInputError(`Contact email must be at most ${MAX_TEXT_FIELD_LENGTH} characters`)
+    }
+  }
 
   for (const line of input.items) {
     assertUuid('menuItemId', line.menuItemId)
@@ -371,6 +398,16 @@ function assertInputShape(input: CreateOrderInput): void {
         )
       }
       seen.add(optionId)
+    }
+    // Same as the email check above: `notes` is a nullable text column with
+    // nothing to stop a non-string value reaching it unchecked.
+    if (line.notes !== undefined) {
+      if (typeof line.notes !== 'string') {
+        throw new InvalidOrderInputError('Line notes must be a string when present')
+      }
+      if (line.notes.length > MAX_TEXT_FIELD_LENGTH) {
+        throw new InvalidOrderInputError(`Line notes must be at most ${MAX_TEXT_FIELD_LENGTH} characters`)
+      }
     }
   }
 }

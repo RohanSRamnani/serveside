@@ -560,6 +560,16 @@ describe('createOrder — server-side validation', () => {
     expect(await orderCount(loc.id)).toBe(0)
   })
 
+  it('refuses a channel it does not recognise', async () => {
+    const loc = await openRestaurant()
+    // Same hazard as payment/fulfillment above, one column over: `channel` is a
+    // Postgres enum, so an unrecognised value would sail past every other check,
+    // burn the whole pricing read, and only then 22P02 at the INSERT.
+    await expect(createOrder({ ...planOrder(loc), channel: 'carrier-pigeon' } as unknown as CreateOrderInput))
+      .rejects.toThrow(InvalidOrderInputError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
   it('refuses a blank contact name or phone', async () => {
     const loc = await openRestaurant()
     // The phone is the whole identity of a guest order — it is how a kitchen chases
@@ -568,6 +578,37 @@ describe('createOrder — server-side validation', () => {
       .rejects.toThrow(InvalidOrderInputError)
     await expect(createOrder(planOrder(loc, { contact: { name: 'Rohan R', phone: '' } })))
       .rejects.toThrow(InvalidOrderInputError)
+  })
+
+  it('refuses a non-string contact email or line note', async () => {
+    const loc = await openRestaurant()
+    // Both are nullable text columns with no shape check of their own — a number
+    // or object here must not reach `contact_email`/`notes` unvalidated.
+    await expect(createOrder(planOrder(loc, {
+      contact: { name: 'Rohan R', phone: '+15551234567', email: 12345 as unknown as string },
+    }))).rejects.toThrow(InvalidOrderInputError)
+    await expect(createOrder(planOrder(loc, {
+      items: [{
+        menuItemId: item(loc, 'Butter Chicken').id, qty: 1,
+        modifierOptionIds: [option(loc, 'Hot').id], notes: 42 as unknown as string,
+      }],
+    }))).rejects.toThrow(InvalidOrderInputError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('refuses a contact email or line note past the length cap', async () => {
+    const loc = await openRestaurant()
+    const tooLong = 'x'.repeat(501)
+    await expect(createOrder(planOrder(loc, {
+      contact: { name: 'Rohan R', phone: '+15551234567', email: tooLong },
+    }))).rejects.toThrow(InvalidOrderInputError)
+    await expect(createOrder(planOrder(loc, {
+      items: [{
+        menuItemId: item(loc, 'Butter Chicken').id, qty: 1,
+        modifierOptionIds: [option(loc, 'Hot').id], notes: tooLong,
+      }],
+    }))).rejects.toThrow(InvalidOrderInputError)
+    expect(await orderCount(loc.id)).toBe(0)
   })
 
   it('writes nothing at all when one line of a multi-line order is rejected', async () => {

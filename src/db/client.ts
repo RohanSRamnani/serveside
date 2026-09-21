@@ -7,11 +7,12 @@ import * as schema from './schema'
  * The stateless connection: one HTTPS round trip per statement, no session, no
  * transactions (`db().transaction()` throws).
  *
- * **Not for location-scoped data.** Menus, snapshots and orders are under RLS,
- * and the policies read a GUC that only survives inside a transaction — which
- * this driver cannot open. A read here returns zero rows and a write is refused
- * with 42501. Use `withLocation` from `@/repo/scoped` for those; `db()` is for
- * organizations, locations, memberships and the hours tables.
+ * **Not for location-scoped data.** Menus, snapshots, orders and hours are
+ * under RLS, and the policies read a GUC that only survives inside a
+ * transaction — which this driver cannot open. A read here returns zero rows
+ * and a write is refused with 42501. Use `withLocation` from `@/repo/scoped`
+ * for those; `db()` is for the five tables with no `location_id` to scope to:
+ * organizations, locations, memberships, webhook_events and printer_probe_events.
  */
 
 let _db: ReturnType<typeof make> | null = null

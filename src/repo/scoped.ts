@@ -5,9 +5,13 @@ import { env } from '@/lib/env'
 import * as schema from '@/db/schema'
 
 /**
- * The tenant-scoped connection. Everything that touches a location's menus or
- * orders goes through `withLocation`; `db()` (neon-http) stays for the tables that
- * are not location-scoped — organizations, locations, memberships, hours.
+ * The tenant-scoped connection. Everything that touches a location's menus,
+ * orders or hours goes through `withLocation`; `db()` (neon-http) stays for the
+ * tables that carry no `location_id` to scope to at all — `organizations`,
+ * `locations`, `memberships`, `webhook_events`, `printer_probe_events`. Hours
+ * (`business_hours`, `holiday_closures`, `order_pauses`) moved under RLS in
+ * migration 0009 — an unscoped read of them now returns zero rows, same as
+ * menus and orders.
  *
  * **Why a second driver at all.** RLS reads the current location out of a session
  * GUC, and a GUC only survives inside a transaction (`SET LOCAL`). The neon-http
@@ -66,7 +70,8 @@ async function assertUnprivilegedRole(): Promise<void> {
   throw new Error(
     `DATABASE_URL connects as "${row.who}", which bypasses row-level security: ${reasons.join('; ')}. `
     + 'Every tenancy policy is silently inert for this role. Point DATABASE_URL at app_user '
-    + '(npm run db:app-user) and keep the owner in MIGRATION_DATABASE_URL, which only drizzle-kit reads.',
+    + '(npm run db:app-user) and keep the owner in MIGRATION_DATABASE_URL, which drizzle-kit and '
+    + "scripts/seed-kashi.ts's admin connection read — nothing else may.",
   )
 }
 

@@ -276,7 +276,9 @@ describe('POST /api/orders', () => {
     // `input.contact.name` before it can: a body that parses as JSON and is missing
     // either one throws a TypeError, which this route would map to an opaque 500 — a
     // client-triggerable 500 on the one public write path. Each of these is a shape
-    // the domain would have tripped over.
+    // the domain would have tripped over — either a missing container, or (the last
+    // three) a value `assertInputShape` never checked and that reached a Postgres
+    // enum or a text column unvalidated.
     const loc = await openRestaurant()
     const malformed: Record<string, unknown>[] = [
       { locationId: loc.id, payment: 'card', fulfillment: 'pickup', tipCents: 0, contact: { name: 'A', phone: '+1' } },
@@ -286,6 +288,13 @@ describe('POST /api/orders', () => {
       // Present but not iterable. Absence is legal (see the test below); a number is
       // not, and it must be a coded 422 rather than a TypeError deeper in.
       { ...cartFor(loc), items: [{ menuItemId: loc.items[0].id, qty: 1, modifierOptionIds: 123 }] },
+      // `channel` is a Postgres enum: unchecked, this would burn the full pricing
+      // read and 22P02 at the INSERT instead of failing here with a code.
+      { ...cartFor(loc), channel: 'carrier-pigeon' },
+      // `contact.email` and a line's `notes` are nullable text columns with no
+      // shape check of their own — a non-string value must still be a coded 422.
+      { ...cartFor(loc), contact: { ...(cartFor(loc).contact as Record<string, unknown>), email: 12345 } },
+      { ...cartFor(loc), items: [{ menuItemId: loc.items[0].id, qty: 1, notes: 42 }] },
     ]
     for (const body of malformed) {
       const res = await post(body)
