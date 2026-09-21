@@ -30,6 +30,10 @@ import { sendOrderCreated } from '@/inngest/client'
  * order — is success, logged. A 5xx is reserved for the failures a retry could
  * genuinely fix, and those release the claim on the way out so the retry lands on a
  * clean id rather than a burnt one.
+ *
+ * **One "already done" state is not done**: an order we flipped ourselves whose
+ * fan-out never landed. That one re-announces rather than shrugging — see
+ * {@link FlipOutcome}.
  */
 
 /** Stripe never sends a body big enough to want streaming, and never sends anything but JSON. */
@@ -85,8 +89,10 @@ export async function POST(req: Request): Promise<Response> {
   } catch (err) {
     // The claim is released so Stripe's retry is not delivered onto a burnt id. Note
     // what this does *not* undo: a flip that already committed stays committed, which
-    // is correct — the money really did move — and the retry then reads as the
-    // legal-state no-op below.
+    // is correct — the money really did move. The retry then finds an order that is
+    // already NEW and holds this intent, which is the `re-fired` branch below: it is
+    // how a fan-out that failed here (the most likely reason to be in this catch)
+    // eventually reaches a kitchen.
     console.error('[stripe webhook] handling failed, releasing claim:', event.id, err)
     await release(event.id)
     return Response.json({ error: 'handler_failed' }, { status: 500 })
@@ -121,6 +127,19 @@ async function release(externalId: string): Promise<void> {
 }
 
 /**
+ * What one delivery did to the order, and therefore whether the kitchen still has to
+ * be told.
+ *
+ * `re-fired` exists because "we already flipped it" is **not** the same as "the
+ * kitchen knows". The fan-out happens after the commit, so a crash — or a 500 out of
+ * this handler — can leave an order paid, flipped, and never announced. Stripe's
+ * retry then finds it already NEW. Re-announcing is safe because the fan-out is
+ * idempotent per order (`sendOrderCreated` keys the event on the order id), and it is
+ * the only thing that closes that window.
+ */
+type FlipOutcome = 'flipped' | 're-fired' | 'nothing-to-do'
+
+/**
  * PENDING_PAYMENT → NEW, paymentStatus → PAID, and a promised ready time — one
  * transaction, three facts that are really one: the kitchen owns this order now.
  *
@@ -146,7 +165,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
   // moment we recorded the payment must not come from two different clocks.
   const paidAt = new Date()
 
-  const flipped = await withLocation(locationId, async (tx) => {
+  const outcome = await withLocation(locationId, async (tx): Promise<FlipOutcome> => {
     // FOR UPDATE: two deliveries about one order — `payment_intent.succeeded` and
     // some future second handler — must not both read PENDING_PAYMENT and both flip.
     // The idempotency claim covers a repeat of the *same* event; this covers the rest.
@@ -156,7 +175,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     // as "not there" — which is exactly the right answer, and not a 500.
     if (!order) {
       console.error('[stripe webhook] no order', orderId, 'in location', locationId, 'for intent', intent.id)
-      return false
+      return 'nothing-to-do'
     }
     // `locations` is not under RLS, and is read on `tx` so the prep time that makes the
     // promise — and the account the money is checked against — are the ones in force in
@@ -185,7 +204,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         '[stripe webhook] intent', intent.id, 'originated on account', event.account,
         'but location', locationId, 'banks with', location.stripeAccountId, '— refusing to flip',
       )
-      return false
+      return 'nothing-to-do'
     }
     // 2. The amount paid must be the amount owed. Cheap, and it is the check that
     //    turns "wrong payment" into "no payment" rather than a free dinner.
@@ -194,7 +213,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         '[stripe webhook] intent', intent.id, 'paid', intent.amount,
         'but order', orderId, 'totals', order.totalCents, '— refusing to flip',
       )
-      return false
+      return 'nothing-to-do'
     }
     // 3. The order already named a different intent. Marking it paid against a payment
     //    that is not its own is a money error, so it fails closed rather than guessing
@@ -204,26 +223,38 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         '[stripe webhook] order', orderId, 'holds intent', order.stripePaymentIntentId,
         'but the event is about', intent.id, '— refusing to flip',
       )
-      return false
+      return 'nothing-to-do'
     }
 
     // A legal state, not a failure: already flipped by an earlier delivery, or
     // cancelled while the customer was paying (which is a refund's problem, not the
     // state machine's). `transition` would throw here, and a throw means a 5xx, and a
     // 5xx means Stripe retries this forever.
-    //
-    // TODO(task-10): this early return is what makes a failed fan-out unrecoverable,
-    // and it is the blocker — not the stub. When `sendOrderCreated` becomes an Inngest
-    // send keyed on `orderId` (idempotent per order), change this branch to **re-fire
-    // `sendOrderCreated(orderId, locationId)` and return true** when the order is
-    // already NEW *and* `order.stripePaymentIntentId === intent.id` *and*
-    // `paymentStatus === 'PAID'` — i.e. we flipped it ourselves and the caller never
-    // got our 200. Idempotency is what makes the re-fire safe; until it exists, a
-    // re-fire would print a second ticket, so this stays a no-op. Leave every other
-    // status (CANCELED, ACCEPTED, …) returning false.
     if (order.status !== 'PENDING_PAYMENT') {
+      // **The one case that is not a no-op: we flipped this order ourselves, and the
+      // fan-out after it never happened** — this handler died, or answered 500 and
+      // Stripe is retrying. The order is paid and NEW and no kitchen has heard of it,
+      // and without this branch nothing ever tells them: a later delivery finds a
+      // legal state and stops, forever.
+      //
+      // Three conjuncts, all required, because "already NEW" on its own proves
+      // nothing. NEW + PAID + *this* intent is the fingerprint of our own flip: a
+      // pay-at-pickup order is NEW and holds no intent, and a CANCELED or COMPLETED
+      // one must never be re-announced to a kitchen that is done with it.
+      //
+      // Safe only because `sendOrderCreated` is idempotent per order (it keys the
+      // Inngest event on the order id) and the print leg dedupes in the database.
+      // Without both, this would print a second ticket on every retry.
+      if (order.status === 'NEW' && order.paymentStatus === 'PAID'
+        && order.stripePaymentIntentId === intent.id) {
+        console.warn(
+          '[stripe webhook] order', orderId, 'was already flipped for intent', intent.id,
+          '— re-firing the fan-out in case the first one never landed',
+        )
+        return 're-fired'
+      }
       console.warn('[stripe webhook] order', orderId, 'is', order.status, '— nothing to flip')
-      return false
+      return 'nothing-to-do'
     }
 
     // The machine decides the move and hands back the event to append with it — the
@@ -258,16 +289,17 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         },
       },
     ])
-    return true
+    return 'flipped'
   })
 
-  // TODO(task-10): see the marker on the status branch above — this guard is the other
-  // half of it. Once the fan-out is idempotent per order, the already-NEW-and-ours case
-  // returns true and falls through to the re-fire below.
-  if (!flipped) return
+  if (outcome === 'nothing-to-do') return
 
   // **After the commit, never inside it.** The fan-out reads the order row it is told
   // about; fired from inside the transaction it would be handed an id that is not
   // visible yet — or one that a rollback un-writes.
+  //
+  // It throws on failure, which is what makes the handler above release its claim and
+  // answer 5xx: a fan-out that did not happen has to be retried, and the retry lands
+  // on the `re-fired` branch.
   await sendOrderCreated(orderId, locationId)
 }

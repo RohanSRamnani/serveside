@@ -92,6 +92,13 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   client are read *outside* the verification `try`, because caught by it a blank
   `STRIPE_WEBHOOK_SECRET` would answer every real payment `400 invalid_signature` and
   silently flip nothing.
+- **One "already done" state is not done: NEW + PAID + holding *this* intent.** That is
+  the fingerprint of a flip we made whose fan-out never landed — the fan-out runs after
+  the commit, so a crash or a 500 in between loses it — and the webhook **re-fires
+  `sendOrderCreated`** rather than shrugging, or every later delivery finds a legal
+  state and nobody is ever told. All three conjuncts are required: a pay-at-pickup order
+  is NEW and paid too, and a CANCELED one must never be re-announced to a kitchen. Safe
+  only because the fan-out is idempotent per order (see the fan-out rule below).
 - **A signed event proves Stripe sent it, not whose money it is.** Every restaurant on
   the platform has a connected account and can mint an intent with any metadata, so
   the flip additionally requires `event.account === location.stripeAccountId` and
@@ -119,6 +126,19 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   steals a ticket (name + phone) and can confirm it so it never prints. The serial is
   clamped to a plausible shape before it is queried or logged; the throttle and the
   unprovisioned-serial-burst alert are Task 14's, marked `TODO(task-14)` in the route.
+- **The order fan-out (`src/inngest/order-created.ts`) is two INDEPENDENT steps, and
+  that independence is the point.** `queue-print-job` and `sms-owner` run under one
+  `Promise.allSettled`, so a jammed printer still texts the owner and a dead Twilio
+  account still queues the ticket — never sequential, which would make the SMS wait out
+  the print leg's whole retry ladder. Each leg re-reads the order inside its own
+  `withLocation`; nothing about the order travels in the event (ids only — an event
+  payload lives in Inngest's dashboard). The run still **throws** when a leg fails, or a
+  half-done fan-out would show green. **Idempotent three ways**, because all three are
+  needed: the event id (`order-created-${orderId}`) dedupes a re-fire for 24h, the print
+  leg skips when a job for the order already exists, and a `pg_advisory_xact_lock` on
+  the order id makes that check-then-insert safe — Inngest steps are *at-least-once* and
+  can genuinely run twice, concurrently. The SMS leg is deliberately **not** deduped: a
+  duplicate text is a nuisance, a duplicate ticket is food.
 - **`renderTicket` (`src/domain/ticket.ts`) runs once, at fan-out, and its output is
   stored verbatim** in `print_jobs.payload` — same reasoning as `orders.menu_snapshot_id`:
   a reprint must reproduce the ticket that printed, not re-render against a menu that
@@ -139,6 +159,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 
 - `npx vitest run` — the suite. Serial by design (`fileParallelism: false`): DB tests
   share the single Neon `test` branch, so they are not isolated from each other.
+- `npx inngest-cli dev` — the local orchestrator. No account, no keys: it discovers
+  `/api/inngest`, runs the fan-out for real and shows each step and its failures.
+  `INNGEST_EVENT_KEY` / `INNGEST_SIGNING_KEY` are cloud-only.
 - `npm run typecheck` — `next typegen && tsc --noEmit`. Bare `tsc` fails; `LayoutProps`
   and the other route types only exist after typegen.
 - `npx drizzle-kit generate`, then `npm run db:migrate`. `drizzle.config.ts` loads the
@@ -161,7 +184,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 
 - `.env.local` is the Neon `main` branch, `.env.test` is the `test` branch. Both are
   gitignored — do not commit `.env.test` even though the Next docs say to; it holds a
-  live connection string.
+  live connection string. `TWILIO_*` are deliberately **absent** from `.env.test`,
+  unlike the Stripe placeholders: the suite mocks `sendSms`, so a test that reaches the
+  real one has forgotten to — and with no credentials that is a loud `env()` throw
+  instead of a text message sent from CI.
 - `vitest.config.mts`, not `.ts`: this package is CommonJS and Vite's native config
   loader rejects ESM syntax in a `.ts` config.
 - `@types/node` stays on `^22` (Node 22, and vitest 5 peer-requires it). The Next
@@ -206,6 +232,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test
   of `createOrder` needs: it asks `isOpenAt(new Date())`, so hours pinned to one weekday
   would only pass on that weekday.
+- **Inngest 4 is not the API you remember.** It is
+  `createFunction({ id, triggers: { event } }, handler)` — one options object, two
+  arguments. The v3 three-argument form throws at import, and `EventSchemas` is gone
+  (v4 has `eventType()` over a Standard Schema; we shape-check ids by hand instead, the
+  way the Stripe webhook does).
+- **`@inngest/test` is a harness, not the orchestrator**, and two differences bite.
+  It settles a run the moment a step errors, while the sibling step is still mid-write
+  — so an assertion about the *other* leg has to wait (`vi.waitFor`), and a stray step
+  can land during the next test (hence per-test phone numbers in
+  `order-created.test.ts`). And it re-executes steps whose results have not reached its
+  shared state, so step call *counts* are not pinnable; assert side effects and
+  arguments. A mocked step that throws is **not** delivered to the function body, so
+  the "a leg exhausted its retries" path cannot be driven at all — `fanOutFailure` is
+  exported and unit-tested for that reason.
 - **Route handlers are tested by importing and calling them**, not through a server:
   `const { POST } = await import('./webhook/route')`, then `POST(new Request(...))`.
   They take a Web `Request` and return a Web `Response`, with nothing imported from
