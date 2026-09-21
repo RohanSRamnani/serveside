@@ -50,10 +50,14 @@ export const holidayClosures = pgTable('holiday_closures', {
 /**
  * The "we're slammed, stop taking orders" button, with auto-resume.
  *
- * Rows are append-only in spirit — `until` is what expires a pause, so a stale
- * row can never keep a location dark, and the history of how often a kitchen had
- * to pause survives. Resuming early means writing a new row with `until` in the
- * past, not deleting the old one.
+ * `until` is what expires a pause, so a stale row can never keep a location dark and
+ * no job has to remember to lift one.
+ *
+ * **Resuming early shortens the live rows' `until` to now** (`DELETE /api/pause`) —
+ * not a delete, and *not* a new row with a past `until`: `isOpenAt` reports paused if
+ * **any** row has `until > now`, so an extra row cannot cancel an existing one. Every
+ * live row is shortened, because two taps in a rush is two rows. What that preserves
+ * is the history — the reason, the moment, and who stopped taking orders.
  */
 export const orderPauses = pgTable('order_pauses', {
   id: uuid('id').primaryKey().defaultRandom(),

@@ -26,8 +26,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
   Orders pin the **current** snapshot (`getOrBuildCurrentSnapshot`), never a fresh build
   per order — so anything that changes what may be ordered or what it costs (86'ing,
-  repricing, retiring an item) must rebuild the snapshot, or the pinned price evidence
-  goes stale while orders keep charging live prices.
+  repricing, retiring an item) must rebuild the snapshot **in the same transaction as
+  the change**, or the pinned price evidence goes stale while orders keep charging live
+  prices.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
@@ -210,6 +211,30 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `close_time > open_time` CHECK enforces — a wrapped row would close the day. `isOpenAt`
   reads wall-clock times in `locations.timezone` — never the server's — treats
   `close_time` as exclusive, and reports **paused > holiday > closed_hours**.
+- **The 86 button undoes itself, and every 86 rebuilds the snapshot in the same
+  transaction as the toggle.** `POST /api/menu/86?location=<slug>`
+  `{ itemId | modifierOptionId, until: 'tomorrow' | 'manual' }`; `DELETE` puts it back
+  and clears the deadline with the flag. `'tomorrow'` stores
+  `nextLocalHour(now, location.timezone, 6)` — 6am *at the restaurant*, DST-safe;
+  `now + 24h` would put a dish 86'd at 9pm back a whole service late. The hourly
+  Inngest cron `unsnooze` (`0 * * * *`, **UTC** — every restaurant has its own 6am,
+  what they share is an instant) clears `unsnooze_at <= now` on items **and** modifier
+  options and rebuilds each affected location's snapshot in that location's
+  transaction. An indefinite 86 has `unsnooze_at` NULL and survives for free
+  (`NULL <= now` is NULL, not true). It scans **every** location, because
+  `menu_items` carries no `location_id` and an unscoped read under RLS returns
+  nothing — fine into the low hundreds; past that the fix is a second SECURITY
+  DEFINER function, which has to be argued for by name in `rls.test.ts`. Two steps
+  per run, never one per location: that would be `locations × 24 × 30` steps a month
+  of almost entirely nothing, and per-location retries come free from the clear being
+  the state change the rebuild is gated on. **A function not in
+  `src/inngest/functions.ts` is never invoked**, and a cron has no event to go missing.
+- **`POST /api/pause?location=<slug>` `{ minutes, reason? }` is the "we're slammed"
+  switch**, and `DELETE` resumes by **shortening every live row's `until` to now** —
+  not deleting it, and not inserting a row with a past `until`: `isOpenAt` reports
+  paused if *any* row has `until > now`, so a new row cannot cancel an old one, and
+  two taps in a rush is two rows. `created_by` is the Clerk user id; null there means
+  the system paused it, which must stay tellable apart.
 
 ## Commands
 
@@ -238,6 +263,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 
 ## Gotchas
 
+- **`withLocation` commits on a return and rolls back only on a throw.** A refusal
+  decided *after* a write — the 86 route's `menu_unavailable`, which it can only know
+  once the toggle has run — must be **thrown** out of the callback and caught by the
+  route, or the write it meant to undo is committed. Checking beforehand instead would
+  also make the atomicity test pass against a route that used two transactions.
 - `.env.local` is the Neon `main` branch, `.env.test` is the `test` branch. Both are
   gitignored — do not commit `.env.test` even though the Next docs say to; it holds a
   live connection string. `TWILIO_*` are deliberately **absent** from `.env.test`,

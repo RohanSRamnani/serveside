@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isOpenAt } from './hours'
+import { isOpenAt, nextLocalHour } from './hours'
 import { businessHours, holidayClosures, orderPauses } from '@/db/schema'
 import { seedLocation } from '@/test/seed'
 import { withLocation } from '@/repo/scoped'
@@ -191,5 +191,59 @@ describe('isOpenAt', () => {
   it('refuses to guess for an unknown location', async () => {
     await expect(isOpenAt('00000000-0000-0000-0000-000000000000', TUE_18_00_ET))
       .rejects.toThrow(/unknown location/i)
+  })
+})
+
+/**
+ * "86 until tomorrow" is 6am at the restaurant, and the restaurant's own clock is the
+ * only one that can say when that is. A naive `now + 24h` puts a dish 86d at 9pm back
+ * at 9pm tomorrow — a whole service late — and a naive "midnight + 6h" is an hour
+ * wrong on two days a year, in whichever direction hurts.
+ */
+describe('nextLocalHour', () => {
+  const NEW_YORK = 'America/New_York'
+
+  it('is later today when the hour has not come round yet', () => {
+    // 01:00 EDT Tuesday → 06:00 EDT the same morning.
+    expect(nextLocalHour(new Date('2026-09-22T05:00:00Z'), NEW_YORK, 6).toISOString())
+      .toBe('2026-09-22T10:00:00.000Z')
+  })
+
+  it('is tomorrow once the hour has passed', () => {
+    // 16:00 EDT Tuesday → 06:00 EDT Wednesday.
+    expect(nextLocalHour(new Date('2026-09-22T20:00:00Z'), NEW_YORK, 6).toISOString())
+      .toBe('2026-09-23T10:00:00.000Z')
+  })
+
+  it('is tomorrow on the stroke of the hour itself, never right now', () => {
+    // Strictly in the future: an unsnooze that is already due is a 86 that never
+    // happened — the hourly job would clear it at the top of the next hour.
+    expect(nextLocalHour(new Date('2026-09-22T10:00:00Z'), NEW_YORK, 6).toISOString())
+      .toBe('2026-09-23T10:00:00.000Z')
+  })
+
+  it('lands on 6am local across a spring-forward, not 23 or 25 hours later', () => {
+    // 17:00 EST Saturday, the night the clocks go forward. 06:00 the next morning is
+    // EDT: thirteen hours on the wall, but only twelve of them actually happen.
+    const at = new Date('2027-03-13T22:00:00Z')
+    const next = nextLocalHour(at, NEW_YORK, 6)
+    expect(next.toISOString()).toBe('2027-03-14T10:00:00.000Z')
+    expect(next.getTime() - at.getTime()).toBe(12 * 60 * 60_000)
+  })
+
+  it('lands on 6am local across a fall-back', () => {
+    // 18:00 EDT Saturday; 06:00 the next morning is EST — twelve hours on the wall,
+    // thirteen in real time, because 1am happens twice.
+    const at = new Date('2026-10-31T22:00:00Z')
+    const next = nextLocalHour(at, NEW_YORK, 6)
+    expect(next.toISOString()).toBe('2026-11-01T11:00:00.000Z')
+    expect(next.getTime() - at.getTime()).toBe(13 * 60 * 60_000)
+  })
+
+  it('handles a zone whose offset is not a whole number of hours', () => {
+    // Asia/Kolkata is UTC+5:30, so 06:00 local is 00:30Z — the case that fails the
+    // moment anyone does this arithmetic in whole hours.
+    expect(nextLocalHour(new Date('2026-09-22T20:00:00Z'), 'Asia/Kolkata', 6).toISOString())
+      .toBe('2026-09-23T00:30:00.000Z')
   })
 })

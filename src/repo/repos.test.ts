@@ -155,18 +155,53 @@ describe('menuRepo', () => {
       .rejects.toThrow(/more than one active menu/i)
   })
 
-  it('86s an item until a time', async () => {
+  it('86s a dish or a topping until a time, and puts either back', async () => {
+    // One method for both tables, because they are one action to the person tapping:
+    // running out of paneer is as ordinary as running out of a dish.
     const loc = await seedLocationWithMenu()
     const until = new Date(Date.now() + 86_400_000)
-    const updated = await withLocation(loc.id, (tx) => menuRepo(tx).set86(loc.items[0].id, until))
-    expect(updated?.is86d).toBe(true)
-    expect(updated?.unsnoozeAt?.getTime()).toBe(until.getTime())
+
+    const item = await withLocation(loc.id, (tx) => menuRepo(tx).set86({ kind: 'item', id: loc.items[0].id }, until))
+    expect(item?.is86d).toBe(true)
+    expect(item?.unsnoozeAt?.getTime()).toBe(until.getTime())
+
+    const option = loc.modifierOptions[0]
+    const snoozed = await withLocation(loc.id, (tx) => menuRepo(tx).set86({ kind: 'option', id: option.id }, until))
+    expect(snoozed?.is86d).toBe(true)
+    expect(snoozed?.unsnoozeAt?.getTime()).toBe(until.getTime())
+
+    // Cleared *with* the flag: a deadline left behind would give the hourly job a row
+    // to clear — and a snapshot to rebuild — every hour, for a menu nobody changed.
+    const back = await withLocation(loc.id, (tx) => menuRepo(tx).clear86({ kind: 'option', id: option.id }))
+    expect(back?.is86d).toBe(false)
+    expect(back?.unsnoozeAt).toBeNull()
+  })
+
+  it('clears only the 86s whose snooze has run out, and never an indefinite one', async () => {
+    // `unsnooze_at` NULL means "not this season", and `NULL <= now` is NULL rather
+    // than true — so those rows survive. This is the whole correctness of the job.
+    const loc = await seedLocationWithMenu()
+    await withLocation(loc.id, (tx) => menuRepo(tx).set86({ kind: 'item', id: loc.items[0].id }, new Date(Date.now() - 1000)))
+    await withLocation(loc.id, (tx) => menuRepo(tx).set86({ kind: 'item', id: loc.items[1].id }, null))
+
+    const cleared = await withLocation(loc.id, (tx) => menuRepo(tx).clearExpired86s(new Date()))
+    expect(cleared).toEqual({ items: 1, options: 0 })
+
+    const [expired] = await withLocation(loc.id, (tx) => tx.select().from(menuItems).where(eq(menuItems.id, loc.items[0].id)))
+    expect(expired.is86d).toBe(false)
+    expect(expired.unsnoozeAt).toBeNull()
+    const [indefinite] = await withLocation(loc.id, (tx) => tx.select().from(menuItems).where(eq(menuItems.id, loc.items[1].id)))
+    expect(indefinite.is86d).toBe(true)
+
+    // Nothing left to clear, so nothing reads as a change — which is what stops the
+    // job rebuilding a snapshot every hour for a menu that did not move.
+    expect(await withLocation(loc.id, (tx) => menuRepo(tx).clearExpired86s(new Date()))).toEqual({ items: 0, options: 0 })
   })
 
   it('cannot 86 another location\'s item, and says so by updating nothing', async () => {
     const locA = await seedLocationWithMenu()
     const locB = await seedLocationWithMenu()
-    const updated = await withLocation(locB.id, (tx) => menuRepo(tx).set86(locA.items[0].id, null))
+    const updated = await withLocation(locB.id, (tx) => menuRepo(tx).set86({ kind: 'item', id: locA.items[0].id }, null))
     expect(updated).toBeUndefined()
 
     // And the dish really is still on sale at the restaurant that owns it. This is

@@ -93,12 +93,80 @@ async function readState(
 
 /** The instant as the wall clock reads it at the location: day of week + HH:MM:SS. */
 function localWallClock(at: Date, timeZone: string): { dow: number; time: string } {
+  const local = localParts(at, timeZone)
+  const dow = DOW_BY_WEEKDAY[local.weekday]
+  if (dow === undefined) throw new Error(`Unrecognised weekday ${local.weekday} for timezone ${timeZone}`)
+  return { dow, time: `${local.hh}:${local.mm}:${local.ss}` }
+}
+
+/**
+ * The next instant at which the clock **at the location** reads `hour:00:00` —
+ * strictly after `at`, and never more than about a day and a bit away.
+ *
+ * This is what "86 until tomorrow" means. The two wrong answers it exists to rule out
+ * are both plausible-looking arithmetic: `at + 24h` puts a dish 86'd at 9pm back at
+ * 9pm tomorrow, a whole service late, and "local midnight + 6h" is an hour out on the
+ * two days a year the clocks move — in March it would put the dish back at 5am and in
+ * November at 7am, which is the middle of prep either way.
+ *
+ * So the wall clock is read through `Intl` in the location's zone, the calendar day is
+ * chosen there, and the instant is recovered by correcting for the offset actually in
+ * force **at that instant** rather than the one in force now. Two passes settle it:
+ * the first guess is at most one DST shift out, which cannot carry it across a second
+ * transition.
+ *
+ * A wall-clock time that does not exist (a zone that springs forward across `hour`
+ * itself — no US zone does, they all move at 2am) resolves to the instant just after
+ * the gap, which is the next moment that hour could be said to have arrived.
+ */
+export function nextLocalHour(at: Date, timeZone: string, hour: number): Date {
+  const local = localParts(at, timeZone)
+  // Today if the hour is still to come, tomorrow otherwise — and tomorrow when it is
+  // exactly now, because an unsnooze that is already due is a 86 that never happened.
+  const midnight = Date.UTC(local.year, local.month - 1, local.day)
+  const day = new Date(local.hour < hour ? midnight : midnight + DAY_MS)
+
+  const next = instantOfLocalHour(day, hour, timeZone)
+  // The belt to that braces: whatever the zone does, the answer is in the future or
+  // it is not an answer. One day is the largest correction any zone can need.
+  if (next.getTime() > at.getTime()) return next
+  return instantOfLocalHour(new Date(day.getTime() + DAY_MS), hour, timeZone)
+}
+
+const DAY_MS = 24 * 60 * 60_000
+
+/** The instant at which `timeZone`'s clock reads this (UTC-held) calendar day at `hour:00:00`. */
+function instantOfLocalHour(day: Date, hour: number, timeZone: string): Date {
+  const wallAsUtc = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour)
+  const guess = wallAsUtc - zoneOffsetMs(new Date(wallAsUtc), timeZone)
+  return new Date(wallAsUtc - zoneOffsetMs(new Date(guess), timeZone))
+}
+
+/**
+ * How far the zone's clock runs ahead of UTC at this instant, in milliseconds — read
+ * from `Intl` rather than from a table, so it is right for every zone and every rule
+ * change the runtime knows about. Negative west of Greenwich, and not always a whole
+ * number of hours (Asia/Kolkata is +5:30, Australia/Eucla +8:45).
+ */
+function zoneOffsetMs(at: Date, timeZone: string): number {
+  const p = localParts(at, timeZone)
+  const wallAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
+  // `Intl` resolves to the second, so the instant is compared at the same resolution;
+  // otherwise a sub-second `at` would show up as a few hundred milliseconds of offset.
+  return wallAsUtc - Math.floor(at.getTime() / 1000) * 1000
+}
+
+/** One `Intl` read of an instant as the location's clock shows it, numbers and strings both. */
+function localParts(at: Date, timeZone: string) {
   // `hourCycle: 'h23'`, never `hour12: false` — that pairing makes some ICU
   // builds render local midnight as hour "24", which would read as past close.
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     weekday: 'short',
     hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
@@ -110,7 +178,16 @@ function localWallClock(at: Date, timeZone: string): { dow: number; time: string
     return found.value
   }
 
-  const dow = DOW_BY_WEEKDAY[part('weekday')]
-  if (dow === undefined) throw new Error(`Unrecognised weekday ${part('weekday')} for timezone ${timeZone}`)
-  return { dow, time: `${part('hour')}:${part('minute')}:${part('second')}` }
+  return {
+    weekday: part('weekday'),
+    year: Number(part('year')),
+    month: Number(part('month')),
+    day: Number(part('day')),
+    hour: Number(part('hour')),
+    minute: Number(part('minute')),
+    second: Number(part('second')),
+    hh: part('hour'),
+    mm: part('minute'),
+    ss: part('second'),
+  }
 }

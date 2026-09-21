@@ -29,4 +29,15 @@ describe('/api/inngest', () => {
     // against the constant the sender uses, so the two cannot drift apart.
     expect(orderCreated.opts.triggers).toEqual([{ event: ORDER_CREATED }])
   })
+
+  it('serves every function in the registry, the hourly unsnooze included', async () => {
+    const { functions } = await import('@/inngest/functions')
+    const { unsnooze, UNSNOOZE_CRON } = await import('@/inngest/unsnooze')
+
+    // A cron that is defined but not registered is the worst version of this bug:
+    // there is no event to go missing and no failed run to look at, so the only
+    // symptom is dishes that stay 86'd and an owner who stops trusting the button.
+    expect(functions.map((fn) => fn.id(''))).toContain(unsnooze.id(''))
+    expect(unsnooze.opts.triggers).toEqual([{ cron: UNSNOOZE_CRON }])
+  })
 })
