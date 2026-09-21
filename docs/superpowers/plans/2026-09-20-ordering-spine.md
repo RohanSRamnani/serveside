@@ -212,7 +212,7 @@ git add -A && git commit -m "chore: scaffold Next 16 app, Neon + Drizzle client,
 ### Task 2: Tenancy schema (organizations, locations, memberships)
 
 **Files:**
-- Create: `src/db/schema/tenancy.ts`, `src/db/schema/index.ts`, `src/db/migrate.ts`
+- Create: `src/db/schema/tenancy.ts`, `src/db/schema/index.ts` (migrations run via the `db:migrate` npm script — no `migrate.ts` module)
 - Test: `src/db/schema/tenancy.test.ts`
 
 **Interfaces:**
