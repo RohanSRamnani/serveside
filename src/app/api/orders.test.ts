@@ -160,6 +160,27 @@ describe('POST /api/orders', () => {
     expect((await res.json()).error).toBe('invalid_input')
   })
 
+  it('answers 422, not 500, for a body missing the fields the domain dereferences', async () => {
+    // `createOrder` validates thoroughly but reads `input.items.length` and
+    // `input.contact.name` before it can: a body that parses as JSON and is missing
+    // either one throws a TypeError, which this route would map to an opaque 500 — a
+    // client-triggerable 500 on the one public write path. Each of these is a shape
+    // the domain would have tripped over.
+    const loc = await openRestaurant()
+    const malformed: Record<string, unknown>[] = [
+      { locationId: loc.id, payment: 'card', fulfillment: 'pickup', tipCents: 0, contact: { name: 'A', phone: '+1' } },
+      { locationId: loc.id, payment: 'card', fulfillment: 'pickup', tipCents: 0, items: [] },
+      { ...cartFor(loc), contact: 'Rohan' },
+      { ...cartFor(loc), items: [{ menuItemId: loc.items[0].id, qty: 1 }] },
+      { ...cartFor(loc), items: 'butter chicken' },
+    ]
+    for (const body of malformed) {
+      const res = await post(body)
+      expect([422, 400], JSON.stringify(body)).toContain(res.status)
+      expect((await res.json()).error, JSON.stringify(body)).toBe('invalid_input')
+    }
+  })
+
   it('answers 400 for a body that is not JSON at all', async () => {
     const res = await POST(new Request('https://serveside.test/api/orders', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json',

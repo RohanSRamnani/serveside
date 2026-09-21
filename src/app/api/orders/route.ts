@@ -30,12 +30,16 @@ import { createPaymentIntentFor, StripeAccountMissingError } from '@/lib/stripe'
  */
 
 export async function POST(req: Request): Promise<Response> {
-  let input: CreateOrderInput
+  let body: unknown
   try {
-    input = (await req.json()) as CreateOrderInput
+    body = await req.json()
   } catch {
     return Response.json({ error: 'invalid_json' }, { status: 400 })
   }
+  if (!hasOrderShape(body)) {
+    return Response.json({ error: 'invalid_input', message: 'Malformed order body' }, { status: 422 })
+  }
+  const input = body
 
   let order: CreateOrderResult
   try {
@@ -77,6 +81,32 @@ export async function POST(req: Request): Promise<Response> {
     console.error('[POST /api/orders] payment setup failed for order', order.orderId, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
+}
+
+/**
+ * The **structural** guard, and only that: are the containers `createOrder` reaches
+ * into actually there. Everything about what is *in* them — uuids, quantities,
+ * payment modes, a non-blank phone number — stays in `assertInputShape`, which is
+ * where that judgement belongs and where its rejections carry codes.
+ *
+ * It exists because `createOrder` reads `input.items.length` and
+ * `input.contact.name.trim()` before it can validate them, so a body that parses as
+ * JSON but omits either throws a `TypeError` — our bug, mapped to an opaque 500, on
+ * the one route a stranger can POST to. This is the boundary untrusted JSON crosses,
+ * so the cast to `CreateOrderInput` happens after it rather than on the way in.
+ */
+function hasOrderShape(body: unknown): body is CreateOrderInput {
+  if (typeof body !== 'object' || body === null) return false
+  const b = body as Record<string, unknown>
+  const contact = b.contact as Record<string, unknown> | undefined
+  if (typeof contact !== 'object' || contact === null) return false
+  if (typeof contact.name !== 'string' || typeof contact.phone !== 'string') return false
+  if (!Array.isArray(b.items)) return false
+  return b.items.every((line) => (
+    typeof line === 'object' && line !== null
+    // `createOrder` iterates this one before it checks anything about it.
+    && Array.isArray((line as Record<string, unknown>).modifierOptionIds)
+  ))
 }
 
 /**
