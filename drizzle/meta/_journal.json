@@ -22,6 +22,13 @@
       "when": 1789962069694,
       "tag": "0002_lean_leader",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789963165415,
+      "tag": "0003_tan_felicia_hardy",
+      "breakpoints": true
     }
   ]
 }

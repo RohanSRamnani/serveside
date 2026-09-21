@@ -1,0 +1,61 @@
+import { pgTable, uuid, text, integer, time, timestamp } from 'drizzle-orm/pg-core'
+import { locations } from './tenancy'
+
+/**
+ * The weekly grid. Wall-clock local times, read in `locations.timezone` — a row
+ * says "17:00 at this restaurant", never an instant.
+ *
+ * **Deliberately not unique on (location_id, dow):** split service is the norm,
+ * not the exception. Lunch 11:30–15:00 and dinner 17:00–22:00 are two Tuesday
+ * rows, and a constraint here would force every client onto one block a day.
+ *
+ * A range never wraps past midnight — `isOpenAt` compares `open <= local < close`
+ * within one local day. Post a 17:00–02:00 shift as two rows: Tue 17:00–24:00
+ * (Postgres `time` accepts 24:00:00) plus Wed 00:00–02:00.
+ */
+export const businessHours = pgTable('business_hours', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  locationId: uuid('location_id').notNull().references(() => locations.id),
+  /** 0 = Sunday, matching JS `Date#getDay`. */
+  dow: integer('dow').notNull(),
+  openTime: time('open_time').notNull(),
+  /** Exclusive: an order must not land on the stroke of close. */
+  closeTime: time('close_time').notNull(),
+})
+
+/**
+ * Dated overrides of the weekly grid — Thanksgiving, a private event, a flood.
+ * Instants, not wall clocks: the owner picks a date range in the dashboard and
+ * the UI resolves it to timestamps. `startsAt` inclusive, `endsAt` exclusive, so
+ * a closure that ends at 17:00 lets the 17:00 service open.
+ */
+export const holidayClosures = pgTable('holiday_closures', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  locationId: uuid('location_id').notNull().references(() => locations.id),
+  startsAt: timestamp('starts_at', { withTimezone: true }).notNull(),
+  endsAt: timestamp('ends_at', { withTimezone: true }).notNull(),
+  /** Nullable: worth showing the customer when it exists, never worth blocking on. */
+  reason: text('reason'),
+})
+
+/**
+ * The "we're slammed, stop taking orders" button, with auto-resume.
+ *
+ * Rows are append-only in spirit — `until` is what expires a pause, so a stale
+ * row can never keep a location dark, and the history of how often a kitchen had
+ * to pause survives. Resuming early means writing a new row with `until` in the
+ * past, not deleting the old one.
+ */
+export const orderPauses = pgTable('order_pauses', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  locationId: uuid('location_id').notNull().references(() => locations.id),
+  until: timestamp('until', { withTimezone: true }).notNull(),
+  reason: text('reason'),
+  /** Clerk user id, as in `memberships.userId`. Null = paused by the system. */
+  createdBy: text('created_by'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
+export type BusinessHours = typeof businessHours.$inferSelect
+export type HolidayClosure = typeof holidayClosures.$inferSelect
+export type OrderPause = typeof orderPauses.$inferSelect

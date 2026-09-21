@@ -16,6 +16,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **Order rows snapshot names and prices.** Never join a historical order to a live menu item.
 - **`menu_snapshots` is insert-only.** Never update or delete a row. `version` is
   `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
+- **`business_hours` is many rows per day, and a row never wraps midnight.** Split
+  service is the norm, so nothing may unique on `(location_id, dow)`; post a
+  17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`). `isOpenAt`
+  reads wall-clock times in `locations.timezone` — never the server's — treats
+  `close_time` as exclusive, and reports **paused > holiday > closed_hours**.
 
 ## Commands
 

@@ -4,3 +4,4 @@
 export * from './tenancy'
 export * from './menu'
 export * from './snapshots'
+export * from './hours'
