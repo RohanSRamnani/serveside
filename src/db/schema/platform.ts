@@ -124,6 +124,21 @@ export const printJobs = pgTable('print_jobs', {
   index('print_jobs_queued_idx')
     .on(t.locationId, t.createdAt)
     .where(sql`${t.status} = 'queued'`),
+  /**
+   * The same shape for the other transient state, and the heartbeat alarm lives on it:
+   * "any ticket handed over and still not confirmed" runs per location, twelve times
+   * an hour, forever — and the queued index above cannot serve it, because that one is
+   * partial on `status = 'queued'` and this predicate is `delivered`.
+   *
+   * Partial for the same reason too. `delivered` is meant to last seconds (the printer
+   * GETs, prints, DELETEs), so this index holds the jobs actually in flight plus the
+   * stuck ones, rather than every ticket the restaurant has ever printed. Without it
+   * the alarm is a sequential scan of a table that only ever grows, on a five-minute
+   * timer, per kitchen.
+   */
+  index('print_jobs_delivered_idx')
+    .on(t.locationId, t.createdAt)
+    .where(sql`${t.status} = 'delivered'`),
 ]).enableRLS()
 
 /**

@@ -33,8 +33,8 @@
 -- N serials cost N rows once, and a printer hammering us cost none. The heartbeat cron
 -- stamps `alerted_at` on the same rows, which is how "one ops SMS an hour" is recorded.
 --
--- No DELETE: nothing prunes this table today. It grows by one row per serial ever
--- probed, which is bounded by the enumeration attempts themselves — and each of those
--- rows is evidence. Add a retention sweep here if that ever stops being true.
+-- No DELETE here: nothing pruned this table when it was written. **Superseded by
+-- 0018**, which grants DELETE and explains why "keeps everything, forever" was the
+-- wrong answer for the one table an unauthenticated stranger can add rows to.
 
 GRANT SELECT, INSERT, UPDATE ON TABLE "printer_probe_events" TO app_user;

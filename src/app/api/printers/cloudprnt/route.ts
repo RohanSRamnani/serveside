@@ -1,7 +1,8 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm'
 import { db } from '@/db/client'
-import { printers, printJobs, printerProbeEvents } from '@/db/schema'
+import { printers, printJobs } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
+import { recordProbe } from '@/domain/printer-probes'
 
 /**
  * Star CloudPRNT. The kitchen printer polls **us**.
@@ -32,10 +33,12 @@ import { withLocation, isUuid } from '@/repo/scoped'
  *
  * Two rules follow from that, and neither is negotiable:
  *
- * - **An unknown serial creates nothing.** No upsert, no auto-registration. Printers
- *   are provisioned by us. A route that registered a printer on first sight would let
- *   anyone who can reach this URL claim a location and start collecting another
- *   restaurant's tickets, names and phone numbers included.
+ * - **An unknown serial creates no printer.** No upsert onto `printers`, no
+ *   auto-registration. Printers are provisioned by us. A route that registered one on
+ *   first sight would let anyone who can reach this URL claim a location and start
+ *   collecting another restaurant's tickets, names and phone numbers included. (The
+ *   one thing it does write is a capped `printer_probe_events` row, which carries no
+ *   `location_id` and has no path into `printers` — see below.)
  * - **A token is only redeemable in the context that polled for it.** The GET and the
  *   DELETE carry the MAC too (Star sends it), so a job id lifted from one restaurant
  *   is a 404 at another — and a 404 with an empty body, never a 403, so the reply
@@ -55,6 +58,12 @@ import { withLocation, isUuid } from '@/repo/scoped'
  * `jobReady: false` that tells the caller nothing. Elsewhere: every unplaceable serial
  * is recorded in `printer_probe_events`, and `src/inngest/printer-heartbeat.ts` texts
  * ops when twenty distinct ones arrive inside ten minutes, at most once an hour.
+ *
+ * **What is recorded is capped twice**, because this is a durable write a stranger
+ * triggers: one row per serial rather than per request, and **no new serials at all
+ * once the window is already over the alerting threshold** — past that the alarm is
+ * earned and another row adds nothing but a table to clean up. `@/domain/printer-probes`
+ * holds both caps and the 24-hour retention the cron applies.
  *
  * **Deliberately not rate-limited, and that is a decision rather than a gap.** The
  * obvious mitigation — throttle polls per source — is the wrong tool on *this* path.
@@ -122,7 +131,7 @@ export async function POST(req: Request): Promise<Response> {
   if (!printer) {
     if (serial) {
       console.warn('[cloudprnt] poll from an unprovisioned serial', serial)
-      await recordProbe(serial)
+      await noteProbe(serial)
     }
     return noJob()
   }
@@ -259,28 +268,16 @@ async function pollingContext(url: URL): Promise<PrinterRef | null> {
 }
 
 /**
- * Writes down that a serial nobody owns came knocking — the only durable trace an
- * enumeration sweep leaves, and the input to the heartbeat cron's burst alarm.
- *
- * **One row per serial, upserted.** This path is unauthenticated, so a row per request
- * would be unbounded growth an attacker controls; an upsert makes a sweep of N serials
- * cost N rows once and one mis-provisioned printer knocking all afternoon cost none.
- * `polls` and `firstSeenAt` are what tell those two apart at a glance.
- *
- * `db()` because there is no scope to open: a serial `printer_lookup` could not place
- * belongs to no location at all, which is why the table is exempt from RLS
- * (drizzle/0016 argues it).
+ * Writes down that a serial nobody owns came knocking — see `@/domain/printer-probes`
+ * for the two caps that keep this from being a durable write a stranger controls.
  *
  * **Swallowed on failure, deliberately.** This is bookkeeping on the path a thermal
  * printer polls; a 500 here for a stranger's benefit would be a route that can be made
  * to error, and a failed write must never change the answer the printer path gives.
  */
-async function recordProbe(serial: string): Promise<void> {
+async function noteProbe(serial: string): Promise<void> {
   try {
-    await db().insert(printerProbeEvents).values({ serial }).onConflictDoUpdate({
-      target: printerProbeEvents.serial,
-      set: { lastSeenAt: new Date(), polls: sql`${printerProbeEvents.polls} + 1` },
-    })
+    await recordProbe(serial)
   } catch (err) {
     console.error('[cloudprnt] could not record an unprovisioned serial', serial, err)
   }

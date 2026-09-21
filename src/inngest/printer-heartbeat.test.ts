@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { eq, sql } from 'drizzle-orm'
+import { eq, gt, sql } from 'drizzle-orm'
 import type { GetStepTools } from 'inngest'
 import { db } from '@/db/client'
 import { printers, printJobs, printerProbeEvents } from '@/db/schema'
@@ -7,7 +7,7 @@ import { inngest as inngestClient } from '@/inngest/client'
 import { withLocation } from '@/repo/scoped'
 import {
   seedLocationWithMenu, seedBusinessHours, seedPaidOrder, seedPrinter, seedPrintJob,
-  macAddress, type SeededMenu,
+  macAddress, quietProbeWindow, type SeededMenu,
 } from '@/test/seed'
 
 /**
@@ -35,8 +35,9 @@ vi.mock('@/lib/sms', () => ({ sendSms }))
 
 const {
   printerHeartbeat, sweepPrinters, HEARTBEAT_CRON,
-  PRINTER_SILENT_MS, STUCK_JOB_MS, ALERT_COOLDOWN_MS, PROBE_BURST_THRESHOLD,
+  PRINTER_SILENT_MS, STUCK_JOB_MS, STUCK_JOB_MAX_AGE_MS, ALERT_COOLDOWN_MS,
 } = await import('./printer-heartbeat')
+const { PROBE_BURST_THRESHOLD, PROBE_RETENTION_MS, recordProbe } = await import('@/domain/printer-probes')
 
 const OPS_PHONE = '+15550008888'
 const MINUTE = 60_000
@@ -105,29 +106,25 @@ function fakeStep(locationIds: string[], seen: string[] = []): GetStepTools<type
   } as unknown as GetStepTools<typeof inngestClient>
 }
 
-/**
- * Ages every probe row out of the burst window.
- *
- * `printer_probe_events` is platform-global — a row in it belongs to no location, by
- * definition — so there is no scope to hide one test's rows from another's count, and
- * nothing tears the `test` branch down. This is the one place in this suite where a
- * test has to quieten a whole table, and it is safe because the suite is serial
- * (`fileParallelism: false`, and tests within a file run in order).
- *
- * UPDATE rather than DELETE because DELETE is not granted: the rows are evidence of an
- * enumeration attempt and nothing prunes them (see `drizzle/0016`).
- */
-function clearProbeWindow(): Promise<unknown> {
-  return db().execute(sql`
-    update printer_probe_events
-    set last_seen_at = now() - interval '2 hours', alerted_at = null`)
-}
+/** Ages every probe row out of the burst window — shared, and `seed.ts` says why. */
+const clearProbeWindow = quietProbeWindow
 
-/** `n` distinct unknown serials, all seen just now. */
+/**
+ * `n` distinct unknown serials, all seen just now. Inserted directly rather than
+ * through `recordProbe`, because `recordProbe` refuses to grow the table past the
+ * threshold — which is the behaviour under test in its own case, not a way to seed one.
+ */
 async function probes(n: number): Promise<void> {
   await db().insert(printerProbeEvents).values(
     Array.from({ length: n }, () => ({ serial: macAddress() })),
   )
+}
+
+/** How many serials are inside the burst window right now. */
+async function windowSize(): Promise<number> {
+  const rows = await db().select({ id: printerProbeEvents.id }).from(printerProbeEvents)
+    .where(gt(printerProbeEvents.lastSeenAt, new Date(Date.now() - 10 * MINUTE)))
+  return rows.length
 }
 
 beforeEach(() => {
@@ -148,6 +145,10 @@ describe('the printer heartbeat', () => {
     expect(printerHeartbeat.opts.triggers).toEqual([{ cron: HEARTBEAT_CRON }])
     expect(PRINTER_SILENT_MS).toBe(3 * MINUTE)
     expect(STUCK_JOB_MS).toBe(10 * MINUTE)
+    // The upper bound is not tidiness — see the test below, and the constant's own
+    // note: nothing ever moves a job off `delivered`, so without it the alarm would
+    // have no way to stop.
+    expect(STUCK_JOB_MAX_AGE_MS).toBe(6 * 60 * MINUTE)
     expect(ALERT_COOLDOWN_MS).toBe(60 * MINUTE)
   })
 
@@ -292,6 +293,37 @@ describe('the printer heartbeat', () => {
     ])
   })
 
+  it('gives up on a ticket that is hours old, so the alarm can stop', async () => {
+    // **The alarm has to be able to clear itself.** A job that failed to print stays
+    // at `delivered` for good — the route refuses to requeue it, deliberately — and
+    // nothing else moves it, so an unbounded "older than ten minutes" would match the
+    // same row for the life of the database: one jammed ticket on a Tuesday, an owner
+    // and an ops phone texted every open hour, forever. That is exactly the
+    // muted-alarm failure this file exists to avoid, delivered by the file itself.
+    await clearProbeWindow()
+    const loc = await restaurant()
+    await printerLastSeen(loc.id, 0)
+    await stuckTicket(loc.id, 7 * 60)
+
+    const summary = await sweepPrinters(fakeStep([loc.id]))
+
+    expect(summary.alerted).toEqual([])
+    expect(sendSms).not.toHaveBeenCalled()
+  })
+
+  it('still alerts while the stuck ticket is inside the window it can act on', async () => {
+    // The control for the bound above: five hours in, the order may still be on a
+    // board and the customer may still be coming, so it is worth a text.
+    await clearProbeWindow()
+    const loc = await restaurant()
+    await printerLastSeen(loc.id, 0)
+    await stuckTicket(loc.id, 5 * 60)
+
+    await sweepPrinters(fakeStep([loc.id]))
+
+    expect(textsTo(loc.phoneE164)).toHaveLength(1)
+  })
+
   it('ignores a ticket that was only just handed over', async () => {
     await clearProbeWindow()
     const loc = await restaurant()
@@ -321,9 +353,40 @@ describe('the printer heartbeat', () => {
     expect(textsTo(loc.phoneE164)).toHaveLength(1)
     expect((await readPrinter(loc.id, printer.id)).lastAlertAt).toBeInstanceOf(Date)
 
-    // The retry — and the next eleven runs this hour — say nothing more.
+    // The next eleven runs this hour say nothing more — but they also come back
+    // green, which is the whole reason the failure above must not be reported from
+    // inside the step. See the test below.
     sendSms.mockClear()
     await sweepPrinters(fakeStep([loc.id]))
+    expect(sendSms).not.toHaveBeenCalled()
+  })
+
+  it('stays red on a retry that replays the step instead of re-running it', async () => {
+    // **The failure that would otherwise disappear.** Inngest retries a failed step,
+    // and a retry of this one finds the cooldown it just stamped, alerts nobody and
+    // succeeds — so reporting "ops never got the text" from inside the step would turn
+    // a permanently unreachable OPS_ALERT_E164 into a green run, every time, and we
+    // would never learn our own alarm has no way to reach us.
+    //
+    // So the send failure is carried out in the step's *result* and the run is failed
+    // from the function body. Here the step is replayed from memoized state — exactly
+    // what Inngest does on a function-level retry — and the run still ends red without
+    // re-sending anything.
+    const memoized = {
+      alerted: [{ locationId: 'loc-1', printerId: 'p-1', silentMinutes: 7, stuckJobs: 0 }],
+      undelivered: ['loc-1: ops: twilio said no'],
+    }
+    const replay = {
+      run: (id: string, fn: () => Promise<unknown>) => {
+        if (id === 'list-locations') return Promise.resolve(['loc-1'])
+        if (id === 'alert-locations') return Promise.resolve(memoized)
+        return fn()
+      },
+    } as unknown as GetStepTools<typeof inngestClient>
+
+    await clearProbeWindow()
+    await expect(sweepPrinters(replay)).rejects.toThrow(/ops: twilio said no/)
+    // Nothing re-sent: the step that did the texting was never re-run.
     expect(sendSms).not.toHaveBeenCalled()
   })
 
@@ -379,10 +442,74 @@ describe('the unprovisioned-serial burst', () => {
     expect(summary.probeBurst).toMatchObject({ serials: PROBE_BURST_THRESHOLD + 1, alerted: true })
     // Us only. There is no restaurant to tell: by definition these serials belong to
     // nobody.
+    //
+    // "At least", because the count really is a floor and not a measurement: the poll
+    // route stops recording new serials once the window is over threshold, so this
+    // reads the same whether twenty-one MACs were tried or ten million. Claiming an
+    // exact number would be claiming we measured something we deliberately stopped
+    // measuring.
     expect(textsTo(OPS_PHONE)).toEqual([
-      `Serveside: ${PROBE_BURST_THRESHOLD + 1} unknown printer serials polled in the last 10 min`
+      `Serveside: at least ${PROBE_BURST_THRESHOLD + 1} unknown printer serials polled in the last 10 min`
       + ' — possible serial sweep.',
     ])
+  })
+
+  it('stops recording new serials once the alarm is already earned', async () => {
+    // **The cap that keeps this from being a durable, attacker-chosen table.** The MAC
+    // space a sweep walks is tens of millions; a row per guess would be tens of
+    // millions of rows, and the cleanup would be a migration written under pressure.
+    // Past the threshold the alarm has been earned and another serial adds nothing, so
+    // the table simply stops listening.
+    await clearProbeWindow()
+    await probes(PROBE_BURST_THRESHOLD + 1)
+    const before = await windowSize()
+
+    const fresh = macAddress()
+    await recordProbe(fresh)
+
+    expect(await windowSize()).toBe(before)
+    expect(await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, fresh))).toHaveLength(0)
+  })
+
+  it('keeps counting a serial it has already seen, even over the threshold', async () => {
+    // The `or exists` half of the cap: bumping a row that is already there costs no
+    // growth at all, and `polls` on a known-bad serial is the thing that says "one
+    // mis-provisioned printer" rather than "a sweep".
+    await clearProbeWindow()
+    const known = macAddress()
+    await recordProbe(known)
+    await probes(PROBE_BURST_THRESHOLD + 1)
+
+    await recordProbe(known)
+
+    const [row] = await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, known))
+    expect(row.polls).toBe(2)
+  })
+
+  it('sweeps rows older than the retention window, on the same cron', async () => {
+    // Nothing else prunes this table, and "nothing prunes it" is not an answer for the
+    // one table an unauthenticated stranger can add rows to.
+    await clearProbeWindow()
+    const stale = macAddress()
+    await db().insert(printerProbeEvents).values({
+      serial: stale,
+      firstSeenAt: new Date(Date.now() - PROBE_RETENTION_MS - MINUTE),
+      lastSeenAt: new Date(Date.now() - PROBE_RETENTION_MS - MINUTE),
+    })
+    const recent = macAddress()
+    await recordProbe(recent)
+
+    const summary = await sweepPrinters(fakeStep([]))
+
+    expect(summary.probeBurst.pruned).toBeGreaterThanOrEqual(1)
+    expect(await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, stale))).toHaveLength(0)
+    // And it does not touch what is still inside the window — including the row that
+    // would have been the next alert.
+    expect(await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, recent))).toHaveLength(1)
   })
 
   it('says nothing again for an hour', async () => {
@@ -407,13 +534,7 @@ describe('the unprovisioned-serial burst', () => {
     // many polls.
     await clearProbeWindow()
     const serial = macAddress()
-    for (let i = 0; i < PROBE_BURST_THRESHOLD + 5; i++) {
-      await db().insert(printerProbeEvents).values({ serial })
-        .onConflictDoUpdate({
-          target: printerProbeEvents.serial,
-          set: { lastSeenAt: new Date(), polls: sql`${printerProbeEvents.polls} + 1` },
-        })
-    }
+    for (let i = 0; i < PROBE_BURST_THRESHOLD + 5; i++) await recordProbe(serial)
 
     const summary = await sweepPrinters(fakeStep([]))
 

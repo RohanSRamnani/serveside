@@ -145,7 +145,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   steals a ticket (name + phone) and can confirm it so it never prints. The serial is
   clamped to a plausible shape before it is queried or logged, and the one thing an
   unknown one now writes is an upserted `printer_probe_events` row (no `location_id`,
-  no path into `printers`) that the heartbeat cron counts. **The poll path is
+  no path into `printers`) that the heartbeat cron counts — **capped**: one row per
+  serial, and no new serials at all once the window is already over the alerting
+  threshold, so a sweep cannot choose how big that table gets. **The poll path is
   deliberately not rate-limited** — a whole restaurant shares one NAT and a real
   printer polls forever, so a limiter tight enough to slow a sweep eventually refuses a
   kitchen's ticket; the argument is written at the head of the route, and a limiter, if
@@ -189,17 +191,24 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
     minutes in the message are the **thresholds, not elapsed since `createdAt`** — a
     card order's checkout can precede the kitchen hearing about it by minutes.
   - `printer-heartbeat`, cron `*/5 * * * *`: a printer whose `lastSeenAt` is older than
-    3 minutes, or a `print_job` stuck at `delivered` for 10, texts owner **and** ops in
-    one message, at most once an hour per printer via `printers.lastAlertAt`. A NULL
-    `lastSeenAt` is a unit never plugged in, not a fault. Stuck jobs are **never
-    requeued** — the printer may have printed it and died before saying so, and a
-    duplicate ticket is a duplicate dinner. Sends *then* stamps: a duplicate alert is a
-    nuisance, a missed one is a kitchen that does not know it stopped printing.
+    3 minutes, or a `print_job` stuck at `delivered` **between 10 minutes and 6 hours**,
+    texts owner **and** ops in one message, at most once an hour per printer via
+    `printers.lastAlertAt`. A NULL `lastSeenAt` is a unit never plugged in, not a fault.
+    The **upper bound is load-bearing**: nothing ever moves a job off `delivered`, so an
+    open-ended predicate would text about one jammed ticket every open hour forever.
+    Stuck jobs are **never requeued** — the printer may have printed it and died before
+    saying so. Sends *then* stamps, and stamps if **either** phone answered; a send that
+    reached only one is carried out of the step and fails the **run** from the function
+    body, because a step-level failure would be retried, hit the cooldown and come back
+    green.
   - `provenance-refused-alert` on `payments/provenance-refused` — ops only; see the
     Stripe provenance rule above.
-  Its second leg also counts `printer_probe_events`: >20 distinct unknown serials in
-  10 minutes texts ops once an hour. Both legs run under `Promise.allSettled`, so one
-  restaurant's database trouble cannot hide a platform-wide sweep.
+  Its second leg owns `printer_probe_events` (`src/domain/printer-probes.ts`, shared
+  with the poll route): >20 distinct unknown serials in 10 minutes texts ops once an
+  hour, and the same leg prunes rows older than 24h. **The route stops recording new
+  serials once the window is over threshold**, so the count is a floor ("at least N")
+  and the table cannot be grown at will by a stranger. Both legs run under
+  `Promise.allSettled`, so one restaurant's database trouble cannot hide a sweep.
 - **`withLocation` is scoping, not authorization, and the check that is authorization
   is `requireLocationAccess` (`src/lib/authz.ts`).** It runs *before* a scope opens and
   resolves one chain: the Clerk session's active org → `organizations.clerk_org_id` →
@@ -353,12 +362,16 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   column and this should follow the cart.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
   `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`, `seedTicketOrder`,
-  `seedPrinter`, `seedPrintJob`, `linkClerkOrg`) — import them; don't re-inline
-  a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT / REQUIRES_PAYMENT
-  order the Stripe webhook flips; `seedPaidOrder` is the one already at NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
+  `seedPrinter`, `seedPrintJob`, `linkClerkOrg`, `quietProbeWindow`) — import them;
+  don't re-inline a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT /
+  REQUIRES_PAYMENT order the Stripe webhook flips; `seedPaidOrder` is the one already at
+  NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
   alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test
   of `createOrder` needs: it asks `isOpenAt(new Date())`, so hours pinned to one weekday
-  would only pass on that weekday.
+  would only pass on that weekday. **Any test that touches `printer_probe_events` calls
+  `quietProbeWindow()` first** — that table is platform-global with nothing to scope to,
+  so one file's leftover probes change another file's answers (both the burst count and
+  the route's recording cap read the same ten-minute window).
 - **Inngest 4 is not the API you remember.** It is
   `createFunction({ id, triggers: { event } }, handler)` — one options object, two
   arguments. The v3 three-argument form throws at import, and `EventSchemas` is gone

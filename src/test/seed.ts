@@ -15,7 +15,7 @@ import {
   printers, printJobs,
 } from '@/db/schema'
 import type { Location, Order, OrderItem, Printer, PrintJob } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import { withLocation, type ScopedTx } from '@/repo/scoped'
 import { ordersRepo } from '@/repo/orders-repo'
 import { buildMenuSnapshot } from '@/domain/snapshot'
@@ -214,6 +214,26 @@ export async function seedPrinter(locationId: string, serial = macAddress()): Pr
       .returning()
     return printer
   })
+}
+
+/**
+ * Ages every `printer_probe_events` row out of the ten-minute burst window.
+ *
+ * Shared, and the sharing is the point: that table is **platform-global** — a row in it
+ * belongs to no location, by definition — so there is no scope to hide one test file's
+ * rows from another's, and nothing tears the `test` branch down. Two different files
+ * depend on the window being quiet: the burst alarm counts it, and the poll route
+ * *stops recording new serials* once it is over threshold, so a file that left twenty
+ * fresh rows behind would make an unrelated file's probe assertions fail.
+ *
+ * Safe because the suite is serial (`fileParallelism: false`, and tests inside a file
+ * run in order). UPDATE rather than DELETE so it works the same whether or not the
+ * retention grant is in place, and so it leaves the rows for `pruneProbes` to find.
+ */
+export async function quietProbeWindow(): Promise<void> {
+  await db().execute(sql`
+    update printer_probe_events
+    set last_seen_at = now() - interval '2 hours', alerted_at = null`)
 }
 
 /** A MAC in Star's OUI (`00:11:62`), unique per call. */

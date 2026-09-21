@@ -1,9 +1,12 @@
 import type { GetStepTools } from 'inngest'
-import { and, count, eq, gt, inArray, lt, max } from 'drizzle-orm'
-import { db } from '@/db/client'
-import { locations, printers, printJobs, printerProbeEvents } from '@/db/schema'
+import { and, count, eq, gt, inArray, lt } from 'drizzle-orm'
+import { locations, printers, printJobs } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { isOpenAt } from '@/domain/hours'
+import {
+  markProbesAlerted, probeWindow, pruneProbes,
+  PROBE_BURST_THRESHOLD, PROBE_RETENTION_MS,
+} from '@/domain/printer-probes'
 import { sendSms } from '@/lib/sms'
 import { env } from '@/lib/env'
 import { inngest } from './client'
@@ -51,17 +54,29 @@ export const HEARTBEAT_CRON = '*/5 * * * *' as const
 export const PRINTER_SILENT_MS = 3 * 60_000
 /** A ticket collected and unconfirmed for this long is a ticket that did not print. */
 export const STUCK_JOB_MS = 10 * 60_000
+
+/**
+ * …and one older than this is not news any more. **The alarm has to be able to stop.**
+ *
+ * A job that failed to print stays at `delivered` forever — the route refuses to
+ * requeue it, deliberately, because a jammed printer would otherwise fail the same
+ * ticket for the rest of the night. Nothing else moves it either: `confirmed` only ever
+ * comes from a printer saying it printed. So an unbounded "older than ten minutes"
+ * count is a row that matches **for the life of the database**, and one jammed ticket
+ * on a Tuesday would text the owner and ops every open hour, forever — which is the
+ * muted-alarm failure this file's own header warns about, delivered by the file itself.
+ *
+ * Six hours is one service. Inside it the ticket is still worth chasing: the order may
+ * be on a board, the customer may still be coming. Past it the moment has gone — the
+ * kitchen closed, the order was served off the tablet or refunded, and a text about it
+ * is archaeology rather than an alarm. A printer that is *still* broken keeps producing
+ * fresh stuck tickets, which keep entering the window, so a genuinely ongoing fault
+ * keeps alerting on its own merits rather than on the strength of one old row.
+ */
+export const STUCK_JOB_MAX_AGE_MS = 6 * 60 * 60_000
+
 /** One alert an hour per printer. Twelve runs an hour, one text — see `printers.lastAlertAt`. */
 export const ALERT_COOLDOWN_MS = 60 * 60_000
-/** How far back the unknown-serial count reaches. */
-export const PROBE_BURST_WINDOW_MS = 10 * 60_000
-/**
- * How many **distinct** unknown serials inside that window mean somebody is sweeping.
- * A genuinely unknown serial is one mis-provisioned printer repeating itself forever,
- * so the number that matters is how many different ones there are, not how loud they
- * are.
- */
-export const PROBE_BURST_THRESHOLD = 20
 
 /** What one location's check came to. `silentMinutes` is null when only tickets are stuck. */
 export type PrinterAlert = {
@@ -71,8 +86,16 @@ export type PrinterAlert = {
   stuckJobs: number
 }
 
-/** The unknown-serial count for this run, and whether it rang anybody's phone. */
-export type ProbeBurst = { serials: number; alerted: boolean }
+/**
+ * The unknown-serial count for this run, whether it rang anybody's phone, and how many
+ * aged-out rows were swept. `serials` is a **floor, not a measurement**: the route
+ * stops recording new serials once the window is over threshold, so a sweep of a
+ * million MACs and a sweep of twenty-one both read as twenty-one.
+ */
+export type ProbeBurst = { serials: number; alerted: boolean; pruned: number }
+
+/** One location's alert, and the phones it could not reach. */
+type LocationSweep = { alerted: PrinterAlert[]; undelivered: string[] }
 
 export type HeartbeatSummary = {
   /** Locations looked at. Every location, every five minutes — see `listLocationIds`. */
@@ -121,6 +144,19 @@ export async function sweepPrinters(step: GetStepTools<typeof inngest>): Promise
   const failures = [
     health.status === 'rejected' ? `alert-locations: ${describe(health.reason)}` : null,
     burst.status === 'rejected' ? `alert-probe-burst: ${describe(burst.reason)}` : null,
+    // **An alert that reached only one of the two phones fails the RUN from here, not
+    // the step.** It cannot fail the step: the step has already sent the text that did
+    // land and stamped the hour, so a step-level failure would be retried, find the
+    // cooldown, alert nobody, and come back green — a permanently broken
+    // `OPS_ALERT_E164` would vanish into a successful run and we would never learn our
+    // own alarm has no way to reach us. Thrown out here instead, the step stays
+    // memoized (nothing is re-sent) and the run ends red with the phone named, on
+    // every attempt. That is the same mechanism the order fan-out uses, and
+    // `src/inngest/order-created.ts` sets out why the body's throw re-runs the body
+    // only.
+    health.status === 'fulfilled' && health.value.undelivered.length > 0
+      ? `alerts reached only one phone — ${health.value.undelivered.join('; ')}`
+      : null,
   ].filter((failure): failure is string => failure !== null)
   if (failures.length > 0) throw new Error(`printer heartbeat incomplete — ${failures.join('; ')}`)
 
@@ -128,20 +164,32 @@ export async function sweepPrinters(step: GetStepTools<typeof inngest>): Promise
   // cannot know that, so the checks are repeated rather than cast away.
   return {
     scanned: locationIds.length,
-    alerted: health.status === 'fulfilled' ? health.value : [],
-    probeBurst: burst.status === 'fulfilled' ? burst.value : { serials: 0, alerted: false },
+    alerted: health.status === 'fulfilled' ? health.value.alerted : [],
+    probeBurst: burst.status === 'fulfilled' ? burst.value : { serials: 0, alerted: false, pruned: 0 },
   }
 }
 
-/** Every location in turn — see `alertLocation`. One restaurant's failure is not another's. */
-async function alertLocations(locationIds: string[]): Promise<PrinterAlert[]> {
+/**
+ * Every location in turn — see `alertLocation`. One restaurant's failure is not
+ * another's.
+ *
+ * Two kinds of bad news come back differently, and the difference is whether retrying
+ * would help. A location that could not be *read* throws: nothing was sent, so the
+ * step should run again. A location whose alert reached only one of the two phones is
+ * carried out in `undelivered`, because the text that landed must not be sent twice —
+ * `sweepPrinters` turns that into a red run instead.
+ */
+async function alertLocations(locationIds: string[]): Promise<LocationSweep> {
   const alerted: PrinterAlert[] = []
+  const undelivered: string[] = []
   const failures: string[] = []
 
   for (const locationId of locationIds) {
     try {
-      const alert = await alertLocation(locationId)
-      if (alert) alerted.push(alert)
+      const result = await alertLocation(locationId)
+      if (!result) continue
+      alerted.push(result.alert)
+      undelivered.push(...result.undelivered.map((failure) => `${locationId}: ${failure}`))
     } catch (err) {
       // Caught rather than thrown on the spot: one restaurant's database trouble must
       // not leave every other restaurant's dead printer undiscovered. The run still
@@ -153,7 +201,7 @@ async function alertLocations(locationIds: string[]): Promise<PrinterAlert[]> {
   // Named, not counted: which restaurant went unchecked is the first thing anyone
   // needs, and "the heartbeat failed" is not an actionable sentence.
   if (failures.length > 0) throw new Error(`printer heartbeat incomplete — ${failures.join('; ')}`)
-  return alerted
+  return { alerted, undelivered }
 }
 
 /**
@@ -167,17 +215,21 @@ async function alertLocations(locationIds: string[]): Promise<PrinterAlert[]> {
  * two phones are one alert, and the question the stamp answers is "has this alarm been
  * raised", not "did every leg of it succeed":
  *
- * - Both failed — Twilio is down — so nothing was raised: no stamp, and the throw
- *   below makes the step retry and genuinely try again.
- * - One failed: somebody knows. Stamping is what stops the retry texting the other
- *   one a second, third and fourth time about one dead printer, and retrying would not
- *   fix the usual cause anyway (a restaurant phone that has replied STOP, or an
- *   `OPS_ALERT_E164` nobody set). The run still ends red, which is how we find out.
+ * - Both failed — Twilio is down — so nothing was raised: no stamp, and the **throw**
+ *   makes the step retry and genuinely try again.
+ * - One failed: somebody knows. Stamping is what stops the retry texting the other one
+ *   a second, third and fourth time about one dead printer, and retrying would not fix
+ *   the usual cause anyway (a restaurant phone that has replied STOP, or an
+ *   `OPS_ALERT_E164` nobody set). So this **returns rather than throws**, and the
+ *   failure is carried up to `sweepPrinters`, which fails the run outside the step —
+ *   where a retry cannot quietly turn it green.
  *
  * Stamping *before* sending would be the worst of both: an SMS failure would silently
  * buy an hour of silence about a kitchen that has stopped printing.
  */
-async function alertLocation(locationId: string): Promise<PrinterAlert | null> {
+async function alertLocation(
+  locationId: string,
+): Promise<{ alert: PrinterAlert; undelivered: string[] } | null> {
   const now = new Date()
   const due = await assess(locationId, now)
   if (!due) return null
@@ -192,25 +244,31 @@ async function alertLocation(locationId: string): Promise<PrinterAlert | null> {
     textOps(message),
   ])
 
-  if (owner.status === 'fulfilled' || ops.status === 'fulfilled') {
-    await withLocation(locationId, (tx) => tx.update(printers)
-      .set({ lastAlertAt: now })
-      .where(inArray(printers.id, due.printerIds)))
-  }
-
+  // Named, because which phone did not ring decides what someone does next: a bad
+  // restaurant number is a support call, and a bad one of ours is a deploy.
   const failures = [
     owner.status === 'rejected' ? `owner: ${describe(owner.reason)}` : null,
     ops.status === 'rejected' ? `ops: ${describe(ops.reason)}` : null,
   ].filter((failure): failure is string => failure !== null)
-  // Named, because which phone did not ring decides what someone does next: a bad
-  // restaurant number is a support call, and a bad ours is a deploy.
-  if (failures.length > 0) throw new Error(`could not raise the printer alert — ${failures.join('; ')}`)
+
+  if (failures.length === 2) {
+    // Nothing was raised, so the hour must not start here: throw, and let the step's
+    // retry try the whole thing again.
+    throw new Error(`could not raise the printer alert — ${failures.join('; ')}`)
+  }
+
+  await withLocation(locationId, (tx) => tx.update(printers)
+    .set({ lastAlertAt: now })
+    .where(inArray(printers.id, due.printerIds)))
 
   return {
-    locationId,
-    printerId: due.printerId,
-    silentMinutes: due.silentMinutes,
-    stuckJobs: due.stuckJobs,
+    alert: {
+      locationId,
+      printerId: due.printerId,
+      silentMinutes: due.silentMinutes,
+      stuckJobs: due.stuckJobs,
+    },
+    undelivered: failures,
   }
 }
 
@@ -263,10 +321,22 @@ async function assess(locationId: string, now: Date): Promise<Due | null> {
     // ticket came out. Counted from `created_at` because there is no `delivered_at`
     // column — which makes this "a ticket queued ten minutes ago still has not
     // printed", a slightly broader question and the one an owner would actually ask.
+    //
+    // **Bounded at both ends**, and the upper bound is not tidiness: nothing ever moves
+    // a job off `delivered`, so an open-ended predicate matches the same row forever
+    // and one jammed ticket would text this restaurant every open hour for the life of
+    // the database. See {@link STUCK_JOB_MAX_AGE_MS}.
+    //
+    // Served by `print_jobs_delivered_idx` — partial on `delivered`, leading on
+    // `location_id` because RLS adds that equality to every statement. Without it this
+    // is a sequential scan of every ticket the restaurant has ever printed, per
+    // location, twelve times an hour, forever; the partial index holds only the
+    // handful of jobs actually in flight, exactly as the queued one does.
     const [{ stuckJobs }] = await tx.select({ stuckJobs: count() }).from(printJobs)
       .where(and(
         eq(printJobs.status, 'delivered'),
         lt(printJobs.createdAt, new Date(now.getTime() - STUCK_JOB_MS)),
+        gt(printJobs.createdAt, new Date(now.getTime() - STUCK_JOB_MAX_AGE_MS)),
       ))
 
     if (silent.length === 0 && stuckJobs === 0) return null
@@ -346,37 +416,39 @@ function heartbeatMessage(name: string, silentMinutes: number | null, stuckJobs:
  */
 async function alertProbeBurst(): Promise<ProbeBurst> {
   const now = new Date()
-  const since = new Date(now.getTime() - PROBE_BURST_WINDOW_MS)
 
-  // Aggregated rather than read: during an actual sweep this window holds a row per
-  // serial tried, and the only two facts wanted are how many and whether anyone has
-  // been told.
-  const [window] = await db()
-    .select({ serials: count(), lastAlertedAt: max(printerProbeEvents.alertedAt) })
-    .from(printerProbeEvents)
-    .where(gt(printerProbeEvents.lastSeenAt, since))
+  // **Retention first, and on this cron rather than anywhere else.** The table is a
+  // durable write a stranger triggers, so "nothing prunes it" was never an acceptable
+  // answer — it just deferred the cleanup to a migration somebody would have to write
+  // during an incident. Here it is a rolling 24-hour window that maintains itself on
+  // the same five-minute beat as the alarm that reads it. It cannot affect the count
+  // below: everything it removes is a day older than the ten-minute window.
+  const pruned = await pruneProbes(new Date(now.getTime() - PROBE_RETENTION_MS))
 
-  const serials = window?.serials ?? 0
-  if (serials <= PROBE_BURST_THRESHOLD) return { serials, alerted: false }
+  const { serials, lastAlertedAt } = await probeWindow(now)
+  if (serials <= PROBE_BURST_THRESHOLD) return { serials, alerted: false, pruned }
 
   // One text an hour, for the same reason the printer alert has one: a sweep lasts as
   // long as the attacker likes, and a text every five minutes is a phone nobody reads.
-  const lastAlertedAt = window?.lastAlertedAt ?? null
   if (lastAlertedAt && now.getTime() - lastAlertedAt.getTime() < ALERT_COOLDOWN_MS) {
-    return { serials, alerted: false }
+    return { serials, alerted: false, pruned }
   }
 
   // Us only. There is no restaurant to tell: by definition these serials are nobody's.
+  //
+  // "At least", because the number really is a floor: the route stops recording new
+  // serials once the window is over threshold, so this reads twenty-one whether
+  // twenty-one MACs were tried or ten million. Claiming an exact count would be
+  // claiming we measured something we deliberately stopped measuring.
   await textOps(
-    `Serveside: ${serials} unknown printer serials polled in the last 10 min — possible serial sweep.`,
+    `Serveside: at least ${serials} unknown printer serials polled in the last 10 min`
+    + ' — possible serial sweep.',
   )
   // Stamped after the send, like the printer alert, and on the rows that made the
   // count: they *are* the alert, so marking them is the record that it went out.
-  await db().update(printerProbeEvents)
-    .set({ alertedAt: now })
-    .where(gt(printerProbeEvents.lastSeenAt, since))
+  await markProbesAlerted(now)
 
-  return { serials, alerted: true }
+  return { serials, alerted: true, pruned }
 }
 
 /** A failure's reason, flattened for one line of a report. */

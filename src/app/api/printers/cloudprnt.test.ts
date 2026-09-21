@@ -4,7 +4,10 @@ import { neon } from '@neondatabase/serverless'
 import { db } from '@/db/client'
 import { printers, printJobs, printerProbeEvents } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
-import { seedLocationWithMenu, seedPaidOrder, seedPrinter, seedPrintJob, macAddress } from '@/test/seed'
+import {
+  seedLocationWithMenu, seedPaidOrder, seedPrinter, seedPrintJob, macAddress, quietProbeWindow,
+} from '@/test/seed'
+import { PROBE_BURST_THRESHOLD } from '@/domain/printer-probes'
 
 /**
  * The CloudPRNT endpoint, and the one route in this system with **no authentication
@@ -17,10 +20,12 @@ import { seedLocationWithMenu, seedPaidOrder, seedPrinter, seedPrintJob, macAddr
  * Everything after the lookup is ordinary tenant-scoped code. Two properties make
  * that boundary hold, and both are asserted below rather than assumed:
  *
- * 1. **An unknown serial creates nothing.** Printers are provisioned by us. If this
- *    route upserted by MAC, anyone who can reach the URL could claim a location and
- *    start collecting another restaurant's tickets — with the customers' names and
- *    phone numbers on them.
+ * 1. **An unknown serial creates no printer.** Printers are provisioned by us. If this
+ *    route upserted onto `printers` by MAC, anyone who can reach the URL could claim a
+ *    location and start collecting another restaurant's tickets — with the customers'
+ *    names and phone numbers on them. (It does write one capped `printer_probe_events`
+ *    row, which has no location and no path into `printers`; that is the enumeration
+ *    alarm's only input, and the tests below pin both halves.)
  * 2. **A token is only redeemable in the context that polled for it.** The GET and
  *    the DELETE carry the printer's MAC too (Star sends it), so a job id lifted from
  *    one restaurant is a 404 at another — and a 404, not a 403, so the reply cannot
@@ -225,6 +230,11 @@ describe('the serial is the credential', () => {
   })
 
   it('counts an unprovisioned serial, one row however many times it knocks', async () => {
+    // The window has to be quiet first, and not for tidiness: the route stops
+    // recording new serials once the burst window is over threshold, so a file that
+    // ran before this one and left twenty fresh probes behind would make this fail for
+    // a reason that has nothing to do with the route. `seed.ts` explains the sharing.
+    await quietProbeWindow()
     // The **one** thing an unknown serial now writes, and it is nothing like an
     // auto-registration: a row with no `location_id`, no path into `printers`, and
     // nothing in it but a serial that belongs to nobody. It exists because serial
@@ -253,6 +263,28 @@ describe('the serial is the credential', () => {
     // auto-registration is unchanged, and the lookup still refuses the serial.
     expect(await countPrinters()).toBe(before)
     expect((await db().execute(sql`select * from printer_lookup(${stranger})`)).rows).toHaveLength(0)
+  })
+
+  it('stops writing new rows once a sweep is already obvious', async () => {
+    // **The cap that stops this being a durable write an attacker chooses the size
+    // of.** The MAC space a sweep walks is tens of millions; a row per guess would be
+    // tens of millions of rows in a table nothing had a plan for. Past the alerting
+    // threshold the alarm is earned and another serial adds nothing, so the route
+    // stops recording — and the cap refills by itself as rows age out of the window.
+    await quietProbeWindow()
+    await db().insert(printerProbeEvents).values(
+      Array.from({ length: PROBE_BURST_THRESHOLD + 1 }, () => ({ serial: macAddress() })),
+    )
+    const stranger = macAddress()
+
+    // The printer still gets the same answer it always did — the cap is invisible from
+    // the outside, which is the point: nothing about the reply says what we know.
+    const res = await poll(stranger)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ jobReady: false, mediaTypes: ['text/plain'] })
+
+    expect(await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, stranger))).toHaveLength(0)
   })
 
   it('records nothing for a serial that is not shaped like one', async () => {
