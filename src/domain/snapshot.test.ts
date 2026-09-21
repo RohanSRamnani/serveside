@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { buildMenuSnapshot, isVersionRace } from './snapshot'
 import { db } from '@/db/client'
-import { menuSnapshots, menuItems, modifierOptions, menus } from '@/db/schema'
+import { menuSnapshots, menuItems, modifierOptions, menus, itemModifierGroups } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { seedLocation, seedLocationWithMenu } from '@/test/seed'
 
@@ -41,6 +41,36 @@ describe('buildMenuSnapshot', () => {
       { id: loc.modifierOptions[1].id, name: 'Hot', priceDeltaCents: 50, is86d: true },
       { id: loc.modifierOptions[0].id, name: 'Mild', priceDeltaCents: 0, is86d: false },
     ])
+  })
+
+  it('pins the limits the item actually enforces, not the group defaults', async () => {
+    const loc = await seedLocationWithMenu()
+    // A third item, so one payload covers all three branches of the override logic.
+    const [paneer] = await db().insert(menuItems).values({
+      categoryId: loc.category.id, name: 'Paneer Tikka', basePriceCents: 1600, sort: 3,
+    }).returning()
+    await db().insert(itemModifierGroups).values([
+      // Both overridden. minOverride: 0 is a real value — `??` keeps it, `||` would not.
+      { itemId: loc.items[1].id, groupId: loc.modifierGroup.id, sort: 1, minOverride: 0, maxOverride: 3 },
+      // Only max overridden: min must fall back to the group's own.
+      { itemId: paneer.id, groupId: loc.modifierGroup.id, sort: 1, maxOverride: 2 },
+    ])
+
+    const snap = await buildMenuSnapshot(loc.id)
+    const row = await db().query.menuSnapshots.findFirst({ where: eq(menuSnapshots.id, snap.id) })
+    const [butterChicken, rogan, tikka] = row!.payload.categories[0].items
+
+    // No overrides: the group's own numbers.
+    expect(butterChicken.modifierGroups[0]).toMatchObject({ minSelect: 1, maxSelect: 1 })
+    // Partial override: max pinned, min falls back.
+    expect(tikka.modifierGroups[0]).toMatchObject({ minSelect: 1, maxSelect: 2 })
+    // Both overridden — and this is the case that deleting the override logic would break.
+    expect(rogan.modifierGroups[0]).toMatchObject({ minSelect: 0, maxSelect: 3 })
+
+    // The ruling for downstream validators: minSelect decides, `required` does not
+    // outrank it. A group flagged required can still be optional on a given item.
+    expect(rogan.modifierGroups[0].required).toBe(true)
+    expect(rogan.modifierGroups[0].minSelect).toBe(0)
   })
 
   it('versions per location, not globally', async () => {

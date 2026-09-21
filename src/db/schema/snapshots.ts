@@ -14,9 +14,20 @@ export type SnapshotModifierOption = {
 export type SnapshotModifierGroup = {
   id: string
   name: string
-  /** Effective for this item: the item's override if it set one, else the group's own. */
+  /**
+   * Effective for THIS item: the item's override if it set one, else the group's own
+   * (`item_modifier_groups.minOverride ?? group.minSelect`, and the same for max).
+   * An override of 0 is a real value, not "unset".
+   */
   minSelect: number
   maxSelect: number
+  /**
+   * The ruling for validators (Tasks 5, 6, 8): **`minSelect` decides whether a
+   * selection is mandatory; `required` never overrides it.** `required` is the
+   * group's own flag, which no item can override, so a payload may legitimately say
+   * `required: true, minSelect: 0` — an item that opted out of a normally-mandatory
+   * group. Enforce min/max; treat `required` as display intent only.
+   */
   required: boolean
   options: SnapshotModifierOption[]
 }

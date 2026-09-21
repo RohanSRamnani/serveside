@@ -82,9 +82,12 @@ async function readActiveMenu(locationId: string): Promise<MenuSnapshotPayload> 
         modifierGroups: item.modifierGroupLinks.map((link): SnapshotModifierGroup => ({
           id: link.group.id,
           name: link.group.name,
-          // Pin the rule that was actually enforced: the item's override, else the group's own.
+          // Pin the rule that was actually enforced: the item's override, else the group's
+          // own. `??`, not `||` — minOverride: 0 ("optional on this dish") is a real value.
           minSelect: link.minOverride ?? link.group.minSelect,
           maxSelect: link.maxOverride ?? link.group.maxSelect,
+          // Not overridable per item, and it does not outrank minSelect. See the ruling
+          // on SnapshotModifierGroup.required.
           required: link.group.required,
           options: link.group.options.map((option) => ({
             id: option.id,
