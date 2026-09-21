@@ -21,8 +21,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   share the single Neon `test` branch, so they are not isolated from each other.
 - `npm run typecheck` — `next typegen && tsc --noEmit`. Bare `tsc` fails; `LayoutProps`
   and the other route types only exist after typegen.
-- `npx drizzle-kit generate`, then `npm run db:migrate` — migrate targets whatever
-  `DATABASE_URL` is set, so point it at the branch you mean.
+- `npx drizzle-kit generate`, then `npm run db:migrate` — drizzle-kit reads no `.env`
+  file, so bare `db:migrate` dies on `url: undefined`. Name the branch you mean:
+  `DATABASE_URL=$(grep DATABASE_URL .env.test | cut -d= -f2-) npm run db:migrate`.
 
 ## Gotchas
 
