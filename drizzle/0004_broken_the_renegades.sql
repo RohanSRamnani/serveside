@@ -1,0 +1,1 @@
+ALTER TABLE "business_hours" ADD CONSTRAINT "business_hours_no_midnight_wrap" CHECK ("business_hours"."close_time" > "business_hours"."open_time");

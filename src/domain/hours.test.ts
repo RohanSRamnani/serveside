@@ -19,6 +19,18 @@ const WED_01_00_ET = new Date('2026-09-23T05:00:00Z') // the other side of midni
 // Same 21:00 UTC as TUE_17_00_ET, but in standard time it is 16:00 local, not 17:00.
 const TUE_16_00_EST = new Date('2027-01-19T21:00:00Z')
 
+/**
+ * Drizzle wraps driver errors in a DrizzleQueryError whose own message is only the
+ * failed query, so the constraint name lives further down `cause`.
+ */
+function errorChainText(err: unknown): string {
+  let text = ''
+  for (let e: unknown = err, depth = 0; e != null && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    text += `${(e as Error).message ?? ''} ${(e as { constraint?: string }).constraint ?? ''}\n`
+  }
+  return text
+}
+
 /** Tue (dow 2) split service: lunch 11:30–15:00, dinner 17:00–22:00. */
 async function seedTuesdaySplitService(locationId: string) {
   await db().insert(businessHours).values([
@@ -163,6 +175,25 @@ describe('isOpenAt', () => {
     // One restaurant hitting pause must never close the one next door.
     expect(await isOpenAt(paused.id, TUE_18_00_ET)).toEqual({ open: false, reason: 'paused' })
     expect(await isOpenAt(busy.id, TUE_18_00_ET)).toEqual({ open: true })
+  })
+
+  it('refuses a row that wraps past midnight, and accepts the same shift split in two', async () => {
+    const loc = await seedLocation()
+    // `22:00 <= t AND t < 02:00` is satisfiable by no instant at all: the row would
+    // post a dinner service and close the restaurant for the entire day instead,
+    // silently. The database has to be the one that says no — this is data entry,
+    // not arithmetic, so no amount of care in isOpenAt can prevent it.
+    const err = await db().insert(businessHours)
+      .values({ locationId: loc.id, dow: 2, openTime: '22:00:00', closeTime: '02:00:00' })
+      .then(() => null, (e: unknown) => e)
+    expect(err).not.toBeNull()
+    expect(errorChainText(err)).toMatch(/business_hours_no_midnight_wrap/)
+
+    // The documented alternative must stay legal, 24:00:00 boundary included.
+    await expect(db().insert(businessHours).values([
+      { locationId: loc.id, dow: 2, openTime: '22:00:00', closeTime: '24:00:00' },
+      { locationId: loc.id, dow: 3, openTime: '00:00:00', closeTime: '02:00:00' },
+    ])).resolves.toBeDefined()
   })
 
   it('is closed when no hours are posted at all', async () => {

@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, time, timestamp } from 'drizzle-orm/pg-core'
+import { pgTable, uuid, text, integer, time, timestamp, check } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 
 /**
@@ -12,6 +13,11 @@ import { locations } from './tenancy'
  * A range never wraps past midnight — `isOpenAt` compares `open <= local < close`
  * within one local day. Post a 17:00–02:00 shift as two rows: Tue 17:00–24:00
  * (Postgres `time` accepts 24:00:00) plus Wed 00:00–02:00.
+ *
+ * The CHECK is what makes that convention safe rather than merely documented: a
+ * wrap-around row reads as an ordinary dinner service to whoever typed it, but
+ * `22:00 <= t AND t < 02:00` is true for no instant at all, so the location would
+ * report closed for the whole day and nothing would say why.
  */
 export const businessHours = pgTable('business_hours', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -21,7 +27,10 @@ export const businessHours = pgTable('business_hours', {
   openTime: time('open_time').notNull(),
   /** Exclusive: an order must not land on the stroke of close. */
   closeTime: time('close_time').notNull(),
-})
+}, (t) => [
+  // Strict `>`: a zero-length range is as unorderable as a wrapped one.
+  check('business_hours_no_midnight_wrap', sql`${t.closeTime} > ${t.openTime}`),
+])
 
 /**
  * Dated overrides of the weekly grid — Thanksgiving, a private event, a flood.
