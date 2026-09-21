@@ -101,6 +101,14 @@ export const printerHeartbeat = inngest.createFunction(
  * for the same reason: they are independent, and one restaurant's database trouble
  * must not swallow a platform-wide security signal. The run still ends red when either
  * fails, naming which.
+ *
+ * TODO(scale): one transaction per location every five minutes — twelve times the
+ * unsnooze cron's load and against the same unavoidable full scan (`listLocationIds`
+ * explains why there is no narrower question to ask under RLS). Two indexed reads
+ * each, so it is fine into the low hundreds and wrong in the thousands, where it would
+ * also outrun a serverless invocation. The fix is the same one named there: a second
+ * SECURITY DEFINER function — returning only the locations with a silent printer or a
+ * stuck ticket — which has to be argued for by name in `src/repo/rls.test.ts` first.
  */
 export async function sweepPrinters(step: GetStepTools<typeof inngest>): Promise<HeartbeatSummary> {
   const locationIds = await step.run('list-locations', listLocationIds)
@@ -155,27 +163,48 @@ async function alertLocations(locationIds: string[]): Promise<PrinterAlert[]> {
  * inside would hold a database transaction open across two HTTP calls to Twilio, which
  * is a connection held for a network's worth of latency on every alert.
  *
- * **Send before stamping, not after**, and the asymmetry is deliberate — the same one
- * the order fan-out makes about its SMS leg. Stamping first would mean an SMS failure
- * silently buys an hour of silence about a dead printer; sending first means a retry
- * after a partial failure can text an owner twice. A duplicate alert is a nuisance; a
- * missed one is a kitchen that does not know it stopped printing.
+ * **Both texts go out together and the cooldown starts if either of them landed.** The
+ * two phones are one alert, and the question the stamp answers is "has this alarm been
+ * raised", not "did every leg of it succeed":
+ *
+ * - Both failed — Twilio is down — so nothing was raised: no stamp, and the throw
+ *   below makes the step retry and genuinely try again.
+ * - One failed: somebody knows. Stamping is what stops the retry texting the other
+ *   one a second, third and fourth time about one dead printer, and retrying would not
+ *   fix the usual cause anyway (a restaurant phone that has replied STOP, or an
+ *   `OPS_ALERT_E164` nobody set). The run still ends red, which is how we find out.
+ *
+ * Stamping *before* sending would be the worst of both: an SMS failure would silently
+ * buy an hour of silence about a kitchen that has stopped printing.
  */
 async function alertLocation(locationId: string): Promise<PrinterAlert | null> {
   const now = new Date()
   const due = await assess(locationId, now)
   if (!due) return null
 
+  // One message to both, on purpose: it is one thing to get right, and it names the
+  // restaurant because we have more than one of them. Concurrently, because the
+  // restaurant-first ordering that matters is the stale-order escalation's four
+  // minutes, not two milliseconds here — a dead printer is often ours to chase.
   const message = heartbeatMessage(due.name, due.silentMinutes, due.stuckJobs)
-  // The owner first: it is their kitchen, and most of these are fixed by walking over
-  // to the printer. Ours goes to the same words on purpose — one message to get right,
-  // and it names the restaurant because we have more than one of them.
-  await sendSms(due.phoneE164, message)
-  await sendSms(env('OPS_ALERT_E164'), message)
+  const [owner, ops] = await Promise.allSettled([
+    sendSms(due.phoneE164, message),
+    textOps(message),
+  ])
 
-  await withLocation(locationId, (tx) => tx.update(printers)
-    .set({ lastAlertAt: now })
-    .where(inArray(printers.id, due.printerIds)))
+  if (owner.status === 'fulfilled' || ops.status === 'fulfilled') {
+    await withLocation(locationId, (tx) => tx.update(printers)
+      .set({ lastAlertAt: now })
+      .where(inArray(printers.id, due.printerIds)))
+  }
+
+  const failures = [
+    owner.status === 'rejected' ? `owner: ${describe(owner.reason)}` : null,
+    ops.status === 'rejected' ? `ops: ${describe(ops.reason)}` : null,
+  ].filter((failure): failure is string => failure !== null)
+  // Named, because which phone did not ring decides what someone does next: a bad
+  // restaurant number is a support call, and a bad ours is a deploy.
+  if (failures.length > 0) throw new Error(`could not raise the printer alert — ${failures.join('; ')}`)
 
   return {
     locationId,
@@ -183,6 +212,16 @@ async function alertLocation(locationId: string): Promise<PrinterAlert | null> {
     silentMinutes: due.silentMinutes,
     stuckJobs: due.stuckJobs,
   }
+}
+
+/**
+ * Our own phone. A function rather than an inline `env()` call so that a missing
+ * `OPS_ALERT_E164` is a **rejected promise** inside `Promise.allSettled` rather than a
+ * synchronous throw that escapes it — which would leave the owner's text in flight,
+ * unawaited, and lose the very message that matters most.
+ */
+async function textOps(message: string): Promise<void> {
+  await sendSms(env('OPS_ALERT_E164'), message)
 }
 
 type Due = {
@@ -328,8 +367,7 @@ async function alertProbeBurst(): Promise<ProbeBurst> {
   }
 
   // Us only. There is no restaurant to tell: by definition these serials are nobody's.
-  await sendSms(
-    env('OPS_ALERT_E164'),
+  await textOps(
     `Serveside: ${serials} unknown printer serials polled in the last 10 min — possible serial sweep.`,
   )
   // Stamped after the send, like the printer alert, and on the rows that made the

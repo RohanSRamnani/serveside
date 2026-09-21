@@ -304,6 +304,48 @@ describe('the printer heartbeat', () => {
     expect(sendSms).not.toHaveBeenCalled()
   })
 
+  it('still tells the owner when our own number is unreachable, and does not repeat itself', async () => {
+    // Both phones are one alert, and the stamp answers "has this alarm been raised",
+    // not "did every leg succeed". Without that, a blank `OPS_ALERT_E164` or a number
+    // that has replied STOP would make Inngest retry the step and text a restaurant
+    // owner four times about one dead printer — and retrying would not fix either
+    // cause. The run still ends red, which is how we find out ours is broken.
+    await clearProbeWindow()
+    const loc = await restaurant()
+    const printer = await printerLastSeen(loc.id, 7)
+    sendSms.mockImplementation((to: string) =>
+      (to === OPS_PHONE ? Promise.reject(new Error('twilio said no')) : Promise.resolve()))
+
+    await expect(sweepPrinters(fakeStep([loc.id]))).rejects.toThrow(/ops: twilio said no/)
+
+    expect(textsTo(loc.phoneE164)).toHaveLength(1)
+    expect((await readPrinter(loc.id, printer.id)).lastAlertAt).toBeInstanceOf(Date)
+
+    // The retry — and the next eleven runs this hour — say nothing more.
+    sendSms.mockClear()
+    await sweepPrinters(fakeStep([loc.id]))
+    expect(sendSms).not.toHaveBeenCalled()
+  })
+
+  it('does not start the cooldown when neither phone could be reached', async () => {
+    // Twilio down is the one case where retrying is exactly right: nobody was told
+    // anything, so the alarm has not been raised and the hour must not start.
+    await clearProbeWindow()
+    const loc = await restaurant()
+    const printer = await printerLastSeen(loc.id, 7)
+    sendSms.mockRejectedValue(new Error('twilio is down'))
+
+    await expect(sweepPrinters(fakeStep([loc.id]))).rejects.toThrow(/owner: .*; ops: /)
+    expect((await readPrinter(loc.id, printer.id)).lastAlertAt).toBeNull()
+
+    // And once it is back, the alert goes out on the very next run.
+    sendSms.mockReset()
+    sendSms.mockResolvedValue(undefined)
+    await sweepPrinters(fakeStep([loc.id]))
+    expect(textsTo(loc.phoneE164)).toHaveLength(1)
+    expect(textsTo(OPS_PHONE)).toHaveLength(1)
+  })
+
   it('carries on past a location it cannot read, and ends the run red naming it', async () => {
     // Whatever goes wrong for one restaurant must not stop every other restaurant's
     // printer being checked — the same ruling the unsnooze cron makes.
