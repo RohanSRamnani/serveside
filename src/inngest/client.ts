@@ -10,8 +10,17 @@ import { Inngest } from 'inngest'
  */
 export const inngest = new Inngest({ id: 'serveside' })
 
-/** The only event in the system today. A const because the sender and the trigger must not drift. */
+/**
+ * The events in the system. Consts because a sender and a trigger that drift apart
+ * compile, serve, and deliver nothing, forever.
+ *
+ * `order/created` has **two** listeners: the fan-out that tells a kitchen, and the
+ * stale-order escalation that notices when the kitchen did nothing about it. One
+ * event, because both ways an order reaches NEW already send exactly one — and a
+ * second event would be a second thing to remember to fire.
+ */
 export const ORDER_CREATED = 'order/created' as const
+export const PROVENANCE_REFUSED = 'payments/provenance-refused' as const
 
 /**
  * What the fan-out is told. Deliberately **ids only** — no order body, no totals, no
@@ -56,6 +65,51 @@ export async function sendOrderCreated(orderId: string, locationId: string): Pro
     name: ORDER_CREATED,
     data: { orderId, locationId } satisfies OrderCreatedData,
     id: `order-created-${orderId}`,
+  })
+  return ids
+}
+
+/**
+ * Why a payment was refused. Both are fail-closed checks in the Stripe webhook, and
+ * both are security events rather than data-quality wobbles: a signed event proves
+ * Stripe sent it, not whose money it is.
+ *
+ *   account_mismatch   the money originated on a connected account that is not this
+ *                      restaurant's — someone minting an intent with a victim's ids.
+ *   amount_mismatch    right account, wrong amount. 50¢ against a $45 order.
+ */
+export type ProvenanceRefusal = 'account_mismatch' | 'amount_mismatch'
+
+/** Ids and a reason, nothing else — an event payload lives in Inngest's dashboard. */
+export type ProvenanceRefusedData = {
+  orderId: string
+  locationId: string
+  reason: ProvenanceRefusal
+}
+
+/**
+ * Raise the alarm on a payment we refused to act on.
+ *
+ * The refusals it reports used to be a `console.error` and nothing else, which on a
+ * serverless function is a line nobody reads until they are already looking for it —
+ * and the whole point of these checks is that they catch something being *attempted*.
+ *
+ * **Keyed on the Stripe delivery, not the order.** Stripe retries a 5xx for three
+ * days and replays from the dashboard on demand, so the same refusal can arrive many
+ * times; the dedupe makes that one ring instead of hundreds. Keying on the order
+ * instead would hide a second, genuinely different attempt on the same order.
+ *
+ * Throws like `sendOrderCreated` does. The caller decides what that means; the webhook
+ * turns it into a 5xx, so an alert we could not raise is retried rather than lost.
+ */
+export async function sendProvenanceRefused(
+  data: ProvenanceRefusedData,
+  stripeEventId: string,
+): Promise<string[]> {
+  const { ids } = await inngest.send({
+    name: PROVENANCE_REFUSED,
+    data,
+    id: `provenance-refused-${stripeEventId}`,
   })
   return ids
 }

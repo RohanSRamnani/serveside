@@ -1,6 +1,8 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { orders, orderEvents, menus } from '@/db/schema'
+import type { GetStepTools } from 'inngest'
+import type { inngest as inngestClient } from '@/inngest/client'
+import { orders, orderEvents, menus, printJobs } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
 
@@ -29,7 +31,31 @@ vi.mock('stripe', () => ({
   },
 }))
 
+/**
+ * A **pay-at-pickup order reaches NEW inside this route**, and nothing else will ever
+ * announce it — the Stripe webhook only sees card orders. So the fan-out has to be
+ * fired from here or the ticket is never rendered, the printer never hears about the
+ * order, and the owner is never texted: the order exists, is due in 15 minutes, and
+ * the only place it appears is the kitchen tablet, if anyone is watching it.
+ *
+ * `sendOrderCreated` is mocked at the seam the route calls rather than at the network,
+ * and the ticket is then proved by driving the **real** `fanOut` with the ids it was
+ * handed. `importOriginal` is load-bearing: the fan-out imports `inngest` from this
+ * same module, and a factory exporting only `sendOrderCreated` would take the client
+ * away from it.
+ */
+const { sendOrderCreated, sendSms } = vi.hoisted(() => ({
+  sendOrderCreated: vi.fn(),
+  sendSms: vi.fn(),
+}))
+vi.mock('@/inngest/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/inngest/client')>(),
+  sendOrderCreated,
+}))
+vi.mock('@/lib/sms', () => ({ sendSms }))
+
 const { POST } = await import('./orders/route')
+const { fanOut } = await import('@/inngest/order-created')
 
 /** The seeded menu's own arithmetic: (1800 + 50) × 2 = 3700, tax 875bps → 324, tip 500. */
 const TIP_CENTS = 500
@@ -88,7 +114,21 @@ beforeEach(() => {
   paymentIntentsCreate.mockResolvedValue({
     id: currentIntentId, client_secret: `${currentIntentId}_secret_abc`,
   })
+  sendOrderCreated.mockResolvedValue(['01JEVENTID'])
+  sendSms.mockResolvedValue(undefined)
+  vi.stubEnv('FEED_URL', 'https://serveside.test/feed')
 })
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
+
+/** A `step` that simply runs the work — the fan-out's own tests explain why. */
+function plainStep(): GetStepTools<typeof inngestClient> {
+  return {
+    run: (_id: string, fn: () => Promise<unknown>) => fn(),
+  } as unknown as GetStepTools<typeof inngestClient>
+}
 
 describe('POST /api/orders', () => {
   it('places a card order and opens an intent on the restaurant’s own account', async () => {
@@ -149,6 +189,65 @@ describe('POST /api/orders', () => {
     expect(order.paymentStatus).toBe('PAY_ON_PICKUP')
     // Already the kitchen's problem, so it is already promised a time.
     expect(order.quotedReadyAt).not.toBeNull()
+  })
+
+  it('announces a pay-at-pickup order, because nothing else ever will', async () => {
+    // The order reaches NEW inside this route and the Stripe webhook — the only other
+    // caller of the fan-out — never sees it. Without this the ticket is never rendered,
+    // no print job is queued, the owner is never texted, and the stale-order alert has
+    // no event to hang off: the order is real, due in fifteen minutes, and visible
+    // only on a tablet nobody is looking at.
+    const loc = await openRestaurant({ stripeAccountId: null })
+
+    const res = await post(cartFor(loc, { payment: 'pay_on_pickup' }))
+    expect(res.status).toBe(200)
+    const { orderId, shortCode } = await res.json()
+
+    // Both ids: the worker has no scope of its own, and RLS hides the order from
+    // anything that cannot name the location.
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(sendOrderCreated).toHaveBeenCalledWith(orderId, loc.id)
+
+    // End to end, with the real fan-out rather than a spy's say-so: the ticket a
+    // kitchen prints is the artefact this whole path exists to produce.
+    await fanOut({ orderId, locationId: loc.id }, plainStep())
+    const [job] = await withLocation(loc.id, (tx) =>
+      tx.select().from(printJobs).where(eq(printJobs.orderId, orderId)))
+    expect(job).toBeDefined()
+    expect(job.status).toBe('queued')
+    expect(job.payload).toContain(shortCode)
+    expect(sendSms).toHaveBeenCalledWith(loc.phoneE164, expect.stringContaining(shortCode))
+  })
+
+  it('does not announce a card order from here — the webhook does that when the money lands', async () => {
+    // A PENDING_PAYMENT order is not the kitchen's problem, and a ticket for one is
+    // food given away. The gate is the status `createOrder` returned, not the payment
+    // mode, so a future payment mode that lands at NEW is announced for free.
+    const loc = await openRestaurant()
+    const res = await post(cartFor(loc))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('still takes the order when the announcement cannot be sent', async () => {
+    // The order is already committed at NEW by the time this can fail. Answering 500
+    // would tell a customer their dinner did not happen when it did, and the retry is
+    // a second dinner — so the failure is logged loudly and the order is confirmed.
+    // It is not silent: the order is on the kitchen board either way, because the feed
+    // reads `orders`, not `print_jobs`.
+    const loc = await openRestaurant({ stripeAccountId: null })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    sendOrderCreated.mockRejectedValueOnce(new Error('inngest is down'))
+
+    try {
+      const res = await post(cartFor(loc, { payment: 'pay_on_pickup' }))
+      expect(res.status).toBe(200)
+      const { orderId } = await res.json()
+      expect((await readOrder(loc.id, orderId)).status).toBe('NEW')
+      expect(error.mock.calls.flat().join(' ')).toMatch(/inngest is down/)
+    } finally {
+      error.mockRestore()
+    }
   })
 
   it('answers 422 and the rejection code when the customer can do something about it', async () => {

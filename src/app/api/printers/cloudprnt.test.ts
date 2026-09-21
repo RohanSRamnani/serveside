@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { eq, sql } from 'drizzle-orm'
 import { neon } from '@neondatabase/serverless'
 import { db } from '@/db/client'
-import { printers, printJobs } from '@/db/schema'
+import { printers, printJobs, printerProbeEvents } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { seedLocationWithMenu, seedPaidOrder, seedPrinter, seedPrintJob, macAddress } from '@/test/seed'
 
@@ -224,6 +224,56 @@ describe('the serial is the credential', () => {
     expect((await readPrinter(existing.loc.id, existing.printer.id)).lastSeenAt).toBeNull()
   })
 
+  it('counts an unprovisioned serial, one row however many times it knocks', async () => {
+    // The **one** thing an unknown serial now writes, and it is nothing like an
+    // auto-registration: a row with no `location_id`, no path into `printers`, and
+    // nothing in it but a serial that belongs to nobody. It exists because serial
+    // enumeration is the residual attack on this route and a spread of distinct
+    // unknown serials is the only signal it gives off — and because a serverless
+    // counter in memory is per-instance, per-cold-start, and therefore never over any
+    // threshold.
+    //
+    // Upserted rather than appended, which is what bounds it: this path is
+    // unauthenticated, so a row per request would be unbounded growth an attacker
+    // controls. One mis-provisioned printer knocking all afternoon is one row.
+    const before = await countPrinters()
+    const stranger = macAddress()
+
+    await poll(stranger)
+    await poll(stranger)
+
+    const [probe] = await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, stranger))
+    expect(probe).toBeDefined()
+    expect(probe.polls).toBe(2)
+    expect(probe.alertedAt).toBeNull()
+    expect(Date.now() - probe.lastSeenAt.getTime()).toBeLessThan(60_000)
+
+    // Still not a printer, and still not anybody's: the count that would catch an
+    // auto-registration is unchanged, and the lookup still refuses the serial.
+    expect(await countPrinters()).toBe(before)
+    expect((await db().execute(sql`select * from printer_lookup(${stranger})`)).rows).toHaveLength(0)
+  })
+
+  it('records nothing for a serial that is not shaped like one', async () => {
+    // The clamp runs first, so the probe table can only ever hold short, boring
+    // tokens — the same guarantee the log line has. Otherwise a megabyte of JSON in
+    // `printerMAC` would be a megabyte in a durable table, on every request.
+    const before = await db().select({ id: printerProbeEvents.id }).from(printerProbeEvents)
+    await poll('x'.repeat(65))
+    await poll('00 11 62')
+    expect(await db().select({ id: printerProbeEvents.id }).from(printerProbeEvents))
+      .toHaveLength(before.length)
+  })
+
+  it('records nothing for a printer it knows', async () => {
+    const { printer } = await kitchen()
+    await poll(printer.serial)
+    const rows = await db().select().from(printerProbeEvents)
+      .where(eq(printerProbeEvents.serial, printer.serial))
+    expect(rows).toHaveLength(0)
+  })
+
   it('drops a serial that is not shaped like one before it reaches a log line', async () => {
     // The clamp's whole effect is on what gets *logged*, because an unknown serial is
     // answered `jobReady: false` either way — so asserting the response would be
@@ -246,7 +296,7 @@ describe('the serial is the credential', () => {
       }
 
       // The positive control: a well-shaped serial we simply do not know *is* worth a
-      // line, and that line is the signal Task 14's enumeration alert will read.
+      // line, and the row beside it is what the enumeration alarm counts.
       const unknown = macAddress()
       await poll(unknown)
       expect(warn).toHaveBeenCalledTimes(1)

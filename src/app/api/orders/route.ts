@@ -5,6 +5,7 @@ import { withLocation } from '@/repo/scoped'
 import { transition } from '@/domain/order-status'
 import { createOrder, OrderRejectedError, type CreateOrderInput, type CreateOrderResult } from '@/domain/create-order'
 import { createPaymentIntentFor, StripeAccountMissingError } from '@/lib/stripe'
+import { sendOrderCreated } from '@/inngest/client'
 
 /**
  * Checkout. The one route in this plan a stranger can POST to.
@@ -51,6 +52,7 @@ export async function POST(req: Request): Promise<Response> {
   // Cash at the counter: nothing to charge, and the order is already at NEW with a
   // ready time on it. A location with no Stripe account can still do this all day.
   if (input.payment !== 'card') {
+    await announce(order, input.locationId)
     return Response.json({ orderId: order.orderId, shortCode: order.shortCode }, { status: 200 })
   }
 
@@ -80,6 +82,40 @@ export async function POST(req: Request): Promise<Response> {
     }
     console.error('[POST /api/orders] payment setup failed for order', order.orderId, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
+  }
+}
+
+/**
+ * Hands a pay-at-pickup order to the fan-out — the ticket, and the owner's text.
+ *
+ * **This is the only thing that will ever announce such an order.** The Stripe
+ * webhook is the fan-out's other caller and it only ever sees card orders; a
+ * pay-at-pickup order reaches NEW inside `createOrder` and, without this line, is
+ * never rendered, never queued for a printer and never texted about. It exists, it is
+ * due in fifteen minutes, and the only place it appears is a tablet somebody has to
+ * be looking at.
+ *
+ * **Gated on the status the domain returned, not on the payment mode.** `NEW` is
+ * precisely "the kitchen owns this now", so a payment mode added later that lands
+ * there is announced for free, and one that parks at PENDING_PAYMENT cannot leak a
+ * ticket for food nobody has paid for.
+ *
+ * **Failure is logged, not returned.** The order is already committed at NEW by the
+ * time this can fail, so a 500 would tell a customer their dinner did not happen when
+ * it did — and their retry is a second dinner. Degraded rather than silent: the
+ * kitchen feed reads `orders`, so the order is on the board either way. Safe to leave
+ * best-effort because `sendOrderCreated` is idempotent per order, so a later re-fire
+ * (by hand, or by a future sweep) cannot print a second ticket.
+ */
+async function announce(order: CreateOrderResult, locationId: string): Promise<void> {
+  if (order.status !== 'NEW') return
+  try {
+    await sendOrderCreated(order.orderId, locationId)
+  } catch (err) {
+    console.error(
+      '[POST /api/orders] order', order.orderId, 'is NEW but could not be announced —',
+      'no ticket and no SMS; it is on the kitchen feed only:', err,
+    )
   }
 }
 

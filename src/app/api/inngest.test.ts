@@ -40,4 +40,41 @@ describe('/api/inngest', () => {
     expect(functions.map((fn) => fn.id(''))).toContain(unsnooze.id(''))
     expect(unsnooze.opts.triggers).toEqual([{ cron: UNSNOOZE_CRON }])
   })
+
+  it('serves the whole registry, by name, so a new function cannot be half-added', async () => {
+    const { functions } = await import('@/inngest/functions')
+
+    // **The exact set, not a `toContain`.** Every alarm in this system is a function
+    // whose absence looks exactly like nothing being wrong: an unregistered cron has
+    // no event to go missing and no failed run to look at, and an unregistered event
+    // listener is an event Inngest accepts and drops. Pinning the list means adding
+    // one is two edits and forgetting the second is a failing test rather than a
+    // silence somebody notices in six weeks.
+    expect(functions.map((fn) => fn.id('')).sort()).toEqual([
+      'order-created-fan-out',
+      'printer-heartbeat',
+      'provenance-refused-alert',
+      'stale-order-alert',
+      'unsnooze-expired-86s',
+    ])
+  })
+
+  it('escalates a stale order off the same event the fan-out rides', async () => {
+    const { ORDER_CREATED } = await import('@/inngest/client')
+    const { staleOrderAlert } = await import('@/inngest/stale-order-alert')
+
+    // Two functions, one event, on purpose: both paths to NEW already send exactly
+    // one, and a second event would be a second thing to remember to fire — from the
+    // path that was only just fixed.
+    expect(staleOrderAlert.opts.triggers).toEqual([{ event: ORDER_CREATED }])
+  })
+
+  it('runs the printer heartbeat on its cron and the provenance alarm on its event', async () => {
+    const { PROVENANCE_REFUSED } = await import('@/inngest/client')
+    const { printerHeartbeat, HEARTBEAT_CRON } = await import('@/inngest/printer-heartbeat')
+    const { provenanceRefused } = await import('@/inngest/provenance-refused')
+
+    expect(printerHeartbeat.opts.triggers).toEqual([{ cron: HEARTBEAT_CRON }])
+    expect(provenanceRefused.opts.triggers).toEqual([{ event: PROVENANCE_REFUSED }])
+  })
 })

@@ -59,15 +59,22 @@ describe('RLS tenancy', () => {
       'order_pauses', 'orders', 'print_jobs', 'printers',
     ])
     // Exempt on purpose, and only these. Three are the tenancy root, which has nothing
-    // to scope to until a location exists (0008). The fourth, `webhook_events`, is the
-    // deliberate Task 9 addition: a webhook is authenticated by its signature and
-    // arrives before anything knows whose it is — the location is inside the payload,
-    // so there is no scope to open at the moment the row must be written, and opening
-    // one from the unverified body would be scoping to whatever the caller claimed.
-    // The handler opens `withLocation` for the order write. Documented in CLAUDE.md,
-    // in 0008 and in 0011.
+    // to scope to until a location exists (0008). `webhook_events` is the deliberate
+    // Task 9 addition: a webhook is authenticated by its signature and arrives before
+    // anything knows whose it is — the location is inside the payload, so there is no
+    // scope to open at the moment the row must be written, and opening one from the
+    // unverified body would be scoping to whatever the caller claimed. The handler
+    // opens `withLocation` for the order write. Documented in CLAUDE.md, in 0008 and
+    // in 0011.
+    //
+    // `printer_probe_events` (0015/0016) is the second, and it is a stronger case than
+    // the fourth rather than a weaker one: a row lands there *because*
+    // `printer_lookup` returned nothing, so the serial belongs to no location at all —
+    // there is no tenant to scope to, not merely one not yet read. The table has no
+    // `location_id`, holds nothing of any restaurant's, and nothing in it can become a
+    // printer. Its reader is a platform-wide cron, which has no scope either.
     expect(byName.filter((r) => !r.rls).map((r) => r.table)).toEqual([
-      'locations', 'memberships', 'organizations', 'webhook_events',
+      'locations', 'memberships', 'organizations', 'printer_probe_events', 'webhook_events',
     ])
   })
 

@@ -116,7 +116,13 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   the platform has a connected account and can mint an intent with any metadata, so
   the flip additionally requires `event.account === location.stripeAccountId` and
   `intent.amount === order.totalCents` (and, when the order already holds one, a
-  matching intent id). All three are log-and-200 no-ops on mismatch.
+  matching intent id). All three are log-and-200 no-ops on mismatch. The **first two
+  also emit `payments/provenance-refused`**, which texts `OPS_ALERT_E164`: they catch
+  something being *attempted*, and a `console.error` on a serverless function is not an
+  alarm. Sent after the transaction, keyed on the Stripe event id so three days of
+  retries ring one phone. The intent-mismatch branch is deliberately silent — an order
+  can only hold a second intent because we made one, so it is our bug, not a stranger's
+  money.
   **Deployment consequence:** the endpoint must be registered as a **Connect** webhook
   on the platform account — that is what populates `event.account`. Registered on a
   connected account it is absent, and every flip becomes a logged no-op.
@@ -131,14 +137,19 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   MAC** (Star sends it on the query string too), because that is what makes a
   `jobToken` redeemable only in the context that was offered it — a token from another
   restaurant is a 404 with an empty body, never a 403. An unknown serial is answered
-  `jobReady: false` and **writes nothing**: auto-registration would let anyone who can
-  reach the URL claim a location and collect its tickets. A non-OK `code` leaves the
-  job at `delivered` rather than requeuing it — a jammed printer would otherwise fail
-  the same ticket forever and never reach the orders behind it. **The open risk is
+  `jobReady: false` and **creates no printer**: auto-registration would let anyone who
+  can reach the URL claim a location and collect its tickets. A non-OK `code` leaves
+  the job at `delivered` rather than requeuing it — a jammed printer would otherwise
+  fail the same ticket forever and never reach the orders behind it. **The open risk is
   serial enumeration**: the OUI is public and vendors burn MACs sequentially, so a hit
   steals a ticket (name + phone) and can confirm it so it never prints. The serial is
-  clamped to a plausible shape before it is queried or logged; the throttle and the
-  unprovisioned-serial-burst alert are Task 14's, marked `TODO(task-14)` in the route.
+  clamped to a plausible shape before it is queried or logged, and the one thing an
+  unknown one now writes is an upserted `printer_probe_events` row (no `location_id`,
+  no path into `printers`) that the heartbeat cron counts. **The poll path is
+  deliberately not rate-limited** — a whole restaurant shares one NAT and a real
+  printer polls forever, so a limiter tight enough to slow a sweep eventually refuses a
+  kitchen's ticket; the argument is written at the head of the route, and a limiter, if
+  ever wanted, belongs at the CDN.
 - **The order fan-out (`src/inngest/order-created.ts`) is two INDEPENDENT steps, and
   that independence is the point.** `queue-print-job` and `sms-owner` run under one
   `Promise.allSettled`, so a jammed printer still texts the owner and a dead Twilio
@@ -161,6 +172,34 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `timezone` because a ticket prints the restaurant's wall clock, never the server's,
   and that column is not on the order row. `src/domain/ticket.test.ts` pins the exact
   output — change the layout and you change the golden, deliberately.
+- **Every path that reaches NEW must send `order/created`, and there are two.** The
+  Stripe webhook after the flip, and `POST /api/orders` for a pay-at-pickup order,
+  which `createOrder` writes straight to NEW. The second was missing until Task 14:
+  those orders were never rendered, never queued for a printer and never texted about —
+  they existed only on the kitchen feed. The route gates on the **status `createOrder`
+  returned**, not the payment mode, and a failure there is logged and still answers
+  200: the order is already committed, and a 500 would make the customer's retry a
+  second dinner. Safe because `sendOrderCreated` is idempotent per order.
+- **The alarms page the RESTAURANT first and us second, and never for a closed
+  restaurant.** Three functions, all in `src/inngest/`:
+  - `stale-order-alert` rides `order/created` alongside the fan-out (two functions, one
+    event). `step.sleep` 6m → still NEW and `isOpenAt` → text the owner "tap Accept";
+    4m more → still NEW and open → text `OPS_ALERT_E164`. Accepting cancels it by
+    itself: each leg re-reads the order, so there is no cancel signal to go wrong. The
+    minutes in the message are the **thresholds, not elapsed since `createdAt`** — a
+    card order's checkout can precede the kitchen hearing about it by minutes.
+  - `printer-heartbeat`, cron `*/5 * * * *`: a printer whose `lastSeenAt` is older than
+    3 minutes, or a `print_job` stuck at `delivered` for 10, texts owner **and** ops in
+    one message, at most once an hour per printer via `printers.lastAlertAt`. A NULL
+    `lastSeenAt` is a unit never plugged in, not a fault. Stuck jobs are **never
+    requeued** — the printer may have printed it and died before saying so, and a
+    duplicate ticket is a duplicate dinner. Sends *then* stamps: a duplicate alert is a
+    nuisance, a missed one is a kitchen that does not know it stopped printing.
+  - `provenance-refused-alert` on `payments/provenance-refused` — ops only; see the
+    Stripe provenance rule above.
+  Its second leg also counts `printer_probe_events`: >20 distinct unknown serials in
+  10 minutes texts ops once an hour. Both legs run under `Promise.allSettled`, so one
+  restaurant's database trouble cannot hide a platform-wide sweep.
 - **`withLocation` is scoping, not authorization, and the check that is authorization
   is `requireLocationAccess` (`src/lib/authz.ts`).** It runs *before* a scope opens and
   resolves one chain: the Clerk session's active org → `organizations.clerk_org_id` →
@@ -297,12 +336,14 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction on that pooled backend has set it. Policies use
   `nullif(current_setting(...), '')::uuid` for that reason; the bare cast raises
   22P02 on every unscoped query instead of quietly matching nothing.
-- **Exempt from RLS, on purpose and only these four**: `organizations`, `locations`,
+- **Exempt from RLS, on purpose and only these five**: `organizations`, `locations`,
   `memberships` — the tenancy root, with nothing to scope to until a location exists —
-  and `webhook_events`, which must be written before anything knows whose event it is
+  `webhook_events`, which must be written before anything knows whose event it is
   (the tenant is inside the payload, and scoping to a location read out of an
-  unverified body would be scoping to whatever the caller claimed). `memberships` is
-  the one worth revisiting; it maps Clerk user ids to orgs.
+  unverified body would be scoping to whatever the caller claimed), and
+  `printer_probe_events`, whose rows exist *because* `printer_lookup` placed the serial
+  with nobody: there is no tenant to scope to at all. `memberships` is the one worth
+  revisiting; it maps Clerk user ids to orgs.
 - A migration that adds a CHECK validates rows already on the `test` branch, and
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.

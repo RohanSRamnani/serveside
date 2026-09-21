@@ -1,0 +1,40 @@
+-- `printer_probe_events`, made usable — and the argument for it being the second
+-- table outside the tenancy root with no row security on it.
+--
+-- 0008 revoked default privileges on future tables from `app_user`, so a table added
+-- after it is unreadable until its own migration grants it. That is the moment
+-- someone has to decide out loud whether it is tenant-scoped. This is that decision.
+--
+--   printer_probe_events   platform-global and **exempt**. A row here is, by
+--                          definition, a printer serial that belongs to *no*
+--                          location: `printer_lookup` returned zero rows, and that
+--                          is the only thing that puts a row in this table. So there
+--                          is no tenant to scope it to — not one we have not read
+--                          yet, as with `webhook_events`, but none at all. Nothing
+--                          in it is a restaurant's data (a serial nobody owns, a
+--                          count, two timestamps), the table carries no
+--                          `location_id`, and nothing here can become a printer:
+--                          provisioning is ours and goes nowhere near this table.
+--                          The reader is a platform-wide cron with no location to
+--                          open either. Named in CLAUDE.md and in the catalog
+--                          assertion in `src/repo/rls.test.ts`.
+--
+-- Why the table exists at all: the CloudPRNT route is unauthenticated by protocol and
+-- the serial is the whole credential, so **serial enumeration** is the attack
+-- (drizzle/0012 and the route's own header set it out). The only signal a sweep gives
+-- off is a spread of *distinct* unknown serials arriving at once — a real unknown
+-- serial is one mis-provisioned printer repeating itself. Counting that needs somewhere
+-- durable: the route runs on serverless, where an in-memory counter is per-instance,
+-- per-cold-start and therefore always under the threshold.
+--
+-- UPDATE is granted because the write is an upsert (`ON CONFLICT DO UPDATE`), and that
+-- is what bounds the table: the poll path is unauthenticated, so a row per request
+-- would be unbounded growth an attacker controls. One row per serial makes a sweep of
+-- N serials cost N rows once, and a printer hammering us cost none. The heartbeat cron
+-- stamps `alerted_at` on the same rows, which is how "one ops SMS an hour" is recorded.
+--
+-- No DELETE: nothing prunes this table today. It grows by one row per serial ever
+-- probed, which is bounded by the enumeration attempts themselves — and each of those
+-- rows is evidence. Add a retention sweep here if that ever stops being true.
+
+GRANT SELECT, INSERT, UPDATE ON TABLE "printer_probe_events" TO app_user;

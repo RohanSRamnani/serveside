@@ -29,7 +29,8 @@ export const metadata: Metadata = {
  * enough that an order abandoned at NEW three weeks ago is not still chiming on a
  * Tuesday morning. Those old orders are a real problem — they are exactly the orders
  * nobody dealt with — but a kitchen board at 11am is the wrong place to raise it, and
- * Task 14's stale-order alert is the right one.
+ * `src/inngest/stale-order-alert.ts` is the right one: it texts the owner six minutes
+ * in, while the customer is still on their way.
  */
 const WINDOW_HOURS = 12
 

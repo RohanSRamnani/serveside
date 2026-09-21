@@ -29,7 +29,13 @@ import { inngest, ORDER_CREATED, type OrderCreatedData } from './client'
  *
  * **The run still fails when a leg does**, deliberately. A half-done fan-out that
  * reports success is a failed print job nobody is ever told about; a red run is what
- * an alert hangs off (Task 14) and what a human goes and looks at.
+ * a human goes and looks at in the dashboard.
+ *
+ * And it is not the only backstop: `stale-order-alert` rides this same event in a run
+ * of its own, so a fan-out that failed *entirely* — no ticket, no text — still ends
+ * with the owner's phone ringing six minutes later, because the order is still sitting
+ * at NEW. The two are independent by construction: a second function on one event
+ * cannot be taken down by the first one's failure.
  *
  * That throw costs nothing but visibility, and the installed SDK is where that is
  * checked rather than assumed. `node_modules/inngest/components/StepError.d.ts`: a

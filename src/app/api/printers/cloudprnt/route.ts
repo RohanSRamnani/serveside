@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm'
 import { db } from '@/db/client'
-import { printers, printJobs } from '@/db/schema'
+import { printers, printJobs, printerProbeEvents } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
 
 /**
@@ -49,18 +49,24 @@ import { withLocation, isUuid } from '@/repo/scoped'
  * kitchen's next ticket, with the customer's name and phone number on it, and can then
  * DELETE it `code=OK` so the ticket never prints and nobody is told.
  *
- * What is done about it here is only what belongs here: the serial is clamped to a
- * plausible shape before it is used or logged (below), so an unknown serial costs one
- * indexed lookup and one bounded log line and nothing else.
+ * What is done about it, in two halves. Here: the serial is clamped to a plausible
+ * shape before it is used or logged (below), so an unknown serial costs one indexed
+ * lookup, one bounded log line and one bounded upsert — and the answer is a flat
+ * `jobReady: false` that tells the caller nothing. Elsewhere: every unplaceable serial
+ * is recorded in `printer_probe_events`, and `src/inngest/printer-heartbeat.ts` texts
+ * ops when twenty distinct ones arrive inside ten minutes, at most once an hour.
  *
- * TODO(task-14): the actual mitigations are rate-limiting and alerting, and they are
- * Task 14's — it already owns the printer-health alerting that reads `lastSeenAt`.
- * Two obligations, neither optional:
- *   1. Throttle polls per source (and per unknown serial) — an enumeration sweep is
- *      thousands of requests a minute; a real printer polls every few seconds.
- *   2. Alert on an **unprovisioned-serial burst**. A genuine unknown serial is a
- *      mis-provisioned printer at install time: one MAC, repeating. A spread of
- *      distinct unknown serials is someone sweeping, and it is the only signal we get.
+ * **Deliberately not rate-limited, and that is a decision rather than a gap.** The
+ * obvious mitigation — throttle polls per source — is the wrong tool on *this* path.
+ * Every printer at a restaurant sits behind one consumer NAT, often shared with a POS,
+ * a tablet and whatever else is on that router, and it polls every few seconds
+ * forever: a limiter tuned tightly enough to slow a sweep is a limiter that eventually
+ * refuses a real kitchen's ticket, and "the printer stopped working at 7pm" is a worse
+ * outcome than the attack it prevents. What actually bounds an attacker is already
+ * here and cannot be tuned wrong: an unknown serial gets an empty answer and writes
+ * nothing it could ever read back, so sweeping buys nothing but our alert firing. If a
+ * limiter is ever added it belongs in front of the whole app (the CDN/WAF layer),
+ * keyed on something better than an IP a whole restaurant shares.
  */
 
 /** The only thing we render. Star uses this to pick its print path. */
@@ -110,16 +116,23 @@ export async function POST(req: Request): Promise<Response> {
   const serial = serialFrom(poll?.printerMAC)
   const printer = serial ? await lookupPrinter(serial) : null
   // A well-formed poll we cannot place is not a bad request — it is a printer we do
-  // not know, and the honest answer is "no work for you". Logged, not written down:
-  // this is the line that would be an auto-registration if we let it be.
+  // not know, and the honest answer is "no work for you". It is counted, and counting
+  // is emphatically not registering: the row it writes carries no `location_id`, has
+  // no path into `printers`, and cannot be read back by whoever caused it.
   if (!printer) {
-    if (serial) console.warn('[cloudprnt] poll from an unprovisioned serial', serial)
+    if (serial) {
+      console.warn('[cloudprnt] poll from an unprovisioned serial', serial)
+      await recordProbe(serial)
+    }
     return noJob()
   }
 
   // The printer reports its own health on every poll — `200 OK`, or a code for cover
-  // open, paper out, a jam. There is nowhere to store it (no column, and Task 14's
-  // alert reads `lastSeenAt`), so it is logged when it is not OK rather than dropped.
+  // open, paper out, a jam. There is nowhere to store it (no column, and the heartbeat
+  // alarm reads `lastSeenAt` and the stuck-job queue instead — a printer reporting
+  // paper out is still polling, so it is alive and its tickets are stuck, which is
+  // exactly what that alarm says), so it is logged when it is not OK rather than
+  // dropped.
   // Bounded and stripped for the same reason the serial is: it ends up in a log line,
   // and a status code with newlines in it would let a printer write its own entries.
   if (typeof poll?.statusCode === 'string' && !poll.statusCode.startsWith('200')) {
@@ -243,6 +256,34 @@ export async function DELETE(req: Request): Promise<Response> {
 async function pollingContext(url: URL): Promise<PrinterRef | null> {
   const serial = serialFrom(url.searchParams.get('mac') ?? url.searchParams.get('printerMAC'))
   return serial ? lookupPrinter(serial) : null
+}
+
+/**
+ * Writes down that a serial nobody owns came knocking — the only durable trace an
+ * enumeration sweep leaves, and the input to the heartbeat cron's burst alarm.
+ *
+ * **One row per serial, upserted.** This path is unauthenticated, so a row per request
+ * would be unbounded growth an attacker controls; an upsert makes a sweep of N serials
+ * cost N rows once and one mis-provisioned printer knocking all afternoon cost none.
+ * `polls` and `firstSeenAt` are what tell those two apart at a glance.
+ *
+ * `db()` because there is no scope to open: a serial `printer_lookup` could not place
+ * belongs to no location at all, which is why the table is exempt from RLS
+ * (drizzle/0016 argues it).
+ *
+ * **Swallowed on failure, deliberately.** This is bookkeeping on the path a thermal
+ * printer polls; a 500 here for a stranger's benefit would be a route that can be made
+ * to error, and a failed write must never change the answer the printer path gives.
+ */
+async function recordProbe(serial: string): Promise<void> {
+  try {
+    await db().insert(printerProbeEvents).values({ serial }).onConflictDoUpdate({
+      target: printerProbeEvents.serial,
+      set: { lastSeenAt: new Date(), polls: sql`${printerProbeEvents.polls} + 1` },
+    })
+  } catch (err) {
+    console.error('[cloudprnt] could not record an unprovisioned serial', serial, err)
+  }
 }
 
 /**

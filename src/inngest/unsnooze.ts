@@ -131,7 +131,9 @@ async function unsnoozeLocation(locationId: string): Promise<LocationUnsnooze> {
       // the run is green (the clear worked), the summary says `snapshotVersion: null`
       // in a place nobody reads, and nothing else will mention it until the location's
       // next menu mutation — which, per the TODO above, nothing on this branch
-      // performs. Structured so it can be alerted on in Task 14's territory.
+      // performs. Structured so a log-based alert can be hung off it; the SMS alarms
+      // deliberately cover orders and printers only — this is a menu understating
+      // itself, not a service that has stopped.
       console.warn('[unsnooze] rebuild skipped, snapshot now stale', {
         locationId,
         activeMenuCount: activeMenus.length,

@@ -6,7 +6,7 @@ import { withLocation, isUuid } from '@/repo/scoped'
 import { transition } from '@/domain/order-status'
 import { stripe } from '@/lib/stripe'
 import { env } from '@/lib/env'
-import { sendOrderCreated } from '@/inngest/client'
+import { sendOrderCreated, sendProvenanceRefused, type ProvenanceRefusal } from '@/inngest/client'
 
 /**
  * Where a card order becomes the kitchen's problem.
@@ -140,6 +140,18 @@ async function release(externalId: string): Promise<void> {
 type FlipOutcome = 'flipped' | 're-fired' | 'nothing-to-do'
 
 /**
+ * The outcome, plus the one thing that has to outlive the transaction: a provenance
+ * refusal somebody must be told about.
+ *
+ * Carried out rather than alerted from inside, for the same reason the fan-out is
+ * fired after the commit: an `inngest.send` is an HTTP round trip, and making a
+ * database transaction wait for one is a connection held open for a network's worth
+ * of latency. Nothing is being deferred for correctness here — the branch writes
+ * nothing — only for the shape of the thing.
+ */
+type Flip = { outcome: FlipOutcome; refused?: ProvenanceRefusal }
+
+/**
  * How long a flip stays re-announceable, and the number is **Inngest's event-id dedupe
  * window**, not a guess.
  *
@@ -181,7 +193,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
   // moment we recorded the payment must not come from two different clocks.
   const paidAt = new Date()
 
-  const outcome = await withLocation(locationId, async (tx): Promise<FlipOutcome> => {
+  const flip = await withLocation(locationId, async (tx): Promise<Flip> => {
     // FOR UPDATE: two deliveries about one order — `payment_intent.succeeded` and
     // some future second handler — must not both read PENDING_PAYMENT and both flip.
     // The idempotency claim covers a repeat of the *same* event; this covers the rest.
@@ -191,7 +203,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     // as "not there" — which is exactly the right answer, and not a 500.
     if (!order) {
       console.error('[stripe webhook] no order', orderId, 'in location', locationId, 'for intent', intent.id)
-      return 'nothing-to-do'
+      return { outcome: 'nothing-to-do' }
     }
     // `locations` is not under RLS, and is read on `tx` so the prep time that makes the
     // promise — and the account the money is checked against — are the ones in force in
@@ -220,7 +232,12 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         '[stripe webhook] intent', intent.id, 'originated on account', event.account,
         'but location', locationId, 'banks with', location.stripeAccountId, '— refusing to flip',
       )
-      return 'nothing-to-do'
+      // Refusing protects the restaurant; **telling someone** is what makes this a
+      // security control rather than a log line. It is also the one refusal that
+      // fires for a misconfiguration as well as for an attack — a Connect webhook
+      // registered on a connected account leaves `event.account` absent and turns
+      // every real payment into this branch, silently.
+      return { outcome: 'nothing-to-do', refused: 'account_mismatch' }
     }
     // 2. The amount paid must be the amount owed. Cheap, and it is the check that
     //    turns "wrong payment" into "no payment" rather than a free dinner.
@@ -229,17 +246,23 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         '[stripe webhook] intent', intent.id, 'paid', intent.amount,
         'but order', orderId, 'totals', order.totalCents, '— refusing to flip',
       )
-      return 'nothing-to-do'
+      return { outcome: 'nothing-to-do', refused: 'amount_mismatch' }
     }
     // 3. The order already named a different intent. Marking it paid against a payment
     //    that is not its own is a money error, so it fails closed rather than guessing
     //    which of the two is real.
+    //
+    //    Deliberately **not** alerted on, unlike the two above: an order can only hold
+    //    a second intent because *we* created one, so this is our bug (a retried
+    //    checkout, a double-submit) rather than somebody else's money. It fails closed
+    //    and is logged; paging an ops phone for it would be paging ourselves about a
+    //    customer who tapped Pay twice.
     if (order.stripePaymentIntentId && order.stripePaymentIntentId !== intent.id) {
       console.error(
         '[stripe webhook] order', orderId, 'holds intent', order.stripePaymentIntentId,
         'but the event is about', intent.id, '— refusing to flip',
       )
-      return 'nothing-to-do'
+      return { outcome: 'nothing-to-do' }
     }
 
     // A legal state, not a failure: already flipped by an earlier delivery, or
@@ -280,17 +303,17 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
             '[stripe webhook] order', orderId, 'was already flipped for intent', intent.id,
             `${Math.round(age / 1000)}s ago — re-announcing it in case the first fan-out never landed`,
           )
-          return 're-fired'
+          return { outcome: 're-fired' }
         }
         console.warn(
           '[stripe webhook] order', orderId, 'was flipped for intent', intent.id,
           flip ? `${Math.round(age / 3_600_000)}h ago` : 'by something that left no payment_succeeded event',
           '— too late to re-announce: past the dedupe window this would text the owner again',
         )
-        return 'nothing-to-do'
+        return { outcome: 'nothing-to-do' }
       }
       console.warn('[stripe webhook] order', orderId, 'is', order.status, '— nothing to flip')
-      return 'nothing-to-do'
+      return { outcome: 'nothing-to-do' }
     }
 
     // The machine decides the move and hands back the event to append with it — the
@@ -325,10 +348,19 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
         },
       },
     ])
-    return 'flipped'
+    return { outcome: 'flipped' }
   })
 
-  if (outcome === 'nothing-to-do') return
+  // **Before the early return**, because a refusal is the one "nothing happened" that
+  // somebody has to hear about. It throws on failure like the fan-out does, which puts
+  // the handler in its catch: the claim is released, Stripe retries, and the alert we
+  // could not raise is raised on the retry rather than lost. The event id is the
+  // Stripe delivery's, so those retries ring one phone and not three days of them.
+  if (flip.refused) {
+    await sendProvenanceRefused({ orderId, locationId, reason: flip.refused }, event.id)
+  }
+
+  if (flip.outcome === 'nothing-to-do') return
 
   // **After the commit, never inside it.** The fan-out reads the order row it is told
   // about; fired from inside the transaction it would be handed an id that is not
@@ -343,7 +375,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
   // own is a sentence about an intention. Inngest does not report whether it kept the
   // event or dropped it as a duplicate, so the ids are the honest artefact: they are
   // what an operator searches the dashboard with to find out which of the two happened.
-  if (outcome === 're-fired') {
+  if (flip.outcome === 're-fired') {
     console.warn('[stripe webhook] re-announced order', orderId, 'to inngest as', eventIds)
   }
 }

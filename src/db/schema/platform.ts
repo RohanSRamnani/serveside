@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, text, jsonb, timestamp, index } from 'drizzle-orm/pg-core'
+import { pgTable, pgEnum, uuid, text, integer, jsonb, timestamp, index } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 import { orders } from './orders'
@@ -51,7 +51,7 @@ export const webhookEvents = pgTable('webhook_events', {
  * two restaurants would print one kitchen's tickets in another.
  *
  * `lastSeenAt` is nullable — a printer that has never polled has never been seen —
- * and is what Task 14's "your printer is offline" alert reads.
+ * and is what the "your printer is offline" heartbeat reads.
  */
 export const printers = pgTable('printers', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -60,6 +60,20 @@ export const printers = pgTable('printers', {
   provider: text('provider').notNull(),
   serial: text('serial').notNull().unique(),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+  /**
+   * When this printer last caused someone's phone to ring, and the whole of the
+   * heartbeat's "at most one alert an hour" rule.
+   *
+   * A column rather than a dedupe table because the thing being rate-limited *is* a
+   * printer: one row already exists per unit, it is the row the alert is about, and a
+   * separate table would need its own tenancy policy to say the same thing. It covers
+   * the stuck-ticket alert too — a `delivered` job that never printed is this
+   * printer's silence by another name, and two alarms an hour about one dead printer
+   * is how an owner learns to ignore both.
+   *
+   * Null means never alerted, which is every printer that has been behaving.
+   */
+  lastAlertAt: timestamp('last_alert_at', { withTimezone: true }),
 }).enableRLS()
 
 /**
@@ -112,6 +126,48 @@ export const printJobs = pgTable('print_jobs', {
     .where(sql`${t.status} = 'queued'`),
 ]).enableRLS()
 
+/**
+ * One row per printer serial that has polled us and turned out to belong to nobody.
+ *
+ * It exists for one signal and one only: **serial enumeration**. The CloudPRNT route
+ * is unauthenticated by protocol and the serial is the whole credential, so guessing
+ * one is the attack — and the only trace it leaves is a spread of unknown serials
+ * arriving at once. A genuine unknown serial is a mis-provisioned printer at install
+ * time: one MAC, repeating, forever. Twenty distinct ones in ten minutes is a sweep.
+ *
+ * **Platform-global and exempt from RLS**, and this is a cleaner case than
+ * `webhook_events`: a row here is by definition a serial that belongs to *no*
+ * location. `printer_lookup` returned nothing — that is what put the row here — so
+ * there is no tenant to scope it to, not merely one we have not read yet. Nothing in
+ * it is a restaurant's data, and nothing about it can become a printer: this table has
+ * no `location_id` and no path into `printers`. Named in CLAUDE.md and in the catalog
+ * assertion in `src/repo/rls.test.ts`.
+ *
+ * **Unique on `serial`, which is what bounds it.** The poll path is unauthenticated,
+ * so a row per request would be an unbounded write an attacker controls; an upsert
+ * makes a sweep of N serials cost N rows once and a printer hammering us cost none.
+ * `polls` and `firstSeenAt` are what tell the two apart at a glance.
+ */
+export const printerProbeEvents = pgTable('printer_probe_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  /** Already clamped to `SERIAL` shape by the route before it ever reaches here. */
+  serial: text('serial').notNull().unique(),
+  firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  /** Bumped on every poll. The burst query is `count(*) where last_seen_at > now() - 10m`. */
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  polls: integer('polls').notNull().default(1),
+  /**
+   * When this row was last part of an alert. The burst alarm's "one ops SMS an hour"
+   * lives here rather than in a counter of its own: the rows in the window *are* the
+   * alert, so stamping them is the record that it was sent.
+   */
+  alertedAt: timestamp('alerted_at', { withTimezone: true }),
+}, (t) => [
+  // The only query this table serves: the rows seen inside the burst window.
+  index('printer_probe_events_last_seen_idx').on(t.lastSeenAt),
+])
+
 export type WebhookEvent = typeof webhookEvents.$inferSelect
 export type Printer = typeof printers.$inferSelect
 export type PrintJob = typeof printJobs.$inferSelect
+export type PrinterProbeEvent = typeof printerProbeEvents.$inferSelect

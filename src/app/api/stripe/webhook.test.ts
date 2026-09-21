@@ -21,10 +21,11 @@ import { seedLocationWithMenu, seedCardOrder, seedPaidOrder } from '@/test/seed'
  * The Stripe SDK is mocked whole: no network, and `constructEvent` is the seam that
  * lets a test be a valid or an invalid signature without holding a signing secret.
  */
-const { constructEvent, paymentIntentsCreate, sendOrderCreated } = vi.hoisted(() => ({
+const { constructEvent, paymentIntentsCreate, sendOrderCreated, sendProvenanceRefused } = vi.hoisted(() => ({
   constructEvent: vi.fn(),
   paymentIntentsCreate: vi.fn(),
   sendOrderCreated: vi.fn(),
+  sendProvenanceRefused: vi.fn(),
 }))
 
 vi.mock('stripe', () => ({
@@ -34,7 +35,7 @@ vi.mock('stripe', () => ({
   },
 }))
 
-vi.mock('@/inngest/client', () => ({ sendOrderCreated }))
+vi.mock('@/inngest/client', () => ({ sendOrderCreated, sendProvenanceRefused }))
 
 const { POST } = await import('./webhook/route')
 
@@ -161,6 +162,7 @@ beforeEach(() => {
   constructEvent.mockImplementation((payload: string) => JSON.parse(payload))
   // The real one answers with the ids Inngest accepted; the re-fire path logs them.
   sendOrderCreated.mockResolvedValue(['01JEVENTID'])
+  sendProvenanceRefused.mockResolvedValue(['01JREFUSEDID'])
 })
 
 describe('POST /api/stripe/webhook', () => {
@@ -516,6 +518,16 @@ describe('POST /api/stripe/webhook', () => {
     expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
     expect(untouched.stripePaymentIntentId).toBeNull()
     expect(sendOrderCreated).not.toHaveBeenCalled()
+
+    // **And somebody is told.** This is an attempted theft, not a data-quality
+    // wobble: a `console.error` on a serverless function is a line in a log nobody
+    // reads until they are already looking for it. The event is keyed on the Stripe
+    // delivery so the three days of retries behind it ring one phone, not hundreds.
+    expect(sendProvenanceRefused).toHaveBeenCalledTimes(1)
+    expect(sendProvenanceRefused).toHaveBeenCalledWith(
+      { orderId: order.id, locationId: loc.id, reason: 'account_mismatch' },
+      event.id,
+    )
   })
 
   it('will not flip an order for less money than it is owed', async () => {
@@ -525,18 +537,38 @@ describe('POST /api/stripe/webhook', () => {
     const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
 
-    const res = await deliver(succeededEvent({
+    const event = succeededEvent({
       orderId: order.id,
       locationId: loc.id,
       paymentIntentId: order.stripePaymentIntentId!,
       amount: 50,
-    }))
+    })
+    const res = await deliver(event)
     expect(res.status).toBe(200)
 
     const untouched = await readOrder(loc.id, order.id)
     expect(untouched.status).toBe('PENDING_PAYMENT')
     expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
     expect(sendOrderCreated).not.toHaveBeenCalled()
+
+    expect(sendProvenanceRefused).toHaveBeenCalledTimes(1)
+    expect(sendProvenanceRefused).toHaveBeenCalledWith(
+      { orderId: order.id, locationId: loc.id, reason: 'amount_mismatch' },
+      event.id,
+    )
+  })
+
+  it('says nothing about provenance when the money is the order\'s own', async () => {
+    // The control. An alarm that fires on every ordinary payment is an alarm nobody
+    // reads by the second service.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+
+    expect(sendProvenanceRefused).not.toHaveBeenCalled()
   })
 
   it('answers a retryable 5xx — not 400 — when the signing secret is missing', async () => {
