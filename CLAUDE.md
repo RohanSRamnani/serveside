@@ -197,10 +197,14 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
     The **upper bound is load-bearing**: nothing ever moves a job off `delivered`, so an
     open-ended predicate would text about one jammed ticket every open hour forever.
     Stuck jobs are **never requeued** — the printer may have printed it and died before
-    saying so. Sends *then* stamps, and stamps if **either** phone answered; a send that
-    reached only one is carried out of the step and fails the **run** from the function
-    body, because a step-level failure would be retried, hit the cooldown and come back
-    green.
+    saying so. Sends *then* stamps, and stamps if **either** phone answered. **The
+    sweep step never throws**: everything that went wrong comes back in its result and
+    the **run** is failed from the function body. A step-level failure would be retried,
+    and the retry cannot rediscover anything — the alerts that went out stamped their
+    cooldown — so it would come back green. `OPS_ALERT_E164` is one number for the whole
+    platform, so a broken one fails every alerting restaurant in the same tick; throwing
+    on the first of them would discard the rest. The next cron tick is the retry for
+    anything that raised no alarm at all, which stamps nothing.
   - `provenance-refused-alert` on `payments/provenance-refused` — ops only; see the
     Stripe provenance rule above.
   Its second leg owns `printer_probe_events` (`src/domain/printer-probes.ts`, shared

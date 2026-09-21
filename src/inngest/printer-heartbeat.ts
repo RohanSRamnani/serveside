@@ -94,8 +94,27 @@ export type PrinterAlert = {
  */
 export type ProbeBurst = { serials: number; alerted: boolean; pruned: number }
 
-/** One location's alert, and the phones it could not reach. */
-type LocationSweep = { alerted: PrinterAlert[]; undelivered: string[] }
+/**
+ * Everything one pass over the locations found, **including everything that went
+ * wrong**. The step returns this rather than throwing, and the reason is the whole of
+ * the design note on {@link alertLocations}: what is thrown out of a step is lost the
+ * moment a retry of that step succeeds, and some of this can never be rediscovered.
+ */
+type LocationSweep = {
+  alerted: PrinterAlert[]
+  /**
+   * Locations whose alarm was not raised at all — unreadable, or both phones refused.
+   * Nothing was stamped for these, so the next tick five minutes from now tries again
+   * on its own. Reported so the run is red, not so anybody has to act.
+   */
+  unraised: string[]
+  /**
+   * Alerts that reached one of the two phones and not the other. **The cooldown is
+   * stamped for these**, so this report is the only record that will ever exist: the
+   * next tick finds them quiet and has nothing to say.
+   */
+  undelivered: string[]
+}
 
 export type HeartbeatSummary = {
   /** Locations looked at. Every location, every five minutes — see `listLocationIds`. */
@@ -141,19 +160,22 @@ export async function sweepPrinters(step: GetStepTools<typeof inngest>): Promise
     step.run('alert-probe-burst', alertProbeBurst),
   ])
 
+  // **Everything that went wrong in the sweep fails the RUN from here, not the step.**
+  // A step-level failure is retried, and a retry of this step cannot rediscover what
+  // the first attempt found: the alerts that went out stamped their cooldown, so the
+  // retry sees quiet restaurants, contributes nothing, and comes back green — a
+  // permanently broken `OPS_ALERT_E164` would vanish into a successful run and we would
+  // never learn our own alarm has no way to reach us. Thrown out here instead, the step
+  // stays memoized (nothing is re-sent) and every attempt re-reads the same accounting
+  // and ends red with the restaurant and the phone named. That is the same mechanism
+  // the order fan-out uses, and `src/inngest/order-created.ts` sets out why the body's
+  // throw re-runs the body only.
   const failures = [
     health.status === 'rejected' ? `alert-locations: ${describe(health.reason)}` : null,
     burst.status === 'rejected' ? `alert-probe-burst: ${describe(burst.reason)}` : null,
-    // **An alert that reached only one of the two phones fails the RUN from here, not
-    // the step.** It cannot fail the step: the step has already sent the text that did
-    // land and stamped the hour, so a step-level failure would be retried, find the
-    // cooldown, alert nobody, and come back green — a permanently broken
-    // `OPS_ALERT_E164` would vanish into a successful run and we would never learn our
-    // own alarm has no way to reach us. Thrown out here instead, the step stays
-    // memoized (nothing is re-sent) and the run ends red with the phone named, on
-    // every attempt. That is the same mechanism the order fan-out uses, and
-    // `src/inngest/order-created.ts` sets out why the body's throw re-runs the body
-    // only.
+    health.status === 'fulfilled' && health.value.unraised.length > 0
+      ? `alarms not raised — ${health.value.unraised.join('; ')}`
+      : null,
     health.status === 'fulfilled' && health.value.undelivered.length > 0
       ? `alerts reached only one phone — ${health.value.undelivered.join('; ')}`
       : null,
@@ -171,37 +193,52 @@ export async function sweepPrinters(step: GetStepTools<typeof inngest>): Promise
 
 /**
  * Every location in turn — see `alertLocation`. One restaurant's failure is not
- * another's.
+ * another's, so each is caught where it happens.
  *
- * Two kinds of bad news come back differently, and the difference is whether retrying
- * would help. A location that could not be *read* throws: nothing was sent, so the
- * step should run again. A location whose alert reached only one of the two phones is
- * carried out in `undelivered`, because the text that landed must not be sent twice —
- * `sweepPrinters` turns that into a red run instead.
+ * **This function never throws, and that is the load-bearing part.** Everything it
+ * learns comes back in {@link LocationSweep} and `sweepPrinters` fails the run from the
+ * function body. The obvious alternative — throw when anything went wrong, and let the
+ * step retry — loses information it can never get back, on a platform where alerts are
+ * wrong together rather than one at a time:
+ *
+ *   `OPS_ALERT_E164` is **one number for the whole platform**, so a broken one fails
+ *   the ops leg at *every* alerting location in the same tick. Say restaurant A's own
+ *   number also refuses (it replied STOP) and restaurant B's alert therefore reached
+ *   the owner but not ops. Throwing would report A and discard B. The step retries; B
+ *   is inside the cooldown it stamped on the first attempt, so it is not looked at
+ *   again and cannot be rediscovered; A's failure clears; the step resolves clean and
+ *   the run goes **green** — with a broken ops number at every restaurant on the
+ *   platform and nothing anywhere saying so.
+ *
+ * So nothing is discarded. The two kinds of bad news are kept apart only because they
+ * mean different things to whoever reads the run, not because they are treated
+ * differently here: `unraised` will fix itself on the next tick, `undelivered` never
+ * will.
+ *
+ * What is lost by not throwing is the step's own retry for a transient failure — and
+ * this is a cron, so the next tick five minutes later *is* that retry, and unlike the
+ * step's it cannot quietly bury anything. `unraised` locations stamp nothing, which is
+ * exactly what makes that work.
  */
 async function alertLocations(locationIds: string[]): Promise<LocationSweep> {
   const alerted: PrinterAlert[] = []
+  const unraised: string[] = []
   const undelivered: string[] = []
-  const failures: string[] = []
 
   for (const locationId of locationIds) {
     try {
       const result = await alertLocation(locationId)
       if (!result) continue
       alerted.push(result.alert)
+      // Named, not counted, all the way up: which restaurant, and which phone, is the
+      // first thing anyone needs. "The heartbeat failed" is not an actionable sentence.
       undelivered.push(...result.undelivered.map((failure) => `${locationId}: ${failure}`))
     } catch (err) {
-      // Caught rather than thrown on the spot: one restaurant's database trouble must
-      // not leave every other restaurant's dead printer undiscovered. The run still
-      // ends red, below.
-      failures.push(`${locationId}: ${describe(err)}`)
+      unraised.push(`${locationId}: ${describe(err)}`)
     }
   }
 
-  // Named, not counted: which restaurant went unchecked is the first thing anyone
-  // needs, and "the heartbeat failed" is not an actionable sentence.
-  if (failures.length > 0) throw new Error(`printer heartbeat incomplete — ${failures.join('; ')}`)
-  return { alerted, undelivered }
+  return { alerted, unraised, undelivered }
 }
 
 /**

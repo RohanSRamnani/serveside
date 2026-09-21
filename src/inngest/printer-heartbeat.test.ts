@@ -374,6 +374,7 @@ describe('the printer heartbeat', () => {
     // re-sending anything.
     const memoized = {
       alerted: [{ locationId: 'loc-1', printerId: 'p-1', silentMinutes: 7, stuckJobs: 0 }],
+      unraised: [],
       undelivered: ['loc-1: ops: twilio said no'],
     }
     const replay = {
@@ -407,6 +408,98 @@ describe('the printer heartbeat', () => {
     await sweepPrinters(fakeStep([loc.id]))
     expect(textsTo(loc.phoneE164)).toHaveLength(1)
     expect(textsTo(OPS_PHONE)).toHaveLength(1)
+  })
+
+  it('alerts two restaurants in one tick, each about its own kitchen', async () => {
+    // The plain multi-location case the rest of this file was missing: every alarm here
+    // reads one location at a time, so "it works for one" says nothing about a platform
+    // with two. Each owner must get their own message and nobody else's.
+    await clearProbeWindow()
+    const kashi = await restaurant()
+    const other = await seedLocationWithMenu({
+      name: 'Bodega', phoneE164: `+1555${String(3_000_000 + phones++)}`,
+    })
+    await seedBusinessHours(other.id)
+    const kashiPrinter = await printerLastSeen(kashi.id, 7)
+    const otherPrinter = await printerLastSeen(other.id, 12)
+
+    const summary = await sweepPrinters(fakeStep([kashi.id, other.id]))
+
+    expect(textsTo(kashi.phoneE164)).toEqual([
+      'Serveside: at Kashi, the kitchen printer has not checked in for 7 min — check the printer.',
+    ])
+    expect(textsTo(other.phoneE164)).toEqual([
+      'Serveside: at Bodega, the kitchen printer has not checked in for 12 min — check the printer.',
+    ])
+    // Ours gets both, because we are the one who has to go and look at two of them.
+    expect(textsTo(OPS_PHONE)).toHaveLength(2)
+    expect(summary.alerted).toEqual([
+      { locationId: kashi.id, printerId: kashiPrinter.id, silentMinutes: 7, stuckJobs: 0 },
+      { locationId: other.id, printerId: otherPrinter.id, silentMinutes: 12, stuckJobs: 0 },
+    ])
+  })
+
+  it('never loses a half-sent alert because another restaurant failed in the same tick', async () => {
+    // **The masking bug, in the shape it actually happens.** `OPS_ALERT_E164` is one
+    // number for the whole platform, so a broken one fails the ops leg at *every*
+    // alerting restaurant at once. Here A's own number refuses as well (it replied
+    // STOP), so A raises nothing, while B's alert reaches its owner and not us.
+    //
+    // Reporting A by throwing out of the step would discard B — and B can never be
+    // rediscovered, because B stamped its cooldown on the way past. The step retry
+    // would find B quiet, A's transient failure cleared, and report a green run with a
+    // broken ops number at every restaurant on the platform.
+    await clearProbeWindow()
+    const a = await restaurant()
+    const b = await seedLocationWithMenu({
+      name: 'Bodega', phoneE164: `+1555${String(3_000_000 + phones++)}`,
+    })
+    await seedBusinessHours(b.id)
+    const aPrinter = await printerLastSeen(a.id, 7)
+    const bPrinter = await printerLastSeen(b.id, 9)
+    sendSms.mockImplementation((to: string) => (to === OPS_PHONE || to === a.phoneE164
+      ? Promise.reject(new Error(to === OPS_PHONE ? 'ops number is dead' : 'owner replied STOP'))
+      : Promise.resolve()))
+
+    // Attempt one: the run is red and **both** restaurants are named, not just the
+    // one that threw.
+    let memoized: unknown
+    const capturing = {
+      run: (id: string, fn: () => Promise<unknown>) => {
+        if (id === 'list-locations') return Promise.resolve([a.id, b.id])
+        if (id === 'alert-locations') return fn().then((value) => { memoized = value; return value })
+        return fn()
+      },
+    } as unknown as GetStepTools<typeof inngestClient>
+
+    const first = await sweepPrinters(capturing).catch((err: Error) => err.message)
+    expect(first).toContain('ops number is dead')
+    expect(first).toContain(b.id)
+    expect(first).toContain(a.id)
+
+    // A raised nothing, so it is not in a cooldown and the next tick will try it
+    // again. B reached somebody, so it *is* — which is precisely why its failure had
+    // to be carried rather than thrown away.
+    expect((await readPrinter(a.id, aPrinter.id)).lastAlertAt).toBeNull()
+    expect((await readPrinter(b.id, bPrinter.id)).lastAlertAt).toBeInstanceOf(Date)
+
+    // The retry: Inngest replays the memoized step rather than re-running it, so this
+    // is the attempt the old code turned green. B's failure is still in the accounting
+    // and the run is still red.
+    sendSms.mockClear()
+    const replay = {
+      run: (id: string, fn: () => Promise<unknown>) => {
+        if (id === 'list-locations') return Promise.resolve([a.id, b.id])
+        if (id === 'alert-locations') return Promise.resolve(memoized)
+        return fn()
+      },
+    } as unknown as GetStepTools<typeof inngestClient>
+
+    const retried = await sweepPrinters(replay).catch((err: Error) => err.message)
+    expect(retried).toContain('ops number is dead')
+    expect(retried).toContain(b.id)
+    // And nothing was re-sent: the step that did the texting never ran again.
+    expect(sendSms).not.toHaveBeenCalled()
   })
 
   it('carries on past a location it cannot read, and ends the run red naming it', async () => {
