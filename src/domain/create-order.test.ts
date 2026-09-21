@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { desc, eq, inArray } from 'drizzle-orm'
 import {
-  createOrder,
+  createOrder, OrderRejectedError,
   InvalidOrderInputError, ItemUnavailableError, LocationClosedError, LocationInactiveError,
   ModifierSelectionError, OptionUnavailableError, UnknownMenuItemError, UnknownModifierOptionError,
   type CreateOrderInput,
@@ -434,6 +434,32 @@ describe('createOrder — server-side validation', () => {
       items: [{ menuItemId: item(loc, 'Butter Chicken').id, qty: 0, modifierOptionIds: [option(loc, 'Hot').id] }],
     }))).rejects.toThrow(InvalidOrderInputError)
     await expect(createOrder(planOrder(loc, { tipCents: -1 }))).rejects.toThrow(InvalidOrderInputError)
+  })
+
+  it('refuses an order too large to price exactly or to write in one transaction', async () => {
+    const loc = await openRestaurant()
+    const line = { menuItemId: item(loc, 'Butter Chicken').id, modifierOptionIds: [option(loc, 'Hot').id] }
+    // A quantity that is still a legal integer but multiplies out past exact integer
+    // arithmetic has to be a rejection, not a 500 from deep inside the tax math.
+    await expect(createOrder(planOrder(loc, { items: [{ ...line, qty: 1e15 }] })))
+      .rejects.toThrow(InvalidOrderInputError)
+    // One INSERT per line, inside the open transaction.
+    await expect(createOrder(planOrder(loc, { items: Array.from({ length: 101 }, () => ({ ...line, qty: 1 })) })))
+      .rejects.toThrow(InvalidOrderInputError)
+  })
+
+  it('rejects with a coded, named error the HTTP layer can map', async () => {
+    const loc = await openRestaurant()
+    await withLocation(loc.id, (tx) => tx.update(menuItems)
+      .set({ is86d: true }).where(eq(menuItems.id, item(loc, 'Butter Chicken').id)))
+
+    // The contract Task 9's route is built on: one base class to catch, a stable
+    // code to pass on, and a name that says which rejection it was.
+    const err = await createOrder(planOrder(loc)).then(() => null, (e: unknown) => e)
+    expect(err).toBeInstanceOf(OrderRejectedError)
+    expect(err).toMatchObject({ code: 'item_unavailable', name: 'ItemUnavailableError' })
+    // The message is customer-facing, so it names the dish rather than an id.
+    expect((err as Error).message).toContain('Butter Chicken')
   })
 
   it('refuses a payment mode or a fulfillment it does not recognise', async () => {

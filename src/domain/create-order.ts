@@ -173,6 +173,17 @@ const PICKUP_DELIVERY_FEE_CENTS = 0
 /** Discounts land with promotions; the column exists and is always 0 for now. */
 const NO_DISCOUNT_CENTS = 0
 
+/**
+ * Sanity bounds, not business rules — nobody is turning away a real order at these
+ * numbers. They are here because both are arithmetic and resource limits:
+ * `unitPrice × qty` leaves exact integer range long before `qty` stops being a legal
+ * integer, and `insertOrder` writes one statement per line inside the transaction,
+ * so a ten-thousand-line request would hold it open while it ran. Bounded here, both
+ * come back as a named rejection instead of a 500 or a stalled connection.
+ */
+const MAX_LINES_PER_ORDER = 100
+const MAX_QTY_PER_LINE = 999
+
 export async function createOrder(input: CreateOrderInput): Promise<CreateOrderResult> {
   assertInputShape(input)
   // One instant for the whole order: "are you open" and "when will it be ready"
@@ -275,6 +286,11 @@ function assertInputShape(input: CreateOrderInput): void {
   if (input.items.length === 0) {
     throw new InvalidOrderInputError('An order must have at least one line')
   }
+  if (input.items.length > MAX_LINES_PER_ORDER) {
+    throw new InvalidOrderInputError(
+      `An order may have at most ${MAX_LINES_PER_ORDER} lines, got ${input.items.length}`,
+    )
+  }
   // Not decoration: the ternaries below map `card` to "money is owed" and anything
   // else to "pay at the counter", so an unrecognised payment mode would quietly
   // become a free order.
@@ -294,8 +310,10 @@ function assertInputShape(input: CreateOrderInput): void {
   if (input.contact.phone.trim() === '') throw new InvalidOrderInputError('An order needs a contact phone number')
 
   for (const line of input.items) {
-    if (!Number.isInteger(line.qty) || line.qty < 1) {
-      throw new InvalidOrderInputError(`Quantity must be a whole number of at least 1, got ${line.qty}`)
+    if (!Number.isInteger(line.qty) || line.qty < 1 || line.qty > MAX_QTY_PER_LINE) {
+      throw new InvalidOrderInputError(
+        `Quantity must be a whole number between 1 and ${MAX_QTY_PER_LINE}, got ${line.qty}`,
+      )
     }
     const seen = new Set<string>()
     for (const optionId of line.modifierOptionIds) {
