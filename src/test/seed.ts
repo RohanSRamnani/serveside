@@ -11,7 +11,7 @@
 import { db } from '@/db/client'
 import {
   organizations, locations, menus, menuCategories, menuItems,
-  modifierGroups, modifierOptions, itemModifierGroups, businessHours, orderEvents,
+  modifierGroups, modifierOptions, itemModifierGroups, businessHours, orders, orderEvents,
 } from '@/db/schema'
 import type { Location, Order, OrderItem } from '@/db/schema'
 import { eq } from 'drizzle-orm'
@@ -122,10 +122,15 @@ export type SeededOrder = {
   item: OrderItem
 }
 
+/** The fields a seeded order may vary. Everything else is fixed, so the totals stay honest. */
+type OrderOverrides = Partial<Pick<
+  typeof orders.$inferInsert, 'status' | 'paymentStatus' | 'quotedReadyAt' | 'stripePaymentIntentId'
+>>
+
 /**
- * One paid pickup order for a location seeded by `seedLocationWithMenu`: a fresh
- * menu snapshot, an order at NEW / PAID, one line of 2 Butter Chicken with Hot on
- * it, and the `created` event.
+ * One pickup order for a location seeded by `seedLocationWithMenu`: a fresh menu
+ * snapshot, the order, one line of 2 Butter Chicken with Hot on it, and the
+ * `created` event.
  *
  * Priced off the seeded menu, so nothing here is a magic number:
  *   1800 + 50 = 1850/unit × 2 = 3700 subtotal
@@ -135,7 +140,7 @@ export type SeededOrder = {
  * Snapshot, order, line and event all land in **one** transaction — the same shape
  * a real checkout has, so a test that reads half an order is reading a real bug.
  */
-export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
+async function seedOrder(locationId: string, over: OrderOverrides): Promise<SeededOrder> {
   return withLocation(locationId, async (tx) => {
     const snapshot = await buildMenuSnapshot(locationId, tx)
     // By name, not `limit(1)`: RLS already narrows these to this location, and a
@@ -148,8 +153,6 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
       shortCode: 'K7M2',
       channel: 'web',
       fulfillment: 'pickup',
-      status: 'NEW',
-      paymentStatus: 'PAID',
       contactName: 'Rohan R',
       contactPhone: '+15551234567',
       contactEmail: 'rohan@example.com',
@@ -159,6 +162,9 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
       totalCents: 4524,
       menuSnapshotId: snapshot.id,
       notes: 'no cilantro',
+      status: 'NEW',
+      paymentStatus: 'PAID',
+      ...over,
     }, [{
       menuItemId: butterChicken.id,
       nameSnapshot: butterChicken.name,
@@ -171,5 +177,31 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
     await tx.insert(orderEvents).values({ orderId: order.id, type: 'created', actor: 'system' })
     const [item] = await ordersRepo(tx).itemsFor(order.id)
     return { snapshot, order, item }
+  })
+}
+
+/** The order as the kitchen sees it: money taken, ticket owed. */
+export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
+  return seedOrder(locationId, {})
+}
+
+/**
+ * A card order parked exactly where `createOrder` leaves one: PENDING_PAYMENT /
+ * REQUIRES_PAYMENT, with **`quotedReadyAt` null** — no promise is made while the
+ * customer is still on the payment form — and the PaymentIntent id already on the
+ * row, as `POST /api/orders` writes it.
+ *
+ * This is the only state the Stripe webhook may flip, so it is the precondition of
+ * every test in `src/app/api/stripe/webhook.test.ts`.
+ */
+export async function seedCardOrder(
+  locationId: string,
+  paymentIntentId = `pi_test_${Date.now()}_${counter++}`,
+): Promise<SeededOrder> {
+  return seedOrder(locationId, {
+    status: 'PENDING_PAYMENT',
+    paymentStatus: 'REQUIRES_PAYMENT',
+    quotedReadyAt: null,
+    stripePaymentIntentId: paymentIntentId,
   })
 }

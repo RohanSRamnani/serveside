@@ -56,6 +56,31 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   drizzle schema (or `push` would disable the policy — see Commands), `CREATE POLICY`
   and an explicit `GRANT` in its migration (`app_user` has no default privileges),
   and its name added to the catalog assertion in `rls.test.ts`.
+- **Stripe is Connect Standard with direct charges, and the `{ stripeAccount }`
+  option is the entire mechanism.** The charge is created *on the restaurant's*
+  account, so they are merchant of record, funds settle to them, and we are not a
+  money transmitter. Never separate charges + transfers, never destination charges.
+  `amount` is `order.totalCents` verbatim — never recomputed here, or the charge and
+  the receipt get two arithmetic paths to disagree on. A location with no
+  `stripeAccountId` cannot take cards (`StripeAccountMissingError` → 503); pay-at-pickup
+  is unaffected. `createPaymentIntentFor` puts **both** `orderId` and `locationId` in
+  the intent metadata: the webhook has no scope of its own and RLS hides the order
+  from it without the second one.
+- **The webhook's order of operations is the design: verify signature → claim the
+  event → handle.** The claim is `INSERT INTO webhook_events ... ON CONFLICT DO
+  NOTHING` on `external_id`; zero rows back means a duplicate delivery, answer 200 and
+  stop. Stripe *will* deliver twice. Claiming before verifying would let anyone with
+  the URL burn an event id; verifying after parsing `req.json()` would verify bytes
+  Stripe never signed, so the body is read with **`req.text()`**. Handling failure
+  releases the claim and returns 5xx so the retry lands on a clean id.
+- **Stripe retries every 5xx forever, so 200 is the answer to anything a retry cannot
+  fix** — an order already past PENDING_PAYMENT, an event type we ignore, metadata
+  that names no order. Those are logged, not raised. 5xx is only for failures a retry
+  could genuinely repair.
+- **The `PENDING_PAYMENT → NEW` flip sets three things together**: `status`,
+  `paymentStatus = 'PAID'`, and `quotedReadyAt = <flip time> + location.prepTimeMinutes`.
+  The clock starts when the money lands, not at checkout — a promise made while the
+  customer is still typing a card number has an unknown amount of it already spent.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
   17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a
@@ -113,18 +138,28 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction on that pooled backend has set it. Policies use
   `nullif(current_setting(...), '')::uuid` for that reason; the bare cast raises
   22P02 on every unscoped query instead of quietly matching nothing.
-- **Exempt from RLS, on purpose and only these three**: `organizations`, `locations`,
-  `memberships` — the tenancy root, with nothing to scope to until a location exists.
-  `memberships` is the one worth revisiting; it maps Clerk user ids to orgs.
+- **Exempt from RLS, on purpose and only these four**: `organizations`, `locations`,
+  `memberships` — the tenancy root, with nothing to scope to until a location exists —
+  and `webhook_events`, which must be written before anything knows whose event it is
+  (the tenant is inside the payload, and scoping to a location read out of an
+  unverified body would be scoping to whatever the caller claimed). `memberships` is
+  the one worth revisiting; it maps Clerk user ids to orgs.
 - A migration that adds a CHECK validates rows already on the `test` branch, and
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
-  `seedBusinessHours`, `seedPaidOrder`) — import them; don't re-inline a seeder per test
-  file. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
+  `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`) — import them; don't re-inline
+  a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT / REQUIRES_PAYMENT
+  order the Stripe webhook flips; `seedPaidOrder` is the one already at NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
   alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test
   of `createOrder` needs: it asks `isOpenAt(new Date())`, so hours pinned to one weekday
   would only pass on that weekday.
+- **Route handlers are tested by importing and calling them**, not through a server:
+  `const { POST } = await import('./webhook/route')`, then `POST(new Request(...))`.
+  They take a Web `Request` and return a Web `Response`, with nothing imported from
+  `next/server`, which is what keeps that possible. Tests mock the Stripe SDK whole
+  (`vi.mock('stripe', ...)` over `vi.hoisted` fns) — no network, and `constructEvent`
+  is the seam for a valid vs. forged signature.
 - `.env.local` still points `DATABASE_URL` at the owner. Migrate `main` and run
   `ENV_FILE=.env.local npm run db:app-user` before anything serves real traffic —
   until then the app bypasses its own RLS on that branch.

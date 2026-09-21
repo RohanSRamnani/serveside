@@ -71,6 +71,20 @@
       "when": 1789967235838,
       "tag": "0009_rls_hours_and_enable_flags",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789970874131,
+      "tag": "0010_platform_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789970892770,
+      "tag": "0011_platform_rls_and_grants",
+      "breakpoints": true
     }
   ]
 }

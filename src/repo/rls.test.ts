@@ -56,12 +56,18 @@ describe('RLS tenancy', () => {
       'availability_windows', 'business_hours', 'holiday_closures', 'item_modifier_groups',
       'menu_categories', 'menu_items', 'menu_snapshots', 'menus', 'modifier_groups',
       'modifier_options', 'order_events', 'order_item_modifiers', 'order_items',
-      'order_pauses', 'orders',
+      'order_pauses', 'orders', 'print_jobs', 'printers',
     ])
-    // Exempt on purpose, and only these: the tenancy root, which has nothing to scope
-    // to until a location exists. Documented in CLAUDE.md and in 0008.
+    // Exempt on purpose, and only these. Three are the tenancy root, which has nothing
+    // to scope to until a location exists (0008). The fourth, `webhook_events`, is the
+    // deliberate Task 9 addition: a webhook is authenticated by its signature and
+    // arrives before anything knows whose it is — the location is inside the payload,
+    // so there is no scope to open at the moment the row must be written, and opening
+    // one from the unverified body would be scoping to whatever the caller claimed.
+    // The handler opens `withLocation` for the order write. Documented in CLAUDE.md,
+    // in 0008 and in 0011.
     expect(byName.filter((r) => !r.rls).map((r) => r.table)).toEqual([
-      'locations', 'memberships', 'organizations',
+      'locations', 'memberships', 'organizations', 'webhook_events',
     ])
   })
 
@@ -250,6 +256,57 @@ describe('RLS tenancy', () => {
     // And locA still has the row it posted, so "zero" above means hidden, not deleted.
     const own = await withLocation(locA.id, (tx) => tx.execute(sql`select id from business_hours`))
     expect(own.rows).toHaveLength(1)
+  })
+
+  it('cannot read, steal or misdirect another restaurant\'s printer and print jobs', async () => {
+    // A print job is a physical ticket with a customer's name and phone number on it.
+    // Two separate leaks live here: reading another location's queue, and — the one a
+    // location_id-only policy would miss — writing a job that names *this* location
+    // while pointing at *that* location's order, which prints their ticket on our
+    // printer. RI checks bypass row security, so the FK would have allowed it.
+    const locA = await seedLocationWithMenu()
+    const locB = await seedLocationWithMenu()
+    const { order } = await seedPaidOrder(locA.id)
+
+    const own = await withLocation(locA.id, (tx) => tx.execute(sql`
+      insert into print_jobs (location_id, order_id, payload) values
+        (${locA.id}, ${order.id}, '*** K7M2 ***') returning id`))
+    expect(own.rows).toHaveLength(1)
+    await withLocation(locA.id, (tx) => tx.execute(sql`
+      insert into printers (location_id, provider, serial)
+      values (${locA.id}, 'star_cloudprnt', ${`00:11:62:${locA.id.slice(0, 8)}`})`))
+
+    // Deliberately unscoped SQL, from the wrong tenant.
+    const jobs = await withLocation(locB.id, (tx) => tx.execute(sql`select id from print_jobs`))
+    expect(jobs.rows).toHaveLength(0)
+    const seen = await withLocation(locB.id, (tx) => tx.execute(sql`select id from printers`))
+    expect(seen.rows).toHaveLength(0)
+
+    const stolen = await rejectionText(() => withLocation(locB.id, (tx) => tx.execute(sql`
+      insert into print_jobs (location_id, order_id, payload)
+      values (${locB.id}, ${order.id}, 'someone else''s dinner')`)))
+    expect(stolen).toMatch(/row-level security/i)
+
+    // And the plain cross-tenant write, which the direct location_id predicate refuses.
+    const planted = await rejectionText(() => withLocation(locB.id, (tx) => tx.execute(sql`
+      insert into printers (location_id, provider, serial)
+      values (${locA.id}, 'star_cloudprnt', ${`ff:ff:ff:${locB.id.slice(0, 8)}`})`)))
+    expect(planted).toMatch(/row-level security/i)
+  })
+
+  it('leaves webhook_events readable unscoped, on purpose', async () => {
+    // The one exemption outside the tenancy root, and it has to be asserted rather
+    // than assumed: a webhook is authenticated by its signature and arrives before
+    // anything knows whose it is — the location is inside the payload. If this ever
+    // starts failing because someone policied the table, the idempotency insert stops
+    // working and Stripe's double deliveries start flipping orders twice.
+    const externalId = `evt_rls_probe_${Date.now()}`
+    await db().execute(sql`
+      insert into webhook_events (provider, external_id, payload)
+      values ('stripe', ${externalId}, '{}'::jsonb)`)
+    const unscoped = await db().execute(sql`
+      select id from webhook_events where external_id = ${externalId}`)
+    expect(unscoped.rows).toHaveLength(1)
   })
 
   it('sees nothing at all when no location has been set', async () => {
