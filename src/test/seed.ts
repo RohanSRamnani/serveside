@@ -1,12 +1,23 @@
 // Shared test seeders. DB tests run serially against one Neon `test` branch and
 // never tear down, so every seed must be collision-proof: unique() suffixes each
 // slug/phone. Import these instead of re-inlining a seeder per test file.
+//
+// Two connections, and which one a seeder uses is not arbitrary:
+//
+//   db()            organizations and locations — the tenancy root, no RLS on it,
+//                   and nothing to scope to until the location row exists.
+//   withLocation()  everything under a location. Those tables are under RLS, and
+//                   an unscoped write to them is refused, not silently misfiled.
 import { db } from '@/db/client'
 import {
   organizations, locations, menus, menuCategories, menuItems,
-  modifierGroups, modifierOptions, itemModifierGroups,
+  modifierGroups, modifierOptions, itemModifierGroups, orderEvents,
 } from '@/db/schema'
-import type { Location } from '@/db/schema'
+import type { Location, Order, OrderItem } from '@/db/schema'
+import { eq } from 'drizzle-orm'
+import { withLocation } from '@/repo/scoped'
+import { ordersRepo } from '@/repo/orders-repo'
+import { buildMenuSnapshot } from '@/domain/snapshot'
 
 let counter = 0
 /** Date.now() alone collides — two seeds land in the same millisecond. */
@@ -46,23 +57,83 @@ export type SeededMenu = Location & {
  */
 export async function seedLocationWithMenu(overrides: LocationOverrides = {}): Promise<SeededMenu> {
   const loc = await seedLocation(overrides)
-  const [menu] = await db().insert(menus).values({
-    locationId: loc.id, name: 'Dinner', isActive: true,
-  }).returning()
-  const [category] = await db().insert(menuCategories).values({
-    menuId: menu.id, name: 'Mains', sort: 1,
-  }).returning()
-  const [modifierGroup] = await db().insert(modifierGroups).values({
-    locationId: loc.id, name: 'Spice Level', minSelect: 1, maxSelect: 1, required: true,
-  }).returning()
-  const options = await db().insert(modifierOptions).values([
-    { groupId: modifierGroup.id, name: 'Mild', priceDeltaCents: 0 },
-    { groupId: modifierGroup.id, name: 'Hot', priceDeltaCents: 50 },
-  ]).returning()
-  const items = await db().insert(menuItems).values([
-    { categoryId: category.id, name: 'Butter Chicken', description: 'Tomato, cream, fenugreek.', basePriceCents: 1800, sort: 1 },
-    { categoryId: category.id, name: 'Lamb Rogan Josh', basePriceCents: 2100, sort: 2 },
-  ]).returning()
-  await db().insert(itemModifierGroups).values({ itemId: items[0].id, groupId: modifierGroup.id, sort: 1 })
-  return { ...loc, menu, category, items, modifierGroup, modifierOptions: options }
+  return withLocation(loc.id, async (tx) => {
+    const [menu] = await tx.insert(menus).values({
+      locationId: loc.id, name: 'Dinner', isActive: true,
+    }).returning()
+    const [category] = await tx.insert(menuCategories).values({
+      menuId: menu.id, name: 'Mains', sort: 1,
+    }).returning()
+    const [modifierGroup] = await tx.insert(modifierGroups).values({
+      locationId: loc.id, name: 'Spice Level', minSelect: 1, maxSelect: 1, required: true,
+    }).returning()
+    const options = await tx.insert(modifierOptions).values([
+      { groupId: modifierGroup.id, name: 'Mild', priceDeltaCents: 0 },
+      { groupId: modifierGroup.id, name: 'Hot', priceDeltaCents: 50 },
+    ]).returning()
+    const items = await tx.insert(menuItems).values([
+      { categoryId: category.id, name: 'Butter Chicken', description: 'Tomato, cream, fenugreek.', basePriceCents: 1800, sort: 1 },
+      { categoryId: category.id, name: 'Lamb Rogan Josh', basePriceCents: 2100, sort: 2 },
+    ]).returning()
+    await tx.insert(itemModifierGroups).values({ itemId: items[0].id, groupId: modifierGroup.id, sort: 1 })
+    return { ...loc, menu, category, items, modifierGroup, modifierOptions: options }
+  })
+}
+
+export type SeededOrder = {
+  snapshot: { id: string; version: number }
+  order: Order
+  item: OrderItem
+}
+
+/**
+ * One paid pickup order for a location seeded by `seedLocationWithMenu`: a fresh
+ * menu snapshot, an order at NEW / PAID, one line of 2 Butter Chicken with Hot on
+ * it, and the `created` event.
+ *
+ * Priced off the seeded menu, so nothing here is a magic number:
+ *   1800 + 50 = 1850/unit × 2 = 3700 subtotal
+ *   tax 3700 × 875bps = 323.75 → 324 (half up), tip 500 → total 4524
+ * The arithmetic itself belongs to Task 8's `createOrder`; these are stored values.
+ *
+ * Snapshot, order, line and event all land in **one** transaction — the same shape
+ * a real checkout has, so a test that reads half an order is reading a real bug.
+ */
+export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
+  return withLocation(locationId, async (tx) => {
+    const snapshot = await buildMenuSnapshot(locationId, tx)
+    // By name, not `limit(1)`: RLS already narrows these to this location, and a
+    // seeder that silently picks a different dish makes its own totals a lie.
+    const [butterChicken] = await tx.select().from(menuItems).where(eq(menuItems.name, 'Butter Chicken'))
+    const [hot] = await tx.select().from(modifierOptions).where(eq(modifierOptions.name, 'Hot'))
+
+    const order = await ordersRepo(tx).insertOrder({
+      locationId,
+      shortCode: 'K7M2',
+      channel: 'web',
+      fulfillment: 'pickup',
+      status: 'NEW',
+      paymentStatus: 'PAID',
+      contactName: 'Rohan R',
+      contactPhone: '+15551234567',
+      contactEmail: 'rohan@example.com',
+      subtotalCents: 3700,
+      taxCents: 324,
+      tipCents: 500,
+      totalCents: 4524,
+      menuSnapshotId: snapshot.id,
+      notes: 'no cilantro',
+    }, [{
+      menuItemId: butterChicken.id,
+      nameSnapshot: butterChicken.name,
+      qty: 2,
+      unitPriceCents: 1850,
+      lineTotalCents: 3700,
+      modifiers: [{ modifierOptionId: hot.id, nameSnapshot: hot.name, priceDeltaCents: hot.priceDeltaCents }],
+    }])
+
+    await tx.insert(orderEvents).values({ orderId: order.id, type: 'created', actor: 'system' })
+    const [item] = await ordersRepo(tx).itemsFor(order.id)
+    return { snapshot, order, item }
+  })
 }

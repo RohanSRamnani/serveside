@@ -5,6 +5,7 @@ import { orders, orderItems, orderItemModifiers, orderEvents, menuItems } from '
 import { buildMenuSnapshot } from '@/domain/snapshot'
 import { transition } from '@/domain/order-status'
 import { seedLocationWithMenu } from '@/test/seed'
+import { withLocation } from '@/repo/scoped'
 import { rejectionText } from '@/test/errors'
 
 /**
@@ -14,50 +15,57 @@ import { rejectionText } from '@/test/errors'
  * The arithmetic lives in Task 8's `createOrder`; these are stored values, written
  * out so nothing here is a magic number.
  *
- * Deliberately not in `src/test/seed.ts`: the order row **is** what this file tests,
- * and Task 7's `seedPaidOrder` is the shared seeder for everyone downstream.
+ * Deliberately not `seedPaidOrder` from `src/test/seed.ts`: the order row **is**
+ * what this file tests, so it writes its own columns rather than asserting against
+ * a seeder that could drift. Every write runs inside `withLocation` because the
+ * orders chain is under RLS — an unscoped insert is refused, not misfiled.
  */
 async function seedOrder(overrides: Partial<typeof orders.$inferInsert> = {}) {
   const seeded = await seedLocationWithMenu()
-  const snapshot = await buildMenuSnapshot(seeded.id)
-  const [order] = await db().insert(orders).values({
-    locationId: seeded.id,
-    shortCode: 'K7M2',
-    channel: 'web',
-    fulfillment: 'pickup',
-    status: 'NEW',
-    paymentStatus: 'PAID',
-    contactName: 'Rohan R',
-    contactPhone: '+15551234567',
-    contactEmail: 'rohan@example.com',
-    subtotalCents: 3700,
-    taxCents: 324,
-    tipCents: 500,
-    totalCents: 4524,
-    menuSnapshotId: snapshot.id,
-    notes: 'no cilantro',
-    ...overrides,
-  }).returning()
-  return { seeded, snapshot, order }
+  return withLocation(seeded.id, async (tx) => {
+    const snapshot = await buildMenuSnapshot(seeded.id, tx)
+    const [order] = await tx.insert(orders).values({
+      locationId: seeded.id,
+      shortCode: 'K7M2',
+      channel: 'web',
+      fulfillment: 'pickup',
+      status: 'NEW',
+      paymentStatus: 'PAID',
+      contactName: 'Rohan R',
+      contactPhone: '+15551234567',
+      contactEmail: 'rohan@example.com',
+      subtotalCents: 3700,
+      taxCents: 324,
+      tipCents: 500,
+      totalCents: 4524,
+      menuSnapshotId: snapshot.id,
+      notes: 'no cilantro',
+      ...overrides,
+    }).returning()
+    return { seeded, snapshot, order }
+  })
 }
 
 async function seedOrderWithLine() {
   const { seeded, order } = await seedOrder()
-  const [line] = await db().insert(orderItems).values({
-    orderId: order.id,
-    menuItemId: seeded.items[0].id,
-    nameSnapshot: seeded.items[0].name,
-    qty: 2,
-    unitPriceCents: 1850,
-    lineTotalCents: 3700,
-    notes: 'extra sauce',
-  }).returning()
   const hot = seeded.modifierOptions.find((o) => o.name === 'Hot')!
-  await db().insert(orderItemModifiers).values({
-    orderItemId: line.id,
-    modifierOptionId: hot.id,
-    nameSnapshot: hot.name,
-    priceDeltaCents: hot.priceDeltaCents,
+  const line = await withLocation(seeded.id, async (tx) => {
+    const [row] = await tx.insert(orderItems).values({
+      orderId: order.id,
+      menuItemId: seeded.items[0].id,
+      nameSnapshot: seeded.items[0].name,
+      qty: 2,
+      unitPriceCents: 1850,
+      lineTotalCents: 3700,
+      notes: 'extra sauce',
+    }).returning()
+    await tx.insert(orderItemModifiers).values({
+      orderItemId: row.id,
+      modifierOptionId: hot.id,
+      nameSnapshot: hot.name,
+      priceDeltaCents: hot.priceDeltaCents,
+    })
+    return row
   })
   return { seeded, order, line, hot }
 }
@@ -115,7 +123,7 @@ describe('orders schema', () => {
 
   it('refuses an order with no menu snapshot pinned to it', async () => {
     const seeded = await seedLocationWithMenu()
-    const text = await rejectionText(() => db().insert(orders)
+    const text = await rejectionText(() => withLocation(seeded.id, (tx) => tx.insert(orders)
       // @ts-expect-error — the point of the test, asserted twice over: `null` here
       // does not compile (the directive fails as unused the day the column goes
       // nullable) and the database refuses it at runtime. An order that cannot say
@@ -133,7 +141,7 @@ describe('orders schema', () => {
         taxCents: 9,
         totalCents: 109,
         menuSnapshotId: null,
-      }))
+      })))
     // The whole failed statement is in the error text, so match the violation, not
     // the column name — the column name is in there either way.
     expect(text).toMatch(/null value in column "menu_snapshot_id"/)
@@ -155,11 +163,13 @@ describe('orders schema', () => {
 describe('order lines', () => {
   it('keeps the name and the price it charged, after the menu moves on', async () => {
     const { seeded, line } = await seedOrderWithLine()
-    await db().update(menuItems)
-      .set({ name: 'Butter Chicken (Signature)', basePriceCents: 2200 })
-      .where(eq(menuItems.id, seeded.items[0].id))
-
-    const [reread] = await db().select().from(orderItems).where(eq(orderItems.id, line.id))
+    const reread = await withLocation(seeded.id, async (tx) => {
+      await tx.update(menuItems)
+        .set({ name: 'Butter Chicken (Signature)', basePriceCents: 2200 })
+        .where(eq(menuItems.id, seeded.items[0].id))
+      const [row] = await tx.select().from(orderItems).where(eq(orderItems.id, line.id))
+      return row
+    })
     expect(reread.nameSnapshot).toBe('Butter Chicken')
     expect(reread.unitPriceCents).toBe(1850)
     expect(reread.lineTotalCents).toBe(3700)
@@ -168,8 +178,9 @@ describe('order lines', () => {
   })
 
   it('snapshots the modifier name and delta on the line', async () => {
-    const { line, hot } = await seedOrderWithLine()
-    const [mod] = await db().select().from(orderItemModifiers).where(eq(orderItemModifiers.orderItemId, line.id))
+    const { seeded, line, hot } = await seedOrderWithLine()
+    const [mod] = await withLocation(seeded.id, (tx) => tx.select().from(orderItemModifiers)
+      .where(eq(orderItemModifiers.orderItemId, line.id)))
     expect(mod.nameSnapshot).toBe('Hot')
     expect(mod.priceDeltaCents).toBe(50)
     expect(mod.modifierOptionId).toBe(hot.id)
@@ -177,32 +188,32 @@ describe('order lines', () => {
 
   it('refuses the same modifier recorded twice on one line', async () => {
     // A retried insert must not quietly double a charge on the record.
-    const { line, hot } = await seedOrderWithLine()
-    const text = await rejectionText(() => db().insert(orderItemModifiers).values({
+    const { seeded, line, hot } = await seedOrderWithLine()
+    const text = await rejectionText(() => withLocation(seeded.id, (tx) => tx.insert(orderItemModifiers).values({
       orderItemId: line.id, modifierOptionId: hot.id, nameSnapshot: hot.name, priceDeltaCents: hot.priceDeltaCents,
-    }))
+    })))
     expect(text).toMatch(/order_item_modifiers_order_item_id_modifier_option_id_pk|duplicate key/)
   })
 
   it('refuses a line of zero items', async () => {
     const { seeded, order } = await seedOrder()
-    const text = await rejectionText(() => db().insert(orderItems).values({
+    const text = await rejectionText(() => withLocation(seeded.id, (tx) => tx.insert(orderItems).values({
       orderId: order.id, menuItemId: seeded.items[0].id, nameSnapshot: 'Butter Chicken',
       qty: 0, unitPriceCents: 1850, lineTotalCents: 0,
-    }))
+    })))
     expect(text).toMatch(/order_items_qty_positive/)
   })
 })
 
 describe('order events', () => {
   it('appends the event a status change produces', async () => {
-    const { order } = await seedOrder()
-    const [event] = await db().insert(orderEvents).values({
+    const { seeded, order } = await seedOrder()
+    const [event] = await withLocation(seeded.id, (tx) => tx.insert(orderEvents).values({
       orderId: order.id,
       type: 'status_changed',
       actor: 'user_2abc',
       payload: { from: 'NEW', to: 'ACCEPTED' },
-    }).returning()
+    }).returning())
     expect(event.payload).toEqual({ from: 'NEW', to: 'ACCEPTED' })
     expect(event.at).toBeInstanceOf(Date)
   })
@@ -212,9 +223,10 @@ describe('order events', () => {
     // as-is once the caller adds the order id. If it ever needs massaging on the way
     // in, the "every state change writes an event" rule has a gap in it — this is the
     // test that fails first, at compile time as much as at runtime.
-    const { order } = await seedOrder({ status: 'NEW' })
+    const { seeded, order } = await seedOrder({ status: 'NEW' })
     const { next, event } = transition(order, 'ACCEPTED', 'user_2abc')
-    const [written] = await db().insert(orderEvents).values({ orderId: order.id, ...event }).returning()
+    const [written] = await withLocation(seeded.id, (tx) =>
+      tx.insert(orderEvents).values({ orderId: order.id, ...event }).returning())
     expect(next).toBe('ACCEPTED')
     expect(written.type).toBe('status_changed')
     expect(written.actor).toBe('user_2abc')
@@ -222,39 +234,48 @@ describe('order events', () => {
   })
 
   it('defaults an empty payload rather than null', async () => {
-    const { order } = await seedOrder()
-    const [event] = await db().insert(orderEvents)
-      .values({ orderId: order.id, type: 'created', actor: 'system' }).returning()
+    const { seeded, order } = await seedOrder()
+    const [event] = await withLocation(seeded.id, (tx) => tx.insert(orderEvents)
+      .values({ orderId: order.id, type: 'created', actor: 'system' }).returning())
     expect(event.payload).toEqual({})
   })
 
   it('cannot be updated', async () => {
     // Append-only is the whole value of the table: an audit row that can be edited
     // after the fact proves nothing in a dispute. Enforced by trigger, not convention.
-    const { order } = await seedOrder()
-    const [event] = await db().insert(orderEvents)
+    const { seeded, order } = await seedOrder()
+    const [event] = await withLocation(seeded.id, (tx) => tx.insert(orderEvents)
       .values({ orderId: order.id, type: 'status_changed', actor: 'user_2abc', payload: { from: 'NEW', to: 'ACCEPTED' } })
-      .returning()
-    const text = await rejectionText(() => db().update(orderEvents)
-      .set({ actor: 'someone_else' }).where(eq(orderEvents.id, event.id)))
+      .returning())
+    // A separate scope per statement: the rejection aborts its transaction, so the
+    // read-back cannot share one with it.
+    const text = await rejectionText(() => withLocation(seeded.id, (tx) => tx.update(orderEvents)
+      .set({ actor: 'someone_else' }).where(eq(orderEvents.id, event.id))))
     expect(text).toMatch(/append-only/i)
 
-    const [unchanged] = await db().select().from(orderEvents).where(eq(orderEvents.id, event.id))
+    const [unchanged] = await withLocation(seeded.id, (tx) => tx.select().from(orderEvents)
+      .where(eq(orderEvents.id, event.id)))
     expect(unchanged.actor).toBe('user_2abc')
   })
 
   it('cannot be deleted', async () => {
-    const { order } = await seedOrder()
-    const [event] = await db().insert(orderEvents)
-      .values({ orderId: order.id, type: 'created', actor: 'system' }).returning()
-    const text = await rejectionText(() => db().delete(orderEvents).where(eq(orderEvents.id, event.id)))
+    const { seeded, order } = await seedOrder()
+    const [event] = await withLocation(seeded.id, (tx) => tx.insert(orderEvents)
+      .values({ orderId: order.id, type: 'created', actor: 'system' }).returning())
+    const text = await rejectionText(() => withLocation(seeded.id, (tx) =>
+      tx.delete(orderEvents).where(eq(orderEvents.id, event.id))))
     expect(text).toMatch(/append-only/i)
 
-    const [survivor] = await db().select().from(orderEvents).where(eq(orderEvents.id, event.id))
+    const [survivor] = await withLocation(seeded.id, (tx) => tx.select().from(orderEvents)
+      .where(eq(orderEvents.id, event.id)))
     expect(survivor.id).toBe(event.id)
   })
 
   it('cannot be truncated', async () => {
+    // The one statement here that is deliberately NOT scoped. RLS does not filter
+    // TRUNCATE at all, so `app_user` is granted TRUNCATE on this table on purpose
+    // (0008) — otherwise this would fail with "permission denied" and stop proving
+    // that the append-only trigger exists. The trigger is what must refuse it.
     const text = await rejectionText(() => db().execute(sql`truncate table order_events`))
     expect(text).toMatch(/append-only/i)
   })
