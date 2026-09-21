@@ -54,12 +54,16 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
 -- before the trigger — which is exactly the gate we want to watch fail.
 GRANT TRUNCATE ON TABLE order_events TO app_user;--> statement-breakpoint
 
--- Tables added by later migrations inherit the grant instead of being silently
--- unreadable. They do NOT inherit a policy — every new location-scoped table has
--- to declare its own, which is the point.
+-- Future tables get **no** privileges by default, on purpose. A new table app_user
+-- can read but that nobody remembered to write a policy for is a silent
+-- cross-tenant leak — precisely the failure this file exists to prevent. A new
+-- table it cannot read at all is a loud "permission denied" in the first test that
+-- touches it, and the migration that adds the table makes the grant-and-policy
+-- decision out loud. Written as an explicit REVOKE rather than simply omitted, so
+-- re-running this file cannot leave an older GRANT behind.
 DO $$ BEGIN
   EXECUTE format(
-    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user',
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON TABLES FROM app_user',
     current_user);
 END $$;--> statement-breakpoint
 
