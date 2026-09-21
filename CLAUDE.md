@@ -7,6 +7,7 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 
 - Spec: `docs/superpowers/specs/2026-09-07-restaurant-ordering-backend-design.md`
 - Plan in flight: `docs/superpowers/plans/2026-09-20-ordering-spine.md`
+- `README.md` — what this is, the architecture, the env table, the local loop.
 
 ## Non-negotiable rules
 
@@ -50,8 +51,8 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   day RLS stops working. **Two deliberate exceptions**, both taking an explicit
   `locationId`: `ordersRepo.listActiveWithItems` and `ordersRepo.lockById` — the
   kitchen board and the row a tablet is about to move. RLS is *silently inert* for a
-  role that owns the tables, and `.env.local` is still connected as the Neon owner,
-  so the two reads whose output reaches a browser say "whose is this" in SQL too.
+  role that owns the tables, and an env file pointed at the Neon owner is one command
+  away, so the two reads whose output reaches a browser say "whose is this" in SQL too.
   `repos.test.ts` pins that by scoping a transaction to location B and asking for
   A — RLS allows B's rows, so anything returned is the predicate having gone missing.
   Adding a third needs the same argument and the same shape of test. Unscoped means
@@ -305,6 +306,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `app_user`'s password (from `APP_USER_PASSWORD`, else generated), verifies the role
   cannot bypass RLS, and rewrites the env file's `DATABASE_URL`. Never prints a secret.
   The password is deliberately not in the committed migration.
+- `npm run seed:kashi` — the pilot restaurant (org `kashi`, one Brooklyn location),
+  with **their real menu, prices and hours**, copied from
+  `client-sites/src/clients/kashi/config.ts`. Upserts on natural keys, so it is safe to
+  re-run, and its last act is `buildMenuSnapshot` — a seeded location is immediately
+  orderable. `ENV_FILE=.env.test` seeds the test branch; `-- --hours=always-open` posts
+  an around-the-clock **dev** grid (never a restaurant's) so the proof and the suite are
+  not stuck behind opening time. Plain `npm run seed:kashi` puts the real hours back.
+- `npm run spine:proof` — the end-to-end proof: a real pay-on-pickup order through
+  `createOrder`, the real `fanOut` driven with an inline `step`, then it polls
+  `print_jobs` and prints the rendered ticket, ending `SPINE OK`. Needs `DATABASE_URL`
+  on `app_user` (it says so, with the fix, if not) and a seeded restaurant.
+- The local loop is three terminals: `npx inngest-cli dev`, `npm run dev`, and
+  `stripe listen --forward-to localhost:3000/api/stripe/webhook` — whose `whsec_…` goes
+  in `STRIPE_WEBHOOK_SECRET`. `README.md` has the env table and the card walkthrough.
 - Triggers, RLS, roles — anything drizzle-kit does not model — go in a hand-written
   migration: `npx drizzle-kit generate --custom --name=<what>`, fill the file, migrate
   as above. `generate` afterwards must still say "No schema changes". Write them
@@ -411,6 +426,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `next/server`, which is what keeps that possible. Tests mock the Stripe SDK whole
   (`vi.mock('stripe', ...)` over `vi.hoisted` fns) — no network, and `constructEvent`
   is the seam for a valid vs. forged signature.
-- `.env.local` still points `DATABASE_URL` at the owner. Migrate `main` and run
-  `ENV_FILE=.env.local npm run db:app-user` before anything serves real traffic —
-  until then the app bypasses its own RLS on that branch.
+- **`scripts/seed-kashi.ts` is the one code path that connects as the owner**, and it
+  says why: seeding writes a location's menu before there is a tenant to scope to, so
+  `withLocation` would refuse it. It opens its own transaction and sets the GUC itself
+  (`ownerScope`), reads `MIGRATION_DATABASE_URL`, and refuses to run as a role RLS
+  binds. Nothing else may copy it — `spine:proof` deliberately goes through the ordinary
+  `app_user` path, which is what keeps the exemption to one file.
