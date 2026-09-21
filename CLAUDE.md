@@ -114,7 +114,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `jobReady: false` and **writes nothing**: auto-registration would let anyone who can
   reach the URL claim a location and collect its tickets. A non-OK `code` leaves the
   job at `delivered` rather than requeuing it — a jammed printer would otherwise fail
-  the same ticket forever and never reach the orders behind it.
+  the same ticket forever and never reach the orders behind it. **The open risk is
+  serial enumeration**: the OUI is public and vendors burn MACs sequentially, so a hit
+  steals a ticket (name + phone) and can confirm it so it never prints. The serial is
+  clamped to a plausible shape before it is queried or logged; the throttle and the
+  unprovisioned-serial-burst alert are Task 14's, marked `TODO(task-14)` in the route.
 - **`renderTicket` (`src/domain/ticket.ts`) runs once, at fan-out, and its output is
   stored verbatim** in `print_jobs.payload` — same reasoning as `orders.menu_snapshot_id`:
   a reprint must reproduce the ticket that printed, not re-render against a menu that

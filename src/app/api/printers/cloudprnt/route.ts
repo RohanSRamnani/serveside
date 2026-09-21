@@ -40,6 +40,27 @@ import { withLocation, isUuid } from '@/repo/scoped'
  *   DELETE carry the MAC too (Star sends it), so a job id lifted from one restaurant
  *   is a 404 at another — and a 404 with an empty body, never a 403, so the reply
  *   cannot be used to ask whether an id exists.
+ *
+ * **The residual attack, named rather than left to be discovered: serial enumeration.**
+ * If the serial is the credential then guessing one is the whole attack, and a MAC is
+ * a poor secret. The OUI is public (`00:11:62` is Star), which leaves ~24 bits, and
+ * vendors burn MACs sequentially — so a range around a known unit is a far smaller
+ * search than 24 bits suggests. A hit is not a nuisance: the attacker collects that
+ * kitchen's next ticket, with the customer's name and phone number on it, and can then
+ * DELETE it `code=OK` so the ticket never prints and nobody is told.
+ *
+ * What is done about it here is only what belongs here: the serial is clamped to a
+ * plausible shape before it is used or logged (below), so an unknown serial costs one
+ * indexed lookup and one bounded log line and nothing else.
+ *
+ * TODO(task-14): the actual mitigations are rate-limiting and alerting, and they are
+ * Task 14's — it already owns the printer-health alerting that reads `lastSeenAt`.
+ * Two obligations, neither optional:
+ *   1. Throttle polls per source (and per unknown serial) — an enumeration sweep is
+ *      thousands of requests a minute; a real printer polls every few seconds.
+ *   2. Alert on an **unprovisioned-serial burst**. A genuine unknown serial is a
+ *      mis-provisioned printer at install time: one MAC, repeating. A spread of
+ *      distinct unknown serials is someone sweeping, and it is the only signal we get.
  */
 
 /** The only thing we render. Star uses this to pick its print path. */
@@ -50,6 +71,29 @@ const MEDIA_TYPES = ['text/plain'] as const
  * whose. Not the `Printer` row from the schema — nothing here reads one.
  */
 type PrinterRef = { printerId: string; locationId: string }
+
+/**
+ * What a printer serial is allowed to look like, checked **before** the value is
+ * queried with or written to a log.
+ *
+ * A MAC is `00:11:62:aa:bb:cc`; the column is `text` because the next provider's
+ * serial will not be a MAC, so this is deliberately wider than one vendor's format —
+ * alphanumerics and the three separators anyone uses, bounded at 64 characters. It is
+ * not an attempt to validate a MAC. It is an attempt to make sure that whatever
+ * reaches `printer_lookup` and `console.warn` is a short, boring token.
+ *
+ * Two things it closes. A megabyte of JSON string in `printerMAC` would otherwise be
+ * a megabyte in the log on every request — a log-flood with no rate limit in front of
+ * it. And a serial containing newlines would let an attacker write their own lines
+ * into our logs, which is how a forged "printer provisioned" entry appears in an
+ * incident timeline.
+ */
+const SERIAL = /^[A-Za-z0-9:_.-]{1,64}$/
+
+/** The serial from a request, or null if it is not one. Never throws; never logs. */
+function serialFrom(value: unknown): string | null {
+  return typeof value === 'string' && SERIAL.test(value) ? value : null
+}
 
 export async function POST(req: Request): Promise<Response> {
   let body: unknown
@@ -62,7 +106,8 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   const poll = body as { printerMAC?: unknown; statusCode?: unknown } | null
-  const serial = typeof poll?.printerMAC === 'string' ? poll.printerMAC : null
+  // Clamped first: everything below either queries with this value or logs it.
+  const serial = serialFrom(poll?.printerMAC)
   const printer = serial ? await lookupPrinter(serial) : null
   // A well-formed poll we cannot place is not a bad request — it is a printer we do
   // not know, and the honest answer is "no work for you". Logged, not written down:
@@ -75,8 +120,10 @@ export async function POST(req: Request): Promise<Response> {
   // The printer reports its own health on every poll — `200 OK`, or a code for cover
   // open, paper out, a jam. There is nowhere to store it (no column, and Task 14's
   // alert reads `lastSeenAt`), so it is logged when it is not OK rather than dropped.
+  // Bounded and stripped for the same reason the serial is: it ends up in a log line,
+  // and a status code with newlines in it would let a printer write its own entries.
   if (typeof poll?.statusCode === 'string' && !poll.statusCode.startsWith('200')) {
-    console.warn('[cloudprnt] printer', serial, 'reports', poll.statusCode)
+    console.warn('[cloudprnt] printer', serial, 'reports', poll.statusCode.replace(/\s+/g, ' ').slice(0, 64))
   }
 
   const jobToken = await withLocation(printer.locationId, async (tx) => {
@@ -194,7 +241,7 @@ export async function DELETE(req: Request): Promise<Response> {
  * about the name of the same thing.
  */
 async function pollingContext(url: URL): Promise<PrinterRef | null> {
-  const serial = url.searchParams.get('mac') ?? url.searchParams.get('printerMAC')
+  const serial = serialFrom(url.searchParams.get('mac') ?? url.searchParams.get('printerMAC'))
   return serial ? lookupPrinter(serial) : null
 }
 

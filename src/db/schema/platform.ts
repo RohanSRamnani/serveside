@@ -1,4 +1,5 @@
-import { pgTable, pgEnum, uuid, text, jsonb, timestamp } from 'drizzle-orm/pg-core'
+import { pgTable, pgEnum, uuid, text, jsonb, timestamp, index } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 import { orders } from './orders'
 
@@ -91,7 +92,25 @@ export const printJobs = pgTable('print_jobs', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   /** Set when the printer confirms the print, never before. Null on `queued` and `delivered`. */
   confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
-}).enableRLS()
+}, (t) => [
+  /**
+   * The index the CloudPRNT poll lives on, and the only one this table needs.
+   *
+   * Every printer on the platform runs exactly one query against this table, forever:
+   * `WHERE location_id = ... AND status = 'queued' ORDER BY created_at, id LIMIT 1`,
+   * every few seconds, per kitchen. Nothing prunes `print_jobs` — it is the record of
+   * what was printed — so the table only grows, while the set of rows the poll wants
+   * stays near zero. A sequential scan of a year of tickets to find that nothing is
+   * waiting is a cost that compounds with every order ever taken.
+   *
+   * **Partial** for that reason: the predicate matches the query's own, so the index
+   * holds only the handful of jobs actually queued rather than every ticket in
+   * history. `location_id` leads because RLS adds that equality to every statement.
+   */
+  index('print_jobs_queued_idx')
+    .on(t.locationId, t.createdAt)
+    .where(sql`${t.status} = 'queued'`),
+]).enableRLS()
 
 export type WebhookEvent = typeof webhookEvents.$inferSelect
 export type Printer = typeof printers.$inferSelect

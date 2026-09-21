@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { eq, sql } from 'drizzle-orm'
+import { neon } from '@neondatabase/serverless'
 import { db } from '@/db/client'
 import { printers, printJobs } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
@@ -59,6 +60,26 @@ async function readJob(locationId: string, id: string) {
     const [row] = await tx.select().from(printJobs).where(eq(printJobs.id, id))
     return row
   })
+}
+
+/**
+ * A count of every printer row on the branch, taken as the **owner**.
+ *
+ * The only privileged connection in this suite, and it exists to prove a negative
+ * that RLS would otherwise make unprovable. "The route created no printer" is a
+ * statement about rows we are not allowed to see: asked as `app_user` it answers
+ * zero whether or not a row was written, so the assertion would pass for a route
+ * that auto-registers. Asked as the owner it is the real number.
+ *
+ * **Not a general escape hatch.** Nothing else in this repo's tests connects as the
+ * owner, and nothing else should: every other assertion here is about what the
+ * application can see, which is exactly what `app_user` answers. If this connection
+ * is ever the thing that makes a test pass, the test is wrong.
+ */
+async function countPrinters(): Promise<number> {
+  const owner = neon(process.env.MIGRATION_DATABASE_URL!)
+  const [row] = await owner`select count(*)::int as n from printers` as { n: number }[]
+  return row.n
 }
 
 /** A restaurant with a printer and one paid order to print. */
@@ -179,17 +200,74 @@ describe('the serial is the credential', () => {
     // The whole reason this route does not upsert by MAC. If it did, anyone who can
     // reach the URL could register themselves as a printer and — once someone pointed
     // a location at them — start collecting a restaurant's tickets.
-    const before = await db().execute(sql`select count(*)::int as n from printers`)
+    //
+    // The count runs on the **owner** connection. Counting through `db()` would be
+    // worse than useless here: `printers` is RLS-policed and `db()` carries no scope,
+    // so it reads 0 before and 0 after whatever the route does, and the assertion
+    // passes for a route that auto-registers just as happily as for one that does not.
+    // A test that cannot fail is not evidence.
+    const existing = await kitchen()
+    const before = await countPrinters()
     const stranger = macAddress()
 
     const res = await poll(stranger)
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ jobReady: false, mediaTypes: ['text/plain'] })
 
-    const after = await db().execute(sql`select count(*)::int as n from printers`)
-    expect((after.rows[0] as { n: number }).n).toBe((before.rows[0] as { n: number }).n)
+    expect(await countPrinters()).toBe(before)
     const planted = await db().execute(sql`select * from printer_lookup(${stranger})`)
     expect(planted.rows).toHaveLength(0)
+
+    // And it does not touch the printers it *does* know. A heartbeat written on an
+    // unrecognised poll would mean a dead printer looks alive for as long as someone
+    // is knocking — which is precisely when the offline alert matters most.
+    expect((await readPrinter(existing.loc.id, existing.printer.id)).lastSeenAt).toBeNull()
+  })
+
+  it('drops a serial that is not shaped like one before it reaches a log line', async () => {
+    // The clamp's whole effect is on what gets *logged*, because an unknown serial is
+    // answered `jobReady: false` either way — so asserting the response would be
+    // asserting nothing. What it prevents: a megabyte of JSON in `printerMAC` is a
+    // megabyte in the log on every request (a log flood with no rate limit in front of
+    // it), and newlines in it let a caller write their own entries into an incident
+    // timeline. Both are only visible at `console.warn`.
+    const { loc, printer, order } = await kitchen()
+    const job = await seedPrintJob(loc.id, order.id, '*** CLM1 ***')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      for (const bogus of ['x'.repeat(65), 'aa:bb\ncc:dd', "00:11:62'; drop table printers; --", '', '00 11 62']) {
+        const res = await poll(bogus)
+        expect(res.status, `serial ${JSON.stringify(bogus.slice(0, 20))}`).toBe(200)
+        expect(await res.json()).toEqual({ jobReady: false, mediaTypes: ['text/plain'] })
+        // Never queried, never logged — it did not look like a serial, so it was not
+        // treated as one at any point.
+        expect(warn, `${JSON.stringify(bogus.slice(0, 20))} reached a log line`).not.toHaveBeenCalled()
+      }
+
+      // The positive control: a well-shaped serial we simply do not know *is* worth a
+      // line, and that line is the signal Task 14's enumeration alert will read.
+      const unknown = macAddress()
+      await poll(unknown)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn.mock.calls[0].join(' ')).toContain(unknown)
+
+      // A status code is attacker-controlled too, and also ends up in a log line.
+      warn.mockClear()
+      await poll(printer.serial, `40600000 ${'z'.repeat(500)}\nprinter provisioned: attacker`)
+      const logged = warn.mock.calls[0].join(' ')
+      expect(logged).not.toMatch(/\n/)
+      expect(logged.length).toBeLessThan(200)
+    } finally {
+      warn.mockRestore()
+    }
+
+    // A GET or DELETE carrying a malformed MAC is no different: no context to open.
+    expect((await fetchJob('x'.repeat(65), job.id)).status).toBe(404)
+    expect((await confirmJob('aa:bb\ncc', job.id)).status).toBe(404)
+
+    // And the real printer still works, so the clamp rejects shapes, not everything.
+    expect(await (await poll(printer.serial)).json()).toMatchObject({ jobReady: true, jobToken: job.id })
   })
 
   it('never shows one restaurant the other one\'s queue', async () => {
@@ -240,6 +318,28 @@ describe('the serial is the credential', () => {
     }))
     expect(noMac.status).toBe(200)
     expect(await noMac.json()).toEqual({ jobReady: false, mediaTypes: ['text/plain'] })
+  })
+})
+
+describe('the poll runs on an index', () => {
+  it('has the partial index the queue read depends on', async () => {
+    // Every printer on the platform runs one query against `print_jobs` forever, every
+    // few seconds, and nothing ever prunes the table — it is the record of what was
+    // printed. Without this index that poll becomes a sequential scan over a year of
+    // tickets to discover that nothing is waiting, and the cost compounds with every
+    // order ever taken. Asserted rather than assumed because an index is invisible
+    // until it is missing: EXPLAIN on a near-empty test table would pick a seq scan
+    // either way, so what is pinned is that the index is really on the branch, with
+    // the predicate that matches the query.
+    const idx = await db().execute(sql`
+      select indexdef from pg_indexes
+      where schemaname = 'public' and tablename = 'print_jobs' and indexname = 'print_jobs_queued_idx'`)
+    expect(idx.rows).toHaveLength(1)
+    const { indexdef } = idx.rows[0] as { indexdef: string }
+    // location_id leads, because RLS adds that equality to every statement.
+    expect(indexdef).toMatch(/\(location_id, created_at\)/)
+    // Partial, so it holds the handful of queued jobs rather than every ticket ever.
+    expect(indexdef).toMatch(/WHERE \(status = 'queued'/)
   })
 })
 
