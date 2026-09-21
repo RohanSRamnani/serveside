@@ -114,7 +114,7 @@ Postgres. All money is `bigint` cents — never floats. Every table carries
 ```
 organizations      id, name, slug, created_at
 locations          id, org_id, name, address, lat, lng, timezone,
-                   phone_e164, prep_time_minutes, tax_rate_bps,
+                   phone_e164, prep_time_minutes, tax_rate_per_100k,
                    pickup_enabled, delivery_enabled,
                    stripe_account_id, printer_id, status
 users              (Clerk-backed) id, email, name

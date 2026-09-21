@@ -8,8 +8,17 @@
  * test it without a database in the way.
  */
 
-/** Basis points per whole: 875 bps = 8.75%. */
-const BPS_PER_WHOLE = 10_000
+/**
+ * The unit every tax rate in this codebase is in: **parts per 100,000**. 8875 is
+ * 8.875%, which is New York City on prepared food.
+ *
+ * It was basis points until 2026-09-21, and the reason it is not is worth keeping:
+ * 8.875% is 887.5 basis points, so an integer bps rate cannot express the rate of the
+ * first city we launch in. Per 100,000 holds every US jurisdiction, all of which quote
+ * to at most three decimal places, and keeps the rate an integer — the only kind of
+ * number this file is willing to do arithmetic on.
+ */
+const PER_100K_WHOLE = 100_000
 
 /**
  * Half **up**, never banker's rounding.
@@ -38,26 +47,33 @@ export function roundHalfUp(value: number): number {
 /**
  * Sales tax on a subtotal, at the location's rate.
  *
- * `subtotal * bps / 10000` is safe despite the float division: both operands are
+ * `subtotal * rate / 100000` is safe despite the float division: both operands are
  * integers, so the numerator is exact, and the true quotient's only tie values are
- * halves — which binary floating point represents exactly. A division that landed
- * *near* a tie could only do so from an input that differs from the tie by less
- * than 1e-10, and an integer numerator cannot. The safe-integer guard below keeps
- * that argument true by refusing the magnitudes where it would stop being.
+ * halves — which binary floating point represents exactly. Two quotients that are not
+ * equal differ by at least 1e-5 (the numerator moves in whole units), while the
+ * relative error of one IEEE-754 division is about 1e-16, so a quotient that is not a
+ * tie can never be rounded into one. The safe-integer guard below keeps that argument
+ * true by refusing the magnitudes where it would stop being.
+ *
+ * **That guard is ten times tighter than it was**, because the divisor grew: with the
+ * numerator capped at 2^53−1, a full 100% rate (100,000) bounds the subtotal at about
+ * 9.0e10 cents — $900 million on one order, against $9 billion under basis points.
+ * Both are far past every real order and past `orders.subtotal_cents`' own CHECK; the
+ * number is written down here so the next person to widen a rate knows what it costs.
  *
  * One flat rate per location, applied to the whole subtotal: `menu_items.taxCategory`
  * exists but nothing reads it yet, and per-category tax is not in this plan.
  */
-export function taxCentsFor(subtotalCents: number, taxRateBps: number): number {
+export function taxCentsFor(subtotalCents: number, taxRatePer100k: number): number {
   assertWholeCents('subtotal', subtotalCents)
-  assertWholeCents('tax rate (bps)', taxRateBps)
+  assertWholeCents('tax rate (per 100k)', taxRatePer100k)
   assertNotNegative('subtotal', subtotalCents)
-  assertNotNegative('tax rate (bps)', taxRateBps)
-  const numerator = subtotalCents * taxRateBps
+  assertNotNegative('tax rate (per 100k)', taxRatePer100k)
+  const numerator = subtotalCents * taxRatePer100k
   if (!Number.isSafeInteger(numerator)) {
-    throw new Error(`taxCentsFor: ${subtotalCents} × ${taxRateBps} exceeds exact integer arithmetic`)
+    throw new Error(`taxCentsFor: ${subtotalCents} × ${taxRatePer100k} exceeds exact integer arithmetic`)
   }
-  return roundHalfUp(numerator / BPS_PER_WHOLE)
+  return roundHalfUp(numerator / PER_100K_WHOLE)
 }
 
 /**

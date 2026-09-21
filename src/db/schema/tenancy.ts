@@ -20,7 +20,21 @@ export const locations = pgTable('locations', {
   timezone: text('timezone').notNull(),
   phoneE164: text('phone_e164').notNull(),
   prepTimeMinutes: integer('prep_time_minutes').notNull().default(20),
-  taxRateBps: integer('tax_rate_bps').notNull(),
+  /**
+   * Sales tax, in **parts per 100,000** — 8875 is 8.875%, New York City's rate on
+   * prepared food. Not basis points, and the difference is not pedantry: this column
+   * started life as `tax_rate_bps`, and NYC's rate is not expressible in whole basis
+   * points at all (8.875% is 887.5 bps). An integer column in that unit cannot hold
+   * the rate of the city we are launching in, so every location in it would have been
+   * charged 8.75% or 8.9%. Re-united 2026-09-21 (`drizzle/0019_tax_rate_per_100k.sql`),
+   * which multiplied every existing value by ten.
+   *
+   * Integer, still: the alternative is `numeric`, and a rate read back as a string or
+   * a float is a rounding opinion in the one place this codebase refuses to have one.
+   * Per 100,000 covers every US jurisdiction — rates are quoted to at most three
+   * decimal places — and `taxCentsFor` divides by exactly that.
+   */
+  taxRatePer100k: integer('tax_rate_per_100k').notNull(),
   pickupEnabled: boolean('pickup_enabled').notNull().default(true),
   deliveryEnabled: boolean('delivery_enabled').notNull().default(false),
   stripeAccountId: text('stripe_account_id'),

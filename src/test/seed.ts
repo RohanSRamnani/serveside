@@ -37,7 +37,18 @@ export async function seedLocation(overrides: LocationOverrides = {}): Promise<L
     address: 'x',
     timezone: 'America/New_York',
     phoneE164: '+15550000002',
-    taxRateBps: 875,
+    /**
+     * 8.75%, in parts per 100,000 — the unit `locations.tax_rate_per_100k` has held
+     * since 2026-09-21 (it was 875 basis points, the same rate, before the re-unit).
+     *
+     * Deliberately **not** a real jurisdiction's rate, and not Kashi's. A fixture
+     * whose arithmetic tracks a real city moves every golden in this suite the day
+     * that city changes its tax, for no reason connected to the code under test. The
+     * real New York rate (8875) lives in exactly two places: `scripts/seed-kashi.ts`,
+     * which is a real restaurant, and the `createOrder` contract test, which is about
+     * that rate on purpose.
+     */
+    taxRatePer100k: 8750,
     ...overrides,
   }).returning()
   return loc
@@ -149,7 +160,7 @@ type OrderOverrides = Partial<Pick<
  *
  * Priced off the seeded menu, so nothing here is a magic number:
  *   1800 + 50 = 1850/unit × 2 = 3700 subtotal
- *   tax 3700 × 875bps = 323.75 → 324 (half up), tip 500 → total 4524
+ *   tax 3700 × 8750/100k = 323.75 → 324 (half up), tip 500 → total 4524
  * The arithmetic itself belongs to Task 8's `createOrder`; these are stored values.
  *
  * Snapshot, order, line and event all land in **one** transaction — the same shape
@@ -265,7 +276,7 @@ export const TICKET_READY_AT = new Date('2026-09-21T23:45:00Z')
  * Priced off the seeded menu, so nothing here is a magic number:
  *   Butter Chicken 1800 + Hot 50 + Extra Paneer 250 = 2100/unit × 2 = 4200
  *   Lamb Rogan Josh 2100 × 1                                       = 2100
- *   subtotal 6300, tax 6300 × 875bps = 551.25 → 551 (half up), tip 500
+ *   subtotal 6300, tax 6300 × 8750/100k = 551.25 → 551 (half up), tip 500
  *   total 7351
  */
 export async function seedTicketOrder(locationId: string): Promise<Order> {

@@ -12,10 +12,11 @@
  * order from; the full menu is a later job.
  *
  * Two things are ours rather than theirs, and both are named where they are defined:
- * the **tax rate** (they publish none — 875 bps is New York City prepared food: 4%
- * state + 4.5% city + 0.375% MCTD) and the **modifier groups** (their current vendor
- * offers no modifiers at all; the spice level costs nothing, and the bread add-on's
- * prices are Kashi's own listed bread prices).
+ * the **tax rate** (they publish none — 8.875% is New York City prepared food: 4%
+ * state + 4.5% city + 0.375% MCTD, written as 8875 parts per 100,000) and the
+ * **modifier groups** (their current vendor offers no modifiers at all; the spice
+ * level costs nothing, and the bread add-on's prices are Kashi's own listed bread
+ * prices).
  *
  * **It connects as the table owner, on purpose.** Seeding is admin work: it writes
  * menus for a location that does not exist yet, so there is no tenant to scope to
@@ -98,7 +99,7 @@ type KashiSeed = {
     address: string
     timezone: string
     phoneE164: string
-    taxRateBps: number
+    taxRatePer100k: number
   }
   menu: { name: string }
   categories: string[]
@@ -117,11 +118,18 @@ export const KASHI: KashiSeed = {
     /** 917-909-0243 on their site; E.164 is the only shape `sendSms` accepts. */
     phoneE164: '+19179090243',
     /**
-     * 8.875% — New York State 4% + New York City 4.5% + MCTD 0.375%, the rate on
-     * prepared food sold in the five boroughs. Kashi publishes no rate of their own,
-     * so this is the statutory one and it is the number to check with them first.
+     * **8.875%**, in parts per 100,000 — New York State 4% + New York City 4.5% +
+     * MCTD 0.375%, the rate on prepared food sold in the five boroughs. Kashi
+     * publishes no rate of their own, so this is the statutory one and it is the
+     * number to check with them first.
+     *
+     * The unit is the whole reason `locations.tax_rate_per_100k` is not
+     * `tax_rate_bps` any more: 8.875% is 887.5 basis points, and an integer column of
+     * basis points cannot hold this restaurant's actual tax rate. 8875 here is the
+     * one deliberate reprice in the 2026-09-21 re-unit — the migration left every
+     * other location's rate exactly where it was.
      */
-    taxRateBps: 875,
+    taxRatePer100k: 8875,
     // `prep_time_minutes` is deliberately left at the column default (20). It is an
     // operational number only the kitchen can give us, and a guess here would print
     // a promised time on a real ticket.
@@ -323,7 +331,7 @@ export async function seedKashi(db: SeedDb, opts: { hours?: HoursGrid } = {}): P
         address: KASHI.location.address,
         timezone: KASHI.location.timezone,
         phoneE164: KASHI.location.phoneE164,
-        taxRateBps: KASHI.location.taxRateBps,
+        taxRatePer100k: KASHI.location.taxRatePer100k,
       },
     })
     .returning({ id: locations.id })

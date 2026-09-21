@@ -100,7 +100,7 @@ export async function requireLocationAccess(locationSlug: string | null | undefi
       timezone: locations.timezone,
       phoneE164: locations.phoneE164,
       prepTimeMinutes: locations.prepTimeMinutes,
-      taxRateBps: locations.taxRateBps,
+      taxRatePer100k: locations.taxRatePer100k,
       pickupEnabled: locations.pickupEnabled,
       deliveryEnabled: locations.deliveryEnabled,
       stripeAccountId: locations.stripeAccountId,

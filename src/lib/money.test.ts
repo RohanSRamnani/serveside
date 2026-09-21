@@ -41,37 +41,54 @@ describe('roundHalfUp', () => {
 })
 
 describe('taxCentsFor', () => {
-  it('taxes the plan\'s order: 4000 at 875 bps is 350', () => {
-    expect(taxCentsFor(4000, 875)).toBe(350)
+  it('taxes the contract order: 4000 at 8875 per 100k is 355', () => {
+    // **Re-united 2026-09-21.** The plan said "875 bps", and the rate it meant was
+    // New York City's 8.875% — which is 887.5 basis points and therefore not
+    // expressible in an integer bps column at all. The unit is now parts per
+    // 100,000, the contract order's tax moves 350 → 355 and its total 4850 → 4855,
+    // and this line is the one that would have caught the original mistake:
+    // 4000 × 8875 / 100000 = 355.0, exactly.
+    expect(taxCentsFor(4000, 8875)).toBe(355)
   })
 
   it('rounds the half up rather than truncating it', () => {
-    // 1960 × 875 / 10000 = 171.5 exactly. Truncation says 171, banker's says 172
-    // by luck here, half-up says 172 by rule. 40 × 875 / 10000 = 3.5 → 4 is the
-    // case where truncation and banker's both disagree with us.
-    expect(taxCentsFor(1960, 875)).toBe(172)
-    expect(taxCentsFor(40, 875)).toBe(4)
+    // 1960 × 8750 / 100000 = 171.5 exactly. Truncation says 171, banker's says 172
+    // by luck here, half-up says 172 by rule. 40 × 8750 / 100000 = 3.5 → 4 is the
+    // case where truncation and banker's both disagree with us. 8750 is 8.75%: a
+    // rate chosen for its ties, not a jurisdiction's.
+    expect(taxCentsFor(1960, 8750)).toBe(172)
+    expect(taxCentsFor(40, 8750)).toBe(4)
   })
 
   it('keeps sub-cent fractions exact rather than drifting', () => {
-    // 1815 × 875 / 10000 = 158.8125 — a fraction that no float represents exactly.
-    expect(taxCentsFor(1815, 875)).toBe(159)
-    expect(taxCentsFor(1, 875)).toBe(0)
+    // 1815 × 8750 / 100000 = 158.8125 — a fraction that no float represents exactly.
+    expect(taxCentsFor(1815, 8750)).toBe(159)
+    expect(taxCentsFor(1, 8750)).toBe(0)
+    // And the real rate on a real price: 1600 × 8875 / 100000 = 142.0.
+    expect(taxCentsFor(1600, 8875)).toBe(142)
   })
 
   it('taxes nothing at nothing, and at a zero rate', () => {
-    expect(taxCentsFor(0, 875)).toBe(0)
+    expect(taxCentsFor(0, 8750)).toBe(0)
     expect(taxCentsFor(4000, 0)).toBe(0)
   })
 
   it('refuses a negative subtotal or rate', () => {
     // A negative tax is a refund, and a refund is a payment_status, never a total.
-    expect(() => taxCentsFor(-1, 875)).toThrow(/negative/i)
+    expect(() => taxCentsFor(-1, 8750)).toThrow(/negative/i)
     expect(() => taxCentsFor(4000, -1)).toThrow(/negative/i)
   })
 
   it('refuses a fractional subtotal — cents are whole', () => {
-    expect(() => taxCentsFor(4000.5, 875)).toThrow(/whole/i)
+    expect(() => taxCentsFor(4000.5, 8750)).toThrow(/whole/i)
+  })
+
+  it('refuses a subtotal so large the numerator stops being exact', () => {
+    // The guard is ten times tighter since the divisor grew: at a 100% rate the
+    // numerator leaves safe-integer range just past 9.0e10 cents. Named here so a
+    // future rate unit cannot quietly move it again.
+    expect(() => taxCentsFor(90_071_992_548, 100_000)).toThrow(/exact integer/i)
+    expect(taxCentsFor(90_071_992_547, 100_000)).toBe(90_071_992_547)
   })
 })
 

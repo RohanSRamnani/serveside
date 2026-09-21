@@ -134,6 +134,13 @@
       "when": 1789989842247,
       "tag": "0018_probe_events_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789994737203,
+      "tag": "0019_tax_rate_per_100k",
+      "breakpoints": true
     }
   ]
 }

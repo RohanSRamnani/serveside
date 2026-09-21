@@ -23,6 +23,13 @@
  * connected account can still take orders all day. The card path — PENDING_PAYMENT
  * until a signed webhook flips it — is printed as instructions at the end.
  *
+ * **The SMS leg is never run**, and that is an interlock rather than a shortcut: the
+ * number the fan-out texts is the restaurant's real one, so a proof that ran it would
+ * text an actual kitchen about a fake order every time anybody ran this. `proofStep`
+ * runs the print leg and skips everything else; the skip is printed. The owner's text
+ * is covered by `src/inngest/order-created.test.ts` and by the card walkthrough at the
+ * end of a run, which goes through the route and the orchestrator for real.
+ *
  * **It must connect as `app_user`.** Everything it touches goes through
  * `withLocation`, which refuses a connection that can bypass RLS. If the env file
  * still points `DATABASE_URL` at the Neon owner, the run stops and says how to fix
@@ -130,37 +137,48 @@ function describe(item: SnapshotItem, selection: string[], qty: number): string 
 // ---------------------------------------------------------------------------
 
 /**
- * The `step` the fan-out is given here: run the work, now, in this process.
- *
- * Inngest's own step tools memoize, retry and resume across invocations; none of that
- * is available without the orchestrator and none of it is what this proves. The cast
- * is the same one `src/inngest/order-created.test.ts` uses — `fanOut` only ever calls
- * `step.run`, and pinning that is the point of it taking a `step` at all.
+ * The only leg of the fan-out this script runs. Everything else the fan-out asks for
+ * is skipped — see `proofStep`.
  */
-export function inlineStep(): GetStepTools<typeof inngest> {
-  return {
-    run: (_id: string, fn: () => Promise<unknown>) => fn(),
-  } as unknown as GetStepTools<typeof inngest>
-}
+const PROOF_STEP = 'queue-print-job'
+
+/** Printed whenever a leg is skipped, so no run of this can be mistaken for a full one. */
+export const SKIPPED_NOTE = 'a proof run never texts a real restaurant; the print leg is the proof'
 
 /**
- * What a failed fan-out means for this run.
+ * The `step` the fan-out is given here: run the print leg, now, in this process, and
+ * **refuse to run anything else** — which today means the SMS leg, and tomorrow means
+ * whatever leg is added next.
  *
- * `fanOut` throws when **either** leg fails, which is right: a half-done fan-out that
- * reported success would be a ticket nobody printed. But the two legs fail for very
- * different reasons here. The SMS leg needs `TWILIO_*`, which a dev env file
- * legitimately leaves blank, and its failure costs a text message. The print leg
- * failing is the thing this script exists to catch.
+ * This is a safety interlock, not a convenience. `locations.phone_e164` is the
+ * restaurant's *real* number — Kashi's is +1 917 909 0243 — and the fan-out's job is
+ * to text it. The moment working `TWILIO_*` credentials land in `.env.local`, a script
+ * that ran the SMS leg would text an actual restaurant about an actual-looking order
+ * every time anybody ran the proof, including from a loop, including at 3am. Nothing
+ * about that failure is loud: the text sends, the run goes green, and the first person
+ * to hear about it is the owner.
  *
- * So: a fan-out that names only `sms-owner` is reported and survived; anything that
- * names `queue-print-job` — or that is not a fan-out failure at all — is fatal. The
- * queued ticket is still waited for either way, so a print leg that "succeeded" and
- * wrote nothing fails the run a moment later.
+ * **Allow-list, not a block-list**, and the direction is the whole point. Naming the
+ * one leg to run means a renamed or newly added leg is skipped by default: the worst
+ * case is a proof that proves less. A block-list on `'sms-owner'` would fail the other
+ * way — rename the step in `order-created.ts` and the guard silently stops guarding.
+ * If `queue-print-job` is ever renamed, nothing is queued and this script fails
+ * loudly on its own timeout, which is the failure you want.
+ *
+ * The cast is the same one `src/inngest/order-created.test.ts` uses: `fanOut` only ever
+ * calls `step.run`, and pinning that is the point of it taking a `step` at all.
+ * Skipping a step by resolving without running its callback is also exactly what the
+ * real orchestrator does with a memoized step — the shape is not a lie, only the
+ * reason.
  */
-export function fanOutOutcome(err: unknown): { fatal: boolean; message: string } {
-  const message = err instanceof Error ? err.message : String(err)
-  const smsOnly = message.includes('sms-owner:') && !message.includes('queue-print-job:')
-  return { fatal: !smsOnly, message }
+export function proofStep(skipped: string[] = []): GetStepTools<typeof inngest> {
+  return {
+    run: (id: string, fn: () => Promise<unknown>) => {
+      if (id === PROOF_STEP) return fn()
+      skipped.push(id)
+      return Promise.resolve(undefined)
+    },
+  } as unknown as GetStepTools<typeof inngest>
 }
 
 /** The newest pinned menu for a location — what an order is quoted from. */
@@ -211,8 +229,8 @@ export type ProofResult = {
   order: CreateOrderResult
   ticket: string
   printJobId: string
-  /** The fan-out failure that was survived, if there was one. */
-  warning?: string
+  /** The fan-out legs `proofStep` refused to run — `['sms-owner']` today. */
+  skippedSteps: string[]
   description: string[]
 }
 
@@ -238,17 +256,15 @@ export async function runProof(locationId: string): Promise<ProofResult> {
   }
   const order = await createOrder(input)
 
-  let warning: string | undefined
-  try {
-    await fanOut({ orderId: order.orderId, locationId }, inlineStep())
-  } catch (err) {
-    const outcome = fanOutOutcome(err)
-    if (outcome.fatal) throw err
-    warning = outcome.message
-  }
+  // Not wrapped in a try: with only the print leg running, every way `fanOut` can
+  // throw is a print leg that failed, and that is the thing this script exists to
+  // catch. The ticket is still waited for below, so a leg that "succeeded" and wrote
+  // nothing fails the run a moment later anyway.
+  const skippedSteps: string[] = []
+  await fanOut({ orderId: order.orderId, locationId }, proofStep(skippedSteps))
 
   const job = await awaitQueuedTicket(locationId, order.orderId)
-  return { locationId, order, ticket: job.payload, printJobId: job.id, warning, description }
+  return { locationId, order, ticket: job.payload, printJobId: job.id, skippedSteps, description }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,11 +323,8 @@ async function main(): Promise<void> {
   console.log(`  ordered    ${result.description.join(', ')}`)
   console.log(`  order      ${order.shortCode} · ${order.status} · $${formatCents(order.totalCents)} (${order.orderId})`)
   console.log(`  print job  ${result.printJobId} · queued`)
-  if (result.warning) {
-    console.log('')
-    console.log(`  WARNING    the fan-out did not complete: ${result.warning}`)
-    console.log('             The ticket was queued anyway — the two legs are independent by design.')
-    console.log('             Set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_E164 to text the owner too.')
+  if (result.skippedSteps.length > 0) {
+    console.log(`  skipped    ${result.skippedSteps.join(', ')} — ${SKIPPED_NOTE}`)
   }
 
   // The stored payload, byte for byte, at the width it will print at — 32 columns of
@@ -397,6 +410,21 @@ function explain(err: unknown): string[] {
   }
   if (err instanceof OrderRejectedError && err.code === 'menu_unavailable') {
     return [message, '', 'A location needs exactly one active menu. Re-seed it: npm run seed:kashi']
+  }
+  if (message.includes('No orderable item')) {
+    return [
+      message,
+      '',
+      'Every dish on the pinned menu is either 86\'d or has a mandatory modifier group whose',
+      'options are all 86\'d. **A re-seed will not fix this**: 86 is the kitchen\'s switch and',
+      '`seed-kashi` deliberately never clears it, because putting a sold-out dish back on sale',
+      'silently is how you sell food that does not exist. Put one back on the menu instead:',
+      '',
+      '  DELETE /api/menu/86?location=<slug>   { "itemId": "<uuid>" }',
+      '',
+      'or tap it back on from the kitchen feed. The hourly unsnooze job clears anything that',
+      'was 86\'d "until tomorrow" on its own.',
+    ]
   }
   return [message]
 }

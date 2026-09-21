@@ -17,14 +17,23 @@ import { withLocation } from '@/repo/scoped'
 import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
 import { SHORT_CODE_ALPHABET } from '@/lib/short-code'
 
-// The plan's arithmetic, and the reason `Hot` gets repriced below: an order of
-// 2 × (1800 + 200) at 875 bps is subtotal 4000, tax 350, tip 500, total 4850.
+// The contract order, and the reason `Hot` gets repriced below: 2 × (1800 + 200) is
+// a subtotal of 4000, taxed at New York City's real rate, with a 500 tip.
+//
+// **Re-united 2026-09-21.** The plan wrote this rate as "875 bps" — 8.75% — while
+// naming it as New York City's, which is 8.875%: 887.5 basis points, a number an
+// integer bps column cannot hold. `locations.tax_rate_per_100k` now stores parts per
+// 100,000, and the contract numbers move with it: 4000 × 8875 / 100000 = 355 exactly
+// (was 350), so the total is 4855 (was 4850). The fixture default in `@/test/seed`
+// stays at 8.75% on purpose — see the note there — so this test asks for the real
+// rate explicitly, which is also what makes it a test *about* the rate.
+const NYC_TAX_PER_100K = 8875
 const BUTTER_CHICKEN_CENTS = 1800
 const HOT_DELTA_CENTS = 200
 const TIP_CENTS = 500
 const SUBTOTAL = 4000
-const TAX = 350
-const TOTAL = 4850
+const TAX = 355
+const TOTAL = 4855
 
 /** By name, never by index: a seeder that reorders its inserts must not silently repoint a test. */
 function item(loc: SeededMenu, name: string) {
@@ -98,8 +107,8 @@ function pinnedItem(payload: MenuSnapshotPayload, name: string) {
 }
 
 describe('createOrder — the happy path', () => {
-  it('charges the plan\'s numbers exactly: 4000 + 350 + 500 = 4850', async () => {
-    const loc = await openRestaurant()
+  it('charges the contract numbers exactly: 4000 + 355 + 500 = 4855', async () => {
+    const loc = await openRestaurant({ taxRatePer100k: NYC_TAX_PER_100K })
     const result = await createOrder(planOrder(loc))
 
     expect(result.totalCents).toBe(TOTAL)
@@ -184,7 +193,7 @@ describe('createOrder — the happy path', () => {
   })
 
   it('appends exactly one created event, by the customer, carrying the money', async () => {
-    const loc = await openRestaurant()
+    const loc = await openRestaurant({ taxRatePer100k: NYC_TAX_PER_100K })
     const result = await createOrder(planOrder(loc))
     const { events } = await readOrder(loc.id, result.orderId)
     expect(events).toHaveLength(1)
@@ -199,7 +208,8 @@ describe('createOrder — the happy path', () => {
 
   it('rounds the tax half up on the way into the database', async () => {
     const loc = await openRestaurant()
-    // 1960 × 875 / 10000 = 171.5 exactly — the case truncation gets wrong by a cent.
+    // 1960 × 8750 / 100000 = 171.5 exactly — the case truncation gets wrong by a
+    // cent. The fixture rate, not New York's: this test is about the rounding.
     await withLocation(loc.id, (tx) => tx.update(menuItems)
       .set({ basePriceCents: 1960 })
       .where(eq(menuItems.id, item(loc, 'Lamb Rogan Josh').id)))
@@ -323,7 +333,8 @@ describe('createOrder — the menu it prices from', () => {
   })
 
   it('refuses an item that lives on a menu other than the active one', async () => {
-    const loc = await openRestaurant()
+    // The contract rate, because the closing assertion is the contract total.
+    const loc = await openRestaurant({ taxRatePer100k: NYC_TAX_PER_100K })
     // Last winter's menu, switched off, its dishes still flagged active. They are
     // not on sale and they are not in the snapshot — so they are not orderable.
     const offMenuItemId = await withLocation(loc.id, async (tx) => {

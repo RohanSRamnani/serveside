@@ -232,7 +232,7 @@ export async function createOrder(input: CreateOrderInput): Promise<CreateOrderR
     if (!openState.open) throw new LocationClosedError(input.locationId, openState.reason ?? 'closed_hours')
 
     const lines = await priceLines(tx, input)
-    const totals = totalsFor(lines, input.tipCents, location.taxRateBps)
+    const totals = totalsFor(lines, input.tipCents, location.taxRatePer100k)
 
     // Pinned, not rebuilt: see getOrBuildCurrentSnapshot. Same transaction as the
     // order, so `orders.menu_snapshot_id` can never name a row that was rolled back.
@@ -296,7 +296,7 @@ async function readLocation(tx: ScopedTx, locationId: string) {
   const [location] = await tx
     .select({
       status: locations.status,
-      taxRateBps: locations.taxRateBps,
+      taxRatePer100k: locations.taxRatePer100k,
       prepTimeMinutes: locations.prepTimeMinutes,
     })
     .from(locations)
@@ -506,11 +506,11 @@ async function priceLines(tx: ScopedTx, input: CreateOrderInput): Promise<Priced
   })
 }
 
-function totalsFor(lines: PricedLine[], tipCents: number, taxRateBps: number): Totals {
+function totalsFor(lines: PricedLine[], tipCents: number, taxRatePer100k: number): Totals {
   const subtotalCents = lines.reduce((sum, line) => sum + line.lineTotalCents, 0)
   const parts = {
     subtotalCents,
-    taxCents: taxCentsFor(subtotalCents, taxRateBps),
+    taxCents: taxCentsFor(subtotalCents, taxRatePer100k),
     tipCents,
     deliveryFeeCents: PICKUP_DELIVERY_FEE_CENTS,
     discountCents: NO_DISCOUNT_CENTS,

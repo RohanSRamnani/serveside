@@ -216,7 +216,7 @@ git add -A && git commit -m "chore: scaffold Next 16 app, Neon + Drizzle client,
 - Test: `src/db/schema/tenancy.test.ts`
 
 **Interfaces:**
-- Produces: tables `organizations { id uuid pk, name, slug unique, clerkOrgId unique nullable, createdAt }`, `locations { id uuid pk, orgId fk, name, slug, address, timezone, phoneE164, prepTimeMinutes int default 20, taxRateBps int, pickupEnabled bool default true, deliveryEnabled bool default false, stripeAccountId text nullable, status text default 'active', createdAt }`, `memberships { userId text, orgId fk, locationId fk nullable, role enum('owner','manager','staff') }`. Types exported as `Organization`, `Location`.
+- Produces: tables `organizations { id uuid pk, name, slug unique, clerkOrgId unique nullable, createdAt }`, `locations { id uuid pk, orgId fk, name, slug, address, timezone, phoneE164, prepTimeMinutes int default 20, taxRatePer100k int, pickupEnabled bool default true, deliveryEnabled bool default false, stripeAccountId text nullable, status text default 'active', createdAt }`, `memberships { userId text, orgId fk, locationId fk nullable, role enum('owner','manager','staff') }`. Types exported as `Organization`, `Location`.
 
 - [ ] **Step 1: Failing round-trip test**
 
@@ -232,11 +232,11 @@ describe('tenancy schema', () => {
     const [org] = await db().insert(organizations).values({ name: 'Test Org', slug: `t-${Date.now()}` }).returning()
     const [loc] = await db().insert(locations).values({
       orgId: org.id, name: 'Main', slug: 'main', address: '1 Test St, Brooklyn, NY',
-      timezone: 'America/New_York', phoneE164: '+15550000001', taxRateBps: 875,
+      timezone: 'America/New_York', phoneE164: '+15550000001', taxRatePer100k: 8750,
     }).returning()
     const found = await db().query.locations.findFirst({ where: eq(locations.id, loc.id), with: { org: true } })
     expect(found?.org.name).toBe('Test Org')
-    expect(found?.taxRateBps).toBe(875)
+    expect(found?.taxRatePer100k).toBe(8750)
   })
 })
 ```
@@ -269,7 +269,7 @@ export const locations = pgTable('locations', {
   timezone: text('timezone').notNull(),
   phoneE164: text('phone_e164').notNull(),
   prepTimeMinutes: integer('prep_time_minutes').notNull().default(20),
-  taxRateBps: integer('tax_rate_bps').notNull(),
+  taxRatePer100k: integer('tax_rate_per_100k').notNull(),
   pickupEnabled: boolean('pickup_enabled').notNull().default(true),
   deliveryEnabled: boolean('delivery_enabled').notNull().default(false),
   stripeAccountId: text('stripe_account_id'),
@@ -335,7 +335,7 @@ async function seedLocation() {
   const [org] = await db().insert(organizations).values({ name: 'M', slug: `m-${Date.now()}` }).returning()
   const [loc] = await db().insert(locations).values({
     orgId: org.id, name: 'Main', slug: 'main', address: 'x', timezone: 'America/New_York',
-    phoneE164: '+15550000002', taxRateBps: 875,
+    phoneE164: '+15550000002', taxRatePer100k: 8750,
   }).returning()
   return loc
 }
@@ -540,9 +540,16 @@ type CreateOrderResult = { orderId: string; shortCode: string; totalCents: numbe
 export function createOrder(input: CreateOrderInput): Promise<CreateOrderResult>
 ```
 
-- Money: `taxCents = roundHalfUp(subtotal * taxRateBps / 10000)`; `lineTotal = (unitPrice + sum(deltas)) * qty`.
+- Money: `taxCents = roundHalfUp(subtotal * taxRatePer100k / 100000)`; `lineTotal = (unitPrice + sum(deltas)) * qty`.
+  > **Correction, 2026-09-21 (Task 15).** This plan originally wrote the rate as an integer count of
+  > **basis points** and used New York City as the example — but NYC prepared food is 8.875%, which is
+  > 887.5 bps and is therefore not representable in that unit at all. The column is now
+  > `locations.tax_rate_per_100k` (parts per 100,000, 8875 = 8.875%), migrated by
+  > `drizzle/0019_tax_rate_per_100k.sql`, which multiplied every existing rate by ten. Every number
+  > below that reads "875 bps" is that same 8.75%, now written 8750; the contract order's tax at the
+  > real New York rate is **355**, not 350, and its total **4855**.
 
-- [ ] **Step 1: Failing money tests** — `roundHalfUp(174.5) === 175`, `roundHalfUp(174.4) === 174`; an order of 2× (1800 + 200 delta) at 875 bps: subtotal 4000, tax 350, tip 500, total 4850.
+- [ ] **Step 1: Failing money tests** — `roundHalfUp(174.5) === 175`, `roundHalfUp(174.4) === 174`; an order of 2× (1800 + 200 delta) at the real NYC rate (8875 per 100,000): subtotal 4000, tax 355, tip 500, total 4855 (see the 2026-09-21 correction above).
 
 - [ ] **Step 2: Failing createOrder tests** — (a) happy path: totals exact per Step 1 numbers, status `PENDING_PAYMENT` for card / `NEW` for pay_on_pickup, `menuSnapshotId` set, item `nameSnapshot` equals menu name, an `order_events` row `type='created'`; (b) an 86'd item → throws `ItemUnavailableError`; (c) modifier count below `minSelect` → throws `ModifierSelectionError`; (d) location closed (`isOpenAt` false) → throws `LocationClosedError`.
 
@@ -672,7 +679,7 @@ export function createOrder(input: CreateOrderInput): Promise<CreateOrderResult>
 
 **Interfaces:**
 - Consumes: everything.
-- Produces: `npm run seed:kashi` — org "Kashi", one Brooklyn location (tax 875 bps, America/New_York, real hours from kashiny.com), a 10-item starter menu with two modifier groups (full 92-item build is Plan 2's Stage 6); `npm run spine:proof` — places a pay-on-pickup order via `createOrder` (no Stripe dependency), then polls `printJobs` until a `queued` job for it exists, prints the rendered ticket to stdout, and exits 0. For the card path it prints instructions: run `stripe listen --forward-to localhost:3000/api/stripe/webhook`, place a card order via the API with test card 4242…, watch it flip to NEW.
+- Produces: `npm run seed:kashi` — org "Kashi", one Brooklyn location (tax 8875 per 100,000 = 8.875%, America/New_York, real hours from kashiny.com), a 10-item starter menu with two modifier groups (full 92-item build is Plan 2's Stage 6); `npm run spine:proof` — places a pay-on-pickup order via `createOrder` (no Stripe dependency), then polls `printJobs` until a `queued` job for it exists, prints the rendered ticket to stdout, and exits 0. For the card path it prints instructions: run `stripe listen --forward-to localhost:3000/api/stripe/webhook`, place a card order via the API with test card 4242…, watch it flip to NEW.
 
 - [ ] **Step 1: Write both scripts + run `spine:proof` against the dev database.** Expected stdout ends with the ticket block and `SPINE OK`.
 - [ ] **Step 2: README** — what this repo is, the one-paragraph architecture, env table, local dev loop (`npx inngest-cli dev`, `npm run dev`, `stripe listen`), the proof command, pointer to spec + this plan. CLAUDE.md gets the same commands in short form.

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest'
 import { drizzle } from 'drizzle-orm/neon-serverless'
 import { Pool, neonConfig } from '@neondatabase/serverless'
 import * as schema from '@/db/schema'
@@ -15,14 +15,16 @@ import { seedKashi, KASHI, type SeedDb } from './seed-kashi'
  * that grid is for: `createOrder` asks the real `isOpenAt(now)`, so with Kashi's real
  * hours this file would only be green between 11am and 10pm New York time.
  *
- * `sendSms` is mocked and nothing else is. The fan-out's SMS leg is a real HTTP call
- * to Twilio otherwise — money, and a text to a real restaurant, from CI.
+ * `sendSms` is mocked and nothing else is — and the mock is also an **assertion**:
+ * `runProof` must never reach it, because the number the fan-out texts is a real
+ * restaurant's. The interlock that stops it is `proofStep`, and the test below sets
+ * working-looking Twilio credentials precisely so that a broken interlock would send.
  */
 const { sendSms } = vi.hoisted(() => ({ sendSms: vi.fn() }))
 vi.mock('@/lib/sms', () => ({ sendSms }))
 
 const {
-  runProof, chooseProofLines, fanOutOutcome, awaitQueuedTicket,
+  runProof, chooseProofLines, awaitQueuedTicket,
 } = await import('./place-test-order')
 
 if (!neonConfig.webSocketConstructor && typeof globalThis.WebSocket !== 'undefined') {
@@ -47,9 +49,14 @@ afterAll(async () => {
 beforeEach(() => {
   sendSms.mockReset()
   sendSms.mockResolvedValue(undefined)
-  // The fan-out's SMS carries a link to the kitchen feed; `.env.test` has no FEED_URL,
-  // deliberately, so it is stubbed per test rather than added to the file.
+  // Stubbed even though the SMS leg never runs here: if the interlock ever broke, the
+  // leg would otherwise die on a missing `FEED_URL` (`.env.test` deliberately has
+  // none) and the failure would read as an env problem instead of "it texted someone".
   vi.stubEnv('FEED_URL', 'https://serveside.test/feed')
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
 })
 
 /** A snapshot payload shaped like a real one, for the pure picker. */
@@ -123,30 +130,12 @@ describe('chooseProofLines', () => {
   })
 })
 
-describe('fanOutOutcome', () => {
-  it('survives an SMS-only failure — a dev env file has no Twilio credentials', () => {
-    const out = fanOutOutcome(new Error('order abc fan-out incomplete — sms-owner: Missing required env var: TWILIO_ACCOUNT_SID'))
-    expect(out.fatal).toBe(false)
-  })
-
-  it('is fatal when the print leg is named, even alongside the SMS leg', () => {
-    expect(fanOutOutcome(new Error('order abc fan-out incomplete — queue-print-job: db is down')).fatal).toBe(true)
-    expect(fanOutOutcome(new Error('order abc fan-out incomplete — queue-print-job: db is down; sms-owner: twilio is down')).fatal).toBe(true)
-  })
-
-  it('is fatal for anything that is not a fan-out failure at all', () => {
-    expect(fanOutOutcome(new Error('connection terminated')).fatal).toBe(true)
-    expect(fanOutOutcome('a string').fatal).toBe(true)
-  })
-})
-
 describe('runProof, against a freshly seeded Kashi', () => {
   it('places an order, fans out, and leaves a rendered ticket in the print queue', async () => {
     const result = await runProof(locationId)
 
     // Pay-on-pickup reaches the kitchen inside createOrder — no Stripe in the path.
     expect(result.order.status).toBe('NEW')
-    expect(result.warning).toBeUndefined()
 
     // The ticket is the artefact, and it is the stored payload rather than a fresh
     // render: this is what a printer would collect.
@@ -169,23 +158,32 @@ describe('runProof, against a freshly seeded Kashi', () => {
       for (const modifier of modifiers?.split(', ') ?? []) expect(flattened, modifier).toContain(modifier)
     }
 
-    // The owner's phone is the other leg, and it is independent of the ticket.
-    expect(sendSms).toHaveBeenCalledTimes(1)
-    expect(sendSms.mock.calls[0][0]).toBe(KASHI.location.phoneE164)
-    expect(sendSms.mock.calls[0][1]).toContain(result.order.shortCode)
+    // The other leg is skipped, reported as skipped, and never reaches Twilio.
+    expect(result.skippedSteps).toEqual(['sms-owner'])
+    expect(sendSms).not.toHaveBeenCalled()
 
     // And the queued job really is findable the way a printer finds it.
     const job = await awaitQueuedTicket(locationId, result.order.orderId, 2_000)
     expect(job.id).toBe(result.printJobId)
   }, 60_000)
 
-  it('still proves the ticket when the SMS leg is dead', async () => {
-    sendSms.mockRejectedValue(new Error('twilio is down'))
+  it('never texts the restaurant, even with working Twilio credentials set', async () => {
+    // The failure this pins is not hypothetical: `locations.phone_e164` is Kashi's
+    // real number, and the day credentials land in `.env.local` a proof that ran the
+    // SMS leg would text an actual kitchen about a fake order, silently, on every run.
+    // Credentials are set here so that only the interlock in `proofStep` is left
+    // standing between this test and a sent message.
+    vi.stubEnv('TWILIO_ACCOUNT_SID', 'AC_proof_must_not_reach_twilio')
+    vi.stubEnv('TWILIO_AUTH_TOKEN', 'token_proof_must_not_reach_twilio')
+    vi.stubEnv('TWILIO_FROM_E164', '+15550000000')
 
     const result = await runProof(locationId)
 
-    expect(result.warning).toContain('sms-owner: twilio is down')
-    expect(result.warning).not.toContain('queue-print-job')
+    expect(sendSms).not.toHaveBeenCalled()
+    expect(result.skippedSteps).toContain('sms-owner')
+    // Deleting the skip in `proofStep` fails the line above and this one still passes,
+    // which is the point: the ticket is the proof and it does not depend on the text.
     expect(result.ticket).toContain(`*** ${result.order.shortCode} ***`)
+    expect(KASHI.location.phoneE164).toBe('+19179090243')
   }, 60_000)
 })

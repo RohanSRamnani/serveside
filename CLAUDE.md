@@ -12,6 +12,15 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 ## Non-negotiable rules
 
 - **All money is `bigint` cents, never floats.** Drizzle: `bigint({ mode: 'number' })`.
+- **Tax rates are integers in parts per 100,000** — `locations.tax_rate_per_100k`, and
+  `taxCentsFor` divides by 100,000. 8875 is 8.875%, New York City on prepared food. It
+  was `tax_rate_bps` until 2026-09-21 and the unit was simply wrong: 8.875% is 887.5
+  basis points, which an integer bps column cannot hold, so every NYC location would
+  have been charged 8.75% or 8.90%. `drizzle/0019_tax_rate_per_100k.sql` renamed the
+  column and multiplied every existing rate by ten (a semantic no-op); the Kashi seed
+  is the one place a rate was actually corrected. Never reintroduce bps, and never make
+  the rate a float — a rate read back as a float is a rounding opinion in the one place
+  this codebase refuses to have one.
 - **Menus, hours and orders scope to `location_id`, not `org_id`.** Every domain
   table carries one. One missing WHERE clause must not leak another restaurant's orders.
 - **Order rows snapshot names and prices.** Never join a historical order to a live menu item.

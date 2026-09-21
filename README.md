@@ -19,7 +19,9 @@ which trusts the client for ids and quantities and for nothing that costs money:
 modifier deltas, 86 flags and modifier limits are read live, inside the same transaction,
 from the location's one active menu, and the order pins the `menu_snapshots` row it was
 quoted from so a price dispute six months later has evidence. Money is integer cents
-throughout (`src/lib/money.ts`), tax rounded half-up. A pay-at-pickup order reaches `NEW`
+throughout (`src/lib/money.ts`), tax rounded half-up, and the tax rate is an integer in
+parts per 100,000 (`locations.tax_rate_per_100k`: 8875 is New York City's 8.875%, which
+basis points cannot express). A pay-at-pickup order reaches `NEW`
 immediately; a card order sits at `PENDING_PAYMENT` until a **signed** Stripe webhook —
 checked against the location's connected account *and* the amount — flips it. Either way
 the route sends one `order/created` event and Inngest fans it out (`src/inngest/`) into

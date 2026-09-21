@@ -97,8 +97,10 @@ describe('the Kashi seed data', () => {
     // 400 and an owner who is simply never told about an order.
     expect(KASHI.location.phoneE164).toMatch(/^\+[1-9]\d{1,14}$/)
     expect(KASHI.location.timezone).toBe('America/New_York')
-    // 8.875% NYC prepared food. Named here so a change to it is a change to a test.
-    expect(KASHI.location.taxRateBps).toBe(875)
+    // 8.875% NYC prepared food, in parts per 100,000 — the unit exists because
+    // 8.875% is 887.5 basis points, which an integer bps column cannot hold.
+    // Named here so a change to it is a change to a test.
+    expect(KASHI.location.taxRatePer100k).toBe(8875)
   })
 
   it('posts the real weekly grid — 11am weekdays, noon weekends, 10pm nightly', () => {
@@ -129,7 +131,7 @@ describe('seedKashi, against the test branch', () => {
     const rows = await db().select().from(locations).where(eq(locations.orgId, orgs[0].id))
     expect(rows).toHaveLength(1)
     expect(rows[0].id).toBe(first.locationId)
-    expect(rows[0].taxRateBps).toBe(875)
+    expect(rows[0].taxRatePer100k).toBe(8875)
     expect(rows[0].timezone).toBe('America/New_York')
     expect(rows[0].phoneE164).toBe(KASHI.location.phoneE164)
     // Left at the column default rather than guessed at: see the seed.
