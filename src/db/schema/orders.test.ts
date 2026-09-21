@@ -3,6 +3,7 @@ import { eq, sql } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { orders, orderItems, orderItemModifiers, orderEvents, menuItems } from '@/db/schema'
 import { buildMenuSnapshot } from '@/domain/snapshot'
+import { transition } from '@/domain/order-status'
 import { seedLocationWithMenu } from '@/test/seed'
 import { rejectionText } from '@/test/errors'
 
@@ -204,6 +205,20 @@ describe('order events', () => {
     }).returning()
     expect(event.payload).toEqual({ from: 'NEW', to: 'ACCEPTED' })
     expect(event.at).toBeInstanceOf(Date)
+  })
+
+  it('takes what the state machine hands it, with no reshaping in between', async () => {
+    // The contract Task 12's feed depends on: `transition` returns a row that inserts
+    // as-is once the caller adds the order id. If it ever needs massaging on the way
+    // in, the "every state change writes an event" rule has a gap in it — this is the
+    // test that fails first, at compile time as much as at runtime.
+    const { order } = await seedOrder({ status: 'NEW' })
+    const { next, event } = transition(order, 'ACCEPTED', 'user_2abc')
+    const [written] = await db().insert(orderEvents).values({ orderId: order.id, ...event }).returning()
+    expect(next).toBe('ACCEPTED')
+    expect(written.type).toBe('status_changed')
+    expect(written.actor).toBe('user_2abc')
+    expect(written.payload).toEqual({ from: 'NEW', to: 'ACCEPTED' })
   })
 
   it('defaults an empty payload rather than null', async () => {
