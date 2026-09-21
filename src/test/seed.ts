@@ -43,6 +43,20 @@ export async function seedLocation(overrides: LocationOverrides = {}): Promise<L
   return loc
 }
 
+/**
+ * Points a seeded org at a Clerk organization, which is the mapping every authed
+ * route resolves through (`requireLocationAccess`: session `orgId` →
+ * `organizations.clerk_org_id` → the org that owns the location).
+ *
+ * The id has to be collision-proof for the usual reason — the column is UNIQUE and
+ * the `test` branch is never torn down — and is shaped like a real one (`org_...`)
+ * so a log line from a test reads like a log line from production.
+ */
+export async function linkClerkOrg(orgId: string, clerkOrgId = unique('org')): Promise<string> {
+  await db().update(organizations).set({ clerkOrgId }).where(eq(organizations.id, orgId))
+  return clerkOrgId
+}
+
 /** One row of the weekly grid, minus the ids the seeder fills in. */
 export type BusinessHoursRow = Omit<typeof businessHours.$inferInsert, 'id' | 'locationId'>
 

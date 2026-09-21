@@ -37,6 +37,17 @@ export const ORDER_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
 }
 
 /**
+ * What is on the kitchen tablet: every status the kitchen still owes something on.
+ *
+ * It is exactly the non-terminal set **minus `PENDING_PAYMENT`** — an order still on
+ * a payment form is not the kitchen's problem and must never appear on the board, or
+ * a cook starts on food nobody has paid for. `src/domain/order-status.test.ts` pins
+ * that derivation, so a ninth status added to the machine fails there by name rather
+ * than quietly never reaching a feed.
+ */
+export const KITCHEN_STATUSES = ['NEW', 'ACCEPTED', 'IN_KITCHEN', 'READY'] as const
+
+/**
  * Note what is missing: a status to itself. Two taps on "Accept" must not append a
  * second event and a second `acceptedAt`; the caller decides whether that is an
  * error or a no-op, but the machine will not call it a move.

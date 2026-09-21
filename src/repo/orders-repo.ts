@@ -1,6 +1,7 @@
-import { asc, eq, gte, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray } from 'drizzle-orm'
 import { orders, orderItems, orderItemModifiers } from '@/db/schema'
 import type { Order, OrderItem, OrderItemModifier, NewOrder } from '@/db/schema'
+import { KITCHEN_STATUSES } from '@/domain/order-status'
 import type { ScopedTx } from './scoped'
 
 /**
@@ -38,6 +39,46 @@ export function ordersRepo(tx: ScopedTx) {
       return tx.select().from(orders)
         .where(gte(orders.createdAt, new Date(sinceIso)))
         .orderBy(asc(orders.createdAt), asc(orders.id))
+    },
+
+    /**
+     * The kitchen board: every order the kitchen still owes something on, newest
+     * first, with its lines and the modifiers on each.
+     *
+     * **Three queries, not one per order.** A tablet polls this every five seconds
+     * for as long as the restaurant is open, so `getWithItems` in a loop would be
+     * 1 + 2N round trips on a five-second timer; this is 3 whatever N is.
+     *
+     * Newest first because a tablet shows the top of the list and the order that
+     * just landed is the one nobody has looked at yet — the reverse of
+     * {@link listSince}, which pages forward through history.
+     *
+     * `sinceIso` is a **floor, not a cursor**: it bounds how far back the board
+     * reaches (today's service, not last month's abandoned NEW order). A caller that
+     * advances it between polls would stop seeing the orders it already has, which is
+     * exactly the set whose status keeps changing.
+     */
+    async listActiveWithItems(sinceIso?: string): Promise<OrderWithLines[]> {
+      const rows = await tx.select().from(orders)
+        .where(and(
+          inArray(orders.status, [...KITCHEN_STATUSES]),
+          sinceIso ? gte(orders.createdAt, new Date(sinceIso)) : undefined,
+        ))
+        .orderBy(desc(orders.createdAt), desc(orders.id))
+      if (rows.length === 0) return []
+
+      const lines = await tx.select().from(orderItems)
+        .where(inArray(orderItems.orderId, rows.map((o) => o.id)))
+        .orderBy(asc(orderItems.nameSnapshot), asc(orderItems.id))
+      const mods = lines.length === 0 ? [] : await tx.select().from(orderItemModifiers)
+        .where(inArray(orderItemModifiers.orderItemId, lines.map((l) => l.id)))
+        .orderBy(asc(orderItemModifiers.nameSnapshot), asc(orderItemModifiers.modifierOptionId))
+
+      return rows.map((order) => ({
+        ...order,
+        items: lines.filter((l) => l.orderId === order.id)
+          .map((line) => ({ ...line, modifiers: mods.filter((m) => m.orderItemId === line.id) })),
+      }))
     },
 
     /**

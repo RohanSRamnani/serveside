@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { canTransition, transition, IllegalTransitionError } from './order-status'
+import { canTransition, transition, IllegalTransitionError, KITCHEN_STATUSES } from './order-status'
 import type { OrderStatus } from './order-status'
 
 const legal: Array<[string, string]> = [
@@ -49,6 +49,16 @@ describe('order status machine — the whole matrix', () => {
 
   it('refuses a status to itself, so a double-tap cannot append a second event', () => {
     expect(ALL_STATUSES.filter((s) => canTransition(s, s))).toEqual([])
+  })
+
+  it('puts every non-terminal status except PENDING_PAYMENT on the kitchen feed', () => {
+    // `KITCHEN_STATUSES` is written out in the module because a feed query wants a
+    // literal list, and a literal list is the kind of thing a ninth status gets added
+    // to the machine without. This is the derivation it must keep matching: the
+    // kitchen owes something on every open order except one still on a payment form,
+    // where a cook starting would be cooking food nobody has paid for.
+    const expected = ALL_STATUSES.filter((s) => !TERMINAL.includes(s) && s !== 'PENDING_PAYMENT')
+    expect([...KITCHEN_STATUSES]).toEqual(expected)
   })
 
   it('answers false for a status it does not know instead of throwing', () => {

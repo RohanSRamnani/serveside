@@ -152,6 +152,45 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `timezone` because a ticket prints the restaurant's wall clock, never the server's,
   and that column is not on the order row. `src/domain/ticket.test.ts` pins the exact
   output — change the layout and you change the golden, deliberately.
+- **`withLocation` is scoping, not authorization, and the check that is authorization
+  is `requireLocationAccess` (`src/lib/authz.ts`).** It runs *before* a scope opens and
+  resolves one chain: the Clerk session's active org → `organizations.clerk_org_id` →
+  that org's own location with this slug. **Org first, slug second** — `locations.slug`
+  is unique per org (`locations_org_slug_unique`) and not globally, so a slug-first
+  lookup is a coin toss between tenants. "Not yours" and "nobody's" are the same 403
+  with the same body, so the route cannot be used to enumerate restaurants; a page
+  branches on `status === 401` to send someone to sign in. Every authed surface —
+  the feed, the transition buttons, Task 13's 86/pause — goes through it.
+- **`src/proxy.ts` (Next 16's `middleware.ts`) authorizes nothing.** It attaches the
+  Clerk session so `auth()` can read it, and that is all; `createRouteMatcher` is
+  deprecated in `@clerk/nextjs` 7 precisely because path matching drifts from routing
+  and fails open. Its `matcher` **excludes** `/api/stripe/`, `/api/printers/`,
+  `/api/inngest` and `POST /api/orders` — those are authenticated by a signature, a
+  MAC, a signing key and nothing, and `clerkMiddleware()` throws on a missing
+  publishable key, so left in, one blank env var stops a kitchen printing. The matcher
+  must be **one string literal**: Next extracts it by static analysis, and a
+  concatenation is silently dropped, which looks exactly like the exclusions not working.
+- **The feed's `since` is a floor, not a cursor.** `GET /api/feed?location=&since=`
+  returns the whole active set (`KITCHEN_STATUSES`) inside the window, newest first;
+  the tablet fixes `since` at load−12h and never advances it, because the change that
+  matters between two polls is an order *already on the board* moving to ACCEPTED or
+  READY. An advancing cursor returns an empty array all afternoon. `now` in the
+  response is the server's clock — every elapsed time is computed against it, never
+  the tablet's.
+- **`POST /api/orders/[id]/transition` takes the location on the query string**
+  (`?location=<slug>`), because an order id alone cannot be read at all: `orders` is
+  under RLS and the scope has to be chosen before the first SELECT. Body is
+  `{ to, prepBumpMinutes?, reason? }`. `ACCEPTED` sets `quotedReadyAt = now +
+  prepTimeMinutes + bump` (prep time re-read **on the tx**), `READY`/`COMPLETED`/
+  `CANCELED` stamp their columns; `IN_KITCHEN` and `REJECTED` have no column and the
+  `order_events` row is their record. A move the machine refuses is 422
+  `illegal_transition` naming both ends — including a double-tap, since the machine
+  has no status-to-itself edge. **It refuses any order not already in
+  `KITCHEN_STATUSES`** (422 `not_on_the_board`): `PENDING_PAYMENT → NEW` is a legal
+  edge but belongs to the Stripe webhook alone, which flips status, `paymentStatus`
+  and `quotedReadyAt` together — done by hand it puts unpaid food on a pass *and*
+  leaves a row the webhook no longer recognises as its own, so the real payment later
+  flips nothing.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
   17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a
@@ -230,7 +269,7 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   column and this should follow the cart.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
   `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`, `seedTicketOrder`,
-  `seedPrinter`, `seedPrintJob`) — import them; don't re-inline
+  `seedPrinter`, `seedPrintJob`, `linkClerkOrg`) — import them; don't re-inline
   a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT / REQUIRES_PAYMENT
   order the Stripe webhook flips; `seedPaidOrder` is the one already at NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
   alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test
@@ -251,6 +290,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   "a leg exhausted its retries" path cannot be driven through the harness at all — hence
   `fanOut(data, step)` is exported and called directly with a two-line fake `step`,
   which is also the only crisp way to race the print leg against itself.
+- **Clerk needs Organizations turned on in the dashboard**, or every session has a
+  null `orgId`, `requireLocationAccess` 403s everything, and the feed is a refusal
+  page with no error anywhere explaining it. With `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+  blank, `clerkMiddleware()` throws and every proxied route 500s — loud on purpose,
+  and the reason the machine-facing routes are excluded from the matcher.
+- **React components are tested with `renderToStaticMarkup`, not a DOM.** No jsdom, no
+  testing-library: `src/app/feed/feed-client.test.tsx` renders the card to a string and
+  asserts the dish, its modifiers, both notes and the tap-target sizes; `page.test.tsx`
+  calls the async server component as the ordinary function it is
+  (`await FeedPage({ params })`) and renders its element, which covers segment →
+  authz → scoped read → first paint against the real database. `useEffect` never runs,
+  so the 5s poll, the chime's autoplay unlock and anything needing layout are **not**
+  covered by any test — they are the manual check.
+- `public/chime.wav` is generated, not sourced: `node scripts/make-chime.mjs`.
 - **Route handlers are tested by importing and calling them**, not through a server:
   `const { POST } = await import('./webhook/route')`, then `POST(new Request(...))`.
   They take a Web `Request` and return a Web `Response`, with nothing imported from

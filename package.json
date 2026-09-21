@@ -13,6 +13,7 @@
     "db:app-user": "node scripts/create-app-user.mjs"
   },
   "dependencies": {
+    "@clerk/nextjs": "^7.9.4",
     "@neondatabase/serverless": "^1.1.0",
     "drizzle-orm": "^0.45.2",
     "inngest": "^4.20.0",

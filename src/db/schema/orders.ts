@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, text, integer, bigint, jsonb, timestamp, primaryKey, check, foreignKey } from 'drizzle-orm/pg-core'
+import { pgTable, pgEnum, uuid, text, integer, bigint, jsonb, timestamp, primaryKey, check, foreignKey, index } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 import { menuItems, modifierOptions } from './menu'
@@ -121,6 +121,21 @@ export const orders = pgTable('orders', {
     ${t.subtotalCents} >= 0 AND ${t.taxCents} >= 0 AND ${t.tipCents} >= 0
     AND ${t.deliveryFeeCents} >= 0 AND ${t.discountCents} >= 0 AND ${t.totalCents} >= 0
   `),
+  /**
+   * The two indexes the kitchen feed polls on, every five seconds, per tablet,
+   * forever. Both lead with `location_id` because every query does — the RLS policy
+   * adds `location_id = current_setting('app.location_id')` to the WHERE clause
+   * whether or not the caller wrote it, so a leading `created_at` index would never
+   * be usable.
+   *
+   * Two rather than one composite: the feed filters on status **and** bounds on
+   * `created_at`, and no single btree serves both as the leading non-location
+   * column. Postgres can bitmap-AND them, and on a table this size either alone is
+   * already the difference between a scan of every order the restaurant has ever
+   * taken and a handful of rows.
+   */
+  index('orders_location_created_idx').on(t.locationId, t.createdAt),
+  index('orders_location_status_idx').on(t.locationId, t.status),
 ]).enableRLS()
 
 /**
