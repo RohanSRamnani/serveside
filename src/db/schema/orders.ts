@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, text, integer, bigint, jsonb, timestamp, primaryKey, check } from 'drizzle-orm/pg-core'
+import { pgTable, pgEnum, uuid, text, integer, bigint, jsonb, timestamp, primaryKey, check, foreignKey } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 import { menuItems, modifierOptions } from './menu'
@@ -86,8 +86,11 @@ export const orders = pgTable('orders', {
    * (Postgres lets a unique column hold many NULLs, so the cash orders are fine.)
    */
   stripePaymentIntentId: text('stripe_payment_intent_id').unique(),
-  /** NOT NULL, no exceptions — see rule 2 above. */
-  menuSnapshotId: uuid('menu_snapshot_id').notNull().references(() => menuSnapshots.id),
+  /**
+   * NOT NULL, no exceptions — see rule 2 above. The FK is composite and declared
+   * below, not here: it carries `location_id` with it.
+   */
+  menuSnapshotId: uuid('menu_snapshot_id').notNull(),
   /** Customer's note to the kitchen ("no cilantro"). Not an internal field. */
   notes: text('notes'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -97,6 +100,20 @@ export const orders = pgTable('orders', {
   canceledAt: timestamp('canceled_at', { withTimezone: true }),
   cancelReason: text('cancel_reason'),
 }, (t) => [
+  /**
+   * **Composite on purpose.** `(location_id, menu_snapshot_id)` must name a snapshot
+   * of *this* location, not any snapshot anywhere — a plain FK to `menu_snapshots.id`
+   * would let one restaurant's order pin another's menu, and since the snapshot is
+   * the price evidence in a dispute, that is a tenancy leak wearing a receipt.
+   *
+   * RLS does not cover this: both rows are legal inside their own tenant, and
+   * referential-integrity checks bypass row security anyway. Only the constraint does.
+   */
+  foreignKey({
+    name: 'orders_snapshot_location_fk',
+    columns: [t.locationId, t.menuSnapshotId],
+    foreignColumns: [menuSnapshots.locationId, menuSnapshots.id],
+  }),
   // Cents, so every one of these is a whole number of pennies; none of them may be
   // negative. A refund is `paymentStatus = 'REFUNDED'`, never a negative total, and a
   // discount is a positive number that gets subtracted.

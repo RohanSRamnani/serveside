@@ -50,6 +50,20 @@
       "when": 1789964530192,
       "tag": "0006_order_events_append_only",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789965896716,
+      "tag": "0007_snapshot_location_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789965909451,
+      "tag": "0008_rls_tenancy",
+      "breakpoints": true
     }
   ]
 }

@@ -66,6 +66,11 @@ export const menuSnapshots = pgTable('menu_snapshots', {
 }, (t) => [
   // Also the index for "newest snapshot for this location" — location_id leads it.
   unique('menu_snapshots_location_version_unq').on(t.locationId, t.version),
+  // Redundant on its own — `id` is already the primary key — and there so that
+  // `orders` can point a composite FK at (location_id, id). That FK is what makes
+  // "this order pins another restaurant's menu" unrepresentable rather than merely
+  // unlikely; a plain FK to `id` would let it through. See `orders.ts`.
+  unique('menu_snapshots_location_id_id_unq').on(t.locationId, t.id),
 ])
 
 export type MenuSnapshot = typeof menuSnapshots.$inferSelect
