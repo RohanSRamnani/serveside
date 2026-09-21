@@ -281,8 +281,14 @@ describe('POST /api/menu/86', () => {
     // whole transaction — the same rule `createOrder` follows for every id in a body.
     expect((await call('POST', loc.slug, { itemId: 'butter-chicken', until: 'tomorrow' })).status).toBe(422)
     expect((await call('POST', loc.slug, 'not json')).status).toBe(400)
-    // No location at all is answered before the session is consulted.
+
+    // No location at all is answered **before the session is consulted**, and the
+    // cleared mock is what proves that rather than merely asserting the status:
+    // there is nothing to authorize against, and answering this differently for a
+    // signed-in user would be saying something about the slug.
+    auth.mockClear()
     expect((await call('POST', null, { itemId: item, until: 'tomorrow' })).status).toBe(400)
+    expect(auth).not.toHaveBeenCalled()
 
     expect((await liveItem(loc.id, item)).is86d).toBe(false)
   })

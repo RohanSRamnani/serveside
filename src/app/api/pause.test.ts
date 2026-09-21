@@ -150,8 +150,12 @@ describe('POST /api/pause', () => {
     signedInAs(null, null)
     expect((await call('POST', mine.slug, { minutes: 30 })).status).toBe(401)
 
+    // Naming no location is answered **before the session is consulted** — the
+    // cleared mock is what proves the ordering, not the status on its own.
     signedInAs(mine.clerkOrgId)
+    auth.mockClear()
     expect((await call('POST', null, { minutes: 30 })).status).toBe(400)
+    expect(auth).not.toHaveBeenCalled()
 
     expect(await pauses(mine.id)).toHaveLength(0)
   })

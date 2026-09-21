@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { desc, eq } from 'drizzle-orm'
 import { InngestTestEngine } from '@inngest/test'
 import type { GetStepTools } from 'inngest'
@@ -231,22 +231,42 @@ describe('the hourly unsnooze', () => {
     expect((await liveItem(untouched.id, untouched.items[0].id)).is86d).toBe(true)
   })
 
-  it('clears the flags even when the menu cannot be pinned, and says the snapshot was skipped', async () => {
+  it('clears the flags even when the menu cannot be pinned, and says so out loud', async () => {
     // A location with two active menus cannot be snapshotted — and it cannot take an
-    // order either, so there is no pinned evidence to go stale. What must not happen
-    // is the clear rolling back with the rebuild: the dish would stay sold out until
-    // somebody noticed, and the job would fail on that location every hour forever.
-    const loc = await restaurant()
-    await snoozeItem(loc.id, loc.items[0].id, new Date(Date.now() - HOUR_MS))
-    await withLocation(loc.id, (tx) => tx.insert(menus).values({ locationId: loc.id, name: 'Late Night' }))
+    // order either, so nothing can pin the stale payload while it stays that way. What
+    // must not happen is the clear rolling back with the rebuild: the dish would stay
+    // sold out until somebody noticed, and the job would fail on that location every
+    // hour forever.
+    //
+    // Nothing on this branch repairs the skipped snapshot afterwards (there is no menu
+    // editor yet — see the TODO in `unsnoozeLocation`), so the warn line is the only
+    // trace it leaves: the run is green and the summary is read by nobody. It is
+    // asserted here so a later tidy-up cannot delete the one thing that would tell an
+    // operator a location is carrying evidence that understates what it can sell.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const loc = await restaurant()
+      await snoozeItem(loc.id, loc.items[0].id, new Date(Date.now() - HOUR_MS))
+      await withLocation(loc.id, (tx) => tx.insert(menus).values({ locationId: loc.id, name: 'Late Night' }))
 
-    const summary = await unsnoozeExpired(fakeStep([loc.id]))
+      const summary = await unsnoozeExpired(fakeStep([loc.id]))
 
-    expect(summary.unsnoozed).toEqual([
-      { locationId: loc.id, items: 1, options: 0, snapshotVersion: null },
-    ])
-    expect((await liveItem(loc.id, loc.items[0].id)).is86d).toBe(false)
-    expect(await currentSnapshot(loc.id)).toBeUndefined()
+      expect(summary.unsnoozed).toEqual([
+        { locationId: loc.id, items: 1, options: 0, snapshotVersion: null },
+      ])
+      // The flags really did go back, which is the half of this that matters to a
+      // customer standing at the counter.
+      expect((await liveItem(loc.id, loc.items[0].id)).is86d).toBe(false)
+      await expect(placeOrder(loc)).rejects.toThrow(/active menus/i)
+      expect(await currentSnapshot(loc.id)).toBeUndefined()
+
+      expect(warn).toHaveBeenCalledWith(
+        '[unsnooze] rebuild skipped, snapshot now stale',
+        { locationId: loc.id, activeMenuCount: 2, cleared: 1 },
+      )
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('carries on past a location it cannot clear, and ends the run red naming it', async () => {

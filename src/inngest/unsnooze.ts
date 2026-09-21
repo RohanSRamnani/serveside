@@ -108,8 +108,13 @@ async function unsnoozeAll(locationIds: string[]): Promise<UnsnoozeSummary> {
  * snapshotted — no active menu, or two — cannot take an order either, so there is no
  * pinned evidence for a stale payload to contaminate; whereas rolling the clear back
  * would leave the dish sold out and fail this location every hour, forever. So the
- * flags go back and the skipped rebuild is reported as `snapshotVersion: null`. The
- * menu editor that reactivates a menu is itself a menu mutation and rebuilds then.
+ * flags go back and the skipped rebuild is reported as `snapshotVersion: null`.
+ *
+ * TODO(plan-2/menu-editor): no compensation exists yet — a location skipped here keeps
+ * a stale snapshot (is86d=true for a dish that's back on sale) until its next menu
+ * mutation. The Plan-2 menu editor MUST rebuild on menu activation/deactivation, and
+ * Plan 2 adds a reconciliation sweep. Evidence errs toward understating availability;
+ * no pricing consequence.
  */
 async function unsnoozeLocation(locationId: string): Promise<LocationUnsnooze> {
   return withLocation(locationId, async (tx) => {
@@ -122,10 +127,16 @@ async function unsnoozeLocation(locationId: string): Promise<LocationUnsnooze> {
 
     const activeMenus = await repo.activeMenuIds()
     if (activeMenus.length !== 1) {
-      console.warn(
-        '[unsnooze] cleared', items + options, 'expired 86s for location', locationId,
-        'but it has', activeMenus.length, 'active menus, so no snapshot could be pinned',
-      )
+      // One greppable line, because this is the only trace the stale snapshot leaves:
+      // the run is green (the clear worked), the summary says `snapshotVersion: null`
+      // in a place nobody reads, and nothing else will mention it until the location's
+      // next menu mutation — which, per the TODO above, nothing on this branch
+      // performs. Structured so it can be alerted on in Task 14's territory.
+      console.warn('[unsnooze] rebuild skipped, snapshot now stale', {
+        locationId,
+        activeMenuCount: activeMenus.length,
+        cleared: items + options,
+      })
       return { locationId, items, options, snapshotVersion: null }
     }
 
