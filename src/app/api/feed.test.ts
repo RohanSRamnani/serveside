@@ -132,6 +132,26 @@ describe('GET /api/feed', () => {
     expect(res.status).toBe(403)
   })
 
+  it('shows a restaurant its own orders and no trace of the one next door', async () => {
+    // Both restaurants busy at once, which is the ordinary case and the one where a
+    // missing predicate would show. The board must contain exactly A's order.
+    //
+    // RLS narrows this, and so does the explicit `location_id` in
+    // `listActiveWithItems` — the second is pinned independently in
+    // `src/repo/repos.test.ts`, by pointing the read at one location inside another's
+    // scope, because a test that only opens the right scope would pass with no
+    // predicate at all.
+    const mine = await restaurant()
+    const theirs = await restaurant()
+    const ours = await seedPaidOrder(mine.id)
+    const nextDoor = await seedPaidOrder(theirs.id)
+    signedInAs(mine.clerkOrgId)
+
+    const body = await (await get({ location: mine.slug })).json()
+    expect(body.orders.map((o: { id: string }) => o.id)).toEqual([ours.order.id])
+    expect(JSON.stringify(body)).not.toContain(nextDoor.order.id)
+  })
+
   it('shows only the orders the kitchen still owns, newest first', async () => {
     const loc = await restaurant()
     const first = await seedPaidOrder(loc.id)

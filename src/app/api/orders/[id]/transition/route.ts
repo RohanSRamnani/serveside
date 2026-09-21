@@ -33,6 +33,10 @@ import { requireLocationAccess, deniedResponse } from '@/lib/authz'
  *        `not_on_the_board` (an order the kitchen does not own) or
  *        `illegal_transition` (a move the machine refuses), the latter naming both ends
  *   200  `{ order }` — the whole card, re-read, so the tablet can replace it outright
+ *
+ * TODO(plan-2/refunds): rejecting or canceling a PAID order moves no money — the
+ * customer stays charged until the dashboard refund flow exists (spec §4). Owner must
+ * refund in Stripe manually until then.
  */
 
 /** The eight names the column may hold, as a runtime set — the request body is untrusted text. */
@@ -79,9 +83,12 @@ export async function POST(req: Request, ctx: RouteContext<'/api/orders/[id]/tra
   let outcome: Outcome
   try {
     outcome = await withLocation(access.location.id, async (tx): Promise<Outcome> => {
-      // FOR UPDATE: two tablets in one kitchen tapping Accept on the same card must
-      // not both read NEW and both append a `status_changed` event.
-      const [order] = await tx.select().from(orders).where(eq(orders.id, id)).for('update').limit(1)
+      // Locked for the rest of the transaction, and matched on `location_id` as well
+      // as `id` — the scope is already open, so the predicate is the belt to RLS's
+      // braces. It is not decoration: RLS is silently inert for a role that owns the
+      // tables, and this repo has shipped with `.env.local` pointing at the Neon
+      // owner. An order from another location comes back undefined, which is a 404.
+      const order = await ordersRepo(tx).lockById(access.location.id, id)
       if (!order) return { kind: 'not_found' }
 
       // **This route may only move what is on the board**, and the excluded status
@@ -211,7 +218,12 @@ async function stampsFor(
       }
     case 'READY': return { readyAt: at }
     case 'COMPLETED': return { completedAt: at }
+    // TODO(plan-2/refunds): rejecting or canceling a PAID order moves no money — the
+    // customer stays charged until the dashboard refund flow exists (spec §4). Owner
+    // must refund in Stripe manually until then.
     case 'CANCELED': return { canceledAt: at, cancelReason: body.reason ?? null }
+    // REJECTED lands here: no column of its own, and — see the TODO above — no money
+    // moves either. A rejected card order is a charge the customer still has.
     default: return {}
   }
 }

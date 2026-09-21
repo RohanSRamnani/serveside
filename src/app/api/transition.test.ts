@@ -49,8 +49,10 @@ function post(
   )
 }
 
-async function restaurant(): Promise<SeededMenu & { clerkOrgId: string }> {
-  const loc = await seedLocationWithMenu()
+async function restaurant(
+  over: Parameters<typeof seedLocationWithMenu>[0] = {},
+): Promise<SeededMenu & { clerkOrgId: string }> {
+  const loc = await seedLocationWithMenu(over)
   const clerkOrgId = await linkClerkOrg(loc.orgId)
   return { ...loc, clerkOrgId }
 }
@@ -102,8 +104,11 @@ describe('POST /api/orders/[id]/transition', () => {
     expect(moved[0].actor).toBe(USER_ID)
   })
 
-  it('quotes the location’s own prep time when nothing is bumped', async () => {
-    const loc = await restaurant()
+  it('quotes the location’s own prep time, read from the column and not assumed', async () => {
+    // **35, not the schema default of 20.** Every other quote test here would pass
+    // against a route that had `20` hardcoded in it, because the seeded location
+    // keeps the default. This one only passes if the column is actually read.
+    const loc = await restaurant({ prepTimeMinutes: 35 })
     const { order } = await seedPaidOrder(loc.id)
     signedInAs(loc.clerkOrgId)
 
@@ -112,8 +117,23 @@ describe('POST /api/orders/[id]/transition', () => {
 
     const row = await readOrder(loc.id, order.id)
     const quoted = new Date(row.quotedReadyAt!).getTime()
-    expect(quoted).toBeGreaterThanOrEqual(before + 20 * MINUTE - MINUTE)
-    expect(quoted).toBeLessThanOrEqual(Date.now() + 20 * MINUTE + MINUTE)
+    expect(quoted).toBeGreaterThanOrEqual(before + 35 * MINUTE - MINUTE)
+    expect(quoted).toBeLessThanOrEqual(Date.now() + 35 * MINUTE + MINUTE)
+    // Not the default, and not the default plus anything: the number came from the row.
+    expect(quoted).toBeGreaterThan(before + 20 * MINUTE + MINUTE)
+  })
+
+  it('adds the bump to the location’s own prep time, not to the default', async () => {
+    const loc = await restaurant({ prepTimeMinutes: 35 })
+    const { order } = await seedPaidOrder(loc.id)
+    signedInAs(loc.clerkOrgId)
+
+    const before = Date.now()
+    expect((await post(order.id, loc.slug, { to: 'ACCEPTED', prepBumpMinutes: 10 })).status).toBe(200)
+
+    const quoted = new Date((await readOrder(loc.id, order.id)).quotedReadyAt!).getTime()
+    expect(quoted).toBeGreaterThanOrEqual(before + 45 * MINUTE - MINUTE)
+    expect(quoted).toBeLessThanOrEqual(Date.now() + 45 * MINUTE + MINUTE)
   })
 
   it('refuses an illegal move with 422, and changes nothing', async () => {
@@ -229,6 +249,33 @@ describe('POST /api/orders/[id]/transition', () => {
     const res = await post(order.id, mine.slug, { to: 'ACCEPTED' })
     expect(res.status).toBe(404)
     expect((await readOrder(other.id, order.id)).status).toBe('NEW')
+  })
+
+  it('will not move another restaurant’s order through a slug it is authorized for', async () => {
+    // The cross-tenant case, stated plainly: a valid session for restaurant A, A's own
+    // slug on the query string, and B's order id in the path — an id A could have
+    // picked up from a support thread or simply guessed at.
+    //
+    // **Two mechanisms refuse this and the test cares about both.** RLS narrows the
+    // scope, and `lockById` matches `location_id` in the WHERE clause. The second is
+    // what `src/repo/repos.test.ts` pins independently of any policy, because RLS
+    // goes silently inert for a role that owns the tables — which is what
+    // `.env.local` is still connected as.
+    const a = await restaurant()
+    const b = await restaurant()
+    const { order } = await seedPaidOrder(b.id)
+    signedInAs(a.clerkOrgId)
+
+    const res = await post(order.id, a.slug, { to: 'ACCEPTED' })
+    expect(res.status).toBe(404)
+
+    // Not just "the response said no" — the row itself is untouched, down to the
+    // timestamp and the audit trail. A refused write that wrote anything is not refused.
+    const row = await readOrder(b.id, order.id)
+    expect(row.status).toBe('NEW')
+    expect(row.acceptedAt).toBeNull()
+    expect(row.quotedReadyAt).toEqual(order.quotedReadyAt)
+    expect((await readEvents(b.id, order.id)).filter((e) => e.type === 'status_changed')).toHaveLength(0)
   })
 
   it('refuses a body the machine has no name for', async () => {

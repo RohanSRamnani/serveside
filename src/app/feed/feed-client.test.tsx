@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { FeedOrder, FeedPayload } from '@/domain/feed'
 import type { OrderStatus } from '@/domain/order-status'
 import FeedClient, {
-  actionsFor, applyMoved, isLate, minutesBetween, unacknowledgedNew,
+  actionsFor, applyMoved, isLate, minutesBetween, pollBanner, unacknowledgedNew,
 } from './[location]/feed-client'
 
 /**
@@ -106,6 +106,43 @@ describe('folding a transition back into the board', () => {
       const gone = { ...order({ id: 'b' }), status }
       expect(applyMoved([kept, order({ id: 'b' })], gone), status).toEqual([kept])
     }
+  })
+})
+
+describe('what the board says about its own liveness', () => {
+  it('says nothing at all while the poll is working', () => {
+    expect(pollBanner(200)).toBeNull()
+  })
+
+  it('tells a dead session apart from dead wifi, and marks it differently', () => {
+    // The distinction is the point. Wifi comes back on its own and the cards on
+    // screen are still true; a dead session never comes back, and the board behind
+    // those cards has stopped moving. Same-looking screen, opposite meanings.
+    for (const status of [401, 403]) {
+      const banner = pollBanner(status)
+      expect(banner?.tone, String(status)).toBe('dead')
+      expect(banner?.text).toMatch(/signed out/i)
+      // It has to say the board is stale, not merely that someone is signed out —
+      // a signed-out board can never chime again, so silence stops being evidence
+      // that there is nothing to cook.
+      expect(banner?.text).toMatch(/stopped updating/i)
+    }
+  })
+
+  it('calls a failed request and a server error what they are: a stale board', () => {
+    // `null` is the fetch itself failing — no wifi, no DNS, no server.
+    for (const status of [null, 500, 502]) {
+      const banner = pollBanner(status)
+      expect(banner?.tone, String(status)).toBe('stale')
+      expect(banner?.text).toMatch(/no connection/i)
+    }
+  })
+
+  it('never reports a dead session as merely stale, which is the failure that matters', () => {
+    // Stated as its own case because getting it backwards is the silent one: a
+    // kitchen that reads "no connection" waits for the wifi to come back, and waits.
+    expect(pollBanner(401)?.tone).not.toBe('stale')
+    expect(pollBanner(403)?.tone).not.toBe('stale')
   })
 })
 

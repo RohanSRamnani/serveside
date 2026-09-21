@@ -46,7 +46,15 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction that `SET LOCAL`s `app.location_id`, which the policies in
   `drizzle/0008_rls_tenancy.sql` read. Repos (`ordersRepo`, `menuRepo`) therefore
   carry **no** `location_id` filter of their own; writing one back would hide the
-  day RLS stops working. Unscoped means *no rows*, never all rows. `withLocation`
+  day RLS stops working. **Two deliberate exceptions**, both taking an explicit
+  `locationId`: `ordersRepo.listActiveWithItems` and `ordersRepo.lockById` — the
+  kitchen board and the row a tablet is about to move. RLS is *silently inert* for a
+  role that owns the tables, and `.env.local` is still connected as the Neon owner,
+  so the two reads whose output reaches a browser say "whose is this" in SQL too.
+  `repos.test.ts` pins that by scoping a transaction to location B and asking for
+  A — RLS allows B's rows, so anything returned is the predicate having gone missing.
+  Adding a third needs the same argument and the same shape of test. Unscoped means
+  *no rows*, never all rows. `withLocation`
   refuses to open a scope at all if `DATABASE_URL` connects as a role that bypasses
   RLS — the failure is otherwise silent. The leak test `src/repo/rls.test.ts` is the
   proof and must never be weakened: one case asserts the **exact** set of
@@ -176,7 +184,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   matters between two polls is an order *already on the board* moving to ACCEPTED or
   READY. An advancing cursor returns an empty array all afternoon. `now` in the
   response is the server's clock — every elapsed time is computed against it, never
-  the tablet's.
+  the tablet's. The client's `pollBanner(status)` separates **a dead session from dead
+  wifi** and must keep doing so: a signed-out board can never chime again (no poll, no
+  new order, no sound), so silence stops meaning "nothing to cook" — 401/403 gets a
+  full-width bar, everything else a corner chip.
 - **`POST /api/orders/[id]/transition` takes the location on the query string**
   (`?location=<slug>`), because an order id alone cannot be read at all: `orders` is
   under RLS and the scope has to be chosen before the first SELECT. Body is
@@ -190,7 +201,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   edge but belongs to the Stripe webhook alone, which flips status, `paymentStatus`
   and `quotedReadyAt` together — done by hand it puts unpaid food on a pass *and*
   leaves a row the webhook no longer recognises as its own, so the real payment later
-  flips nothing.
+  flips nothing. **Rejecting or cancelling a PAID order moves no money** — the customer
+  stays charged until the dashboard refund flow exists (spec §4); the owner refunds in
+  Stripe by hand until then. `TODO(plan-2/refunds)` marks it in the route.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
   17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a

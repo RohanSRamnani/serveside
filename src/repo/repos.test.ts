@@ -85,6 +85,45 @@ describe('ordersRepo', () => {
     const after = new Date(second.order.createdAt.getTime() + 1).toISOString()
     expect(await withLocation(locA.id, (tx) => ordersRepo(tx).listSince(after))).toHaveLength(0)
   })
+
+  /**
+   * **These two prove the WHERE clause, not the policy — which is the only way to
+   * prove it at all.**
+   *
+   * Every other tenancy test here opens a scope and trusts RLS to narrow the rows, so
+   * it would pass just as green against a repo with no `location_id` predicate in it.
+   * These deliberately point the two feed reads at location A while the transaction
+   * is scoped to **B**: RLS is happy to hand back B's rows, so anything that comes
+   * back is the predicate having gone missing. They would still pass on a connection
+   * that bypasses RLS entirely — which, with `.env.local` currently pointing at the
+   * Neon owner, is not a hypothetical.
+   */
+  it('lists no orders when the explicit location does not match the scope', async () => {
+    const locA = await seedLocationWithMenu()
+    const locB = await seedLocationWithMenu()
+    await seedPaidOrder(locB.id)
+
+    const mismatched = await withLocation(locB.id, (tx) =>
+      ordersRepo(tx).listActiveWithItems(locA.id))
+    expect(mismatched, 'RLS would allow B’s rows here — only the predicate excludes them').toEqual([])
+
+    // And the same read, pointed at its own location, does find them: the predicate
+    // is narrowing on `location_id`, not simply returning nothing.
+    const own = await withLocation(locB.id, (tx) => ordersRepo(tx).listActiveWithItems(locB.id))
+    expect(own).toHaveLength(1)
+  })
+
+  it('locks no row when the explicit location does not match the scope', async () => {
+    const locA = await seedLocationWithMenu()
+    const locB = await seedLocationWithMenu()
+    const { order } = await seedPaidOrder(locB.id)
+
+    const mismatched = await withLocation(locB.id, (tx) => ordersRepo(tx).lockById(locA.id, order.id))
+    expect(mismatched, 'RLS would allow B’s row here — only the predicate excludes it').toBeUndefined()
+
+    const own = await withLocation(locB.id, (tx) => ordersRepo(tx).lockById(locB.id, order.id))
+    expect(own?.id).toBe(order.id)
+  })
 })
 
 describe('menuRepo', () => {

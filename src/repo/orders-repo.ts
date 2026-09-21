@@ -21,9 +21,24 @@ export type NewOrderLine = Omit<typeof orderItems.$inferInsert, 'id' | 'orderId'
 /**
  * Reads and writes for one location's orders.
  *
- * Every method here is **deliberately missing a `location_id` filter**, and that
- * is not an oversight: the transaction is already scoped, and RLS adds the
- * predicate. Writing the filter twice would hide the day RLS stops working.
+ * Most methods here carry **no `location_id` filter**, and that is not an oversight:
+ * the transaction is already scoped and RLS adds the predicate, so writing it twice
+ * everywhere would hide the day RLS stops working.
+ *
+ * **The two methods that take a `locationId` are the deliberate exception**, and the
+ * reason is a real failure mode rather than a hypothetical: RLS is silently inert for
+ * any role that owns the tables or has BYPASSRLS, and this repo has already shipped
+ * with `.env.local` pointing `DATABASE_URL` at the Neon owner. `withLocation` refuses
+ * to open a scope for such a role — but only once it has been asked to, and only for
+ * the paths that go through it. The two reads that answer *"whose orders are these"*
+ * to a browser — the kitchen board and the row a transition locks — say it in SQL as
+ * well, so a misconfigured connection is a query that returns nothing rather than a
+ * tablet showing another restaurant's dinner service.
+ *
+ * That makes them testable without RLS, too: scope a transaction to location B, pass
+ * location A's id, and a correct predicate returns nothing where RLS alone would
+ * happily hand back B's rows. `src/repo/repos.test.ts` does exactly that, which is
+ * what pins the predicate rather than the policy.
  *
  * Note what the reads do NOT do: join `order_items.menu_item_id` back to the live
  * menu. The names and prices on the line are the record — see `orders.ts`.
@@ -57,10 +72,15 @@ export function ordersRepo(tx: ScopedTx) {
      * reaches (today's service, not last month's abandoned NEW order). A caller that
      * advances it between polls would stop seeing the orders it already has, which is
      * exactly the set whose status keeps changing.
+     *
+     * `locationId` is required and is written into the WHERE clause on top of RLS —
+     * see the note at the top of this file. This is the query whose output a browser
+     * renders, so it is the one that must not depend on a policy being live.
      */
-    async listActiveWithItems(sinceIso?: string): Promise<OrderWithLines[]> {
+    async listActiveWithItems(locationId: string, sinceIso?: string): Promise<OrderWithLines[]> {
       const rows = await tx.select().from(orders)
         .where(and(
+          eq(orders.locationId, locationId),
           inArray(orders.status, [...KITCHEN_STATUSES]),
           sinceIso ? gte(orders.createdAt, new Date(sinceIso)) : undefined,
         ))
@@ -88,6 +108,27 @@ export function ordersRepo(tx: ScopedTx) {
      */
     async getById(id: string): Promise<Order | undefined> {
       const [row] = await tx.select().from(orders).where(eq(orders.id, id)).limit(1)
+      return row
+    },
+
+    /**
+     * One order, locked for the rest of the transaction, and only if it really is
+     * this location's.
+     *
+     * `FOR UPDATE` because the caller is about to move it: two tablets in one kitchen
+     * tapping Accept on the same card must not both read NEW and both append a
+     * `status_changed` event.
+     *
+     * `locationId` is required and explicit for the same reason as
+     * {@link listActiveWithItems} — this is the row a browser is about to change, so
+     * "is it yours" is asserted in SQL and not only by a policy. An order belonging
+     * to another location comes back `undefined`, which a route turns into a 404.
+     */
+    async lockById(locationId: string, id: string): Promise<Order | undefined> {
+      const [row] = await tx.select().from(orders)
+        .where(and(eq(orders.id, id), eq(orders.locationId, locationId)))
+        .for('update')
+        .limit(1)
       return row
     },
 

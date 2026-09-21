@@ -97,6 +97,10 @@ export function toFeedOrder(order: OrderWithLines): FeedOrder {
  * time anything calls this — see `src/lib/authz.ts`.
  */
 export async function readFeed(locationId: string, sinceIso?: string): Promise<FeedPayload> {
-  const orders = await withLocation(locationId, (tx) => ordersRepo(tx).listActiveWithItems(sinceIso))
+  // The location id goes in twice on purpose: once to open the RLS scope, once into
+  // the query's own WHERE clause. See the note at the top of `orders-repo.ts` — this
+  // is the read a browser renders, and it must not depend on a policy being live.
+  const orders = await withLocation(locationId, (tx) =>
+    ordersRepo(tx).listActiveWithItems(locationId, sinceIso))
   return { orders: orders.map(toFeedOrder), now: new Date().toISOString() }
 }

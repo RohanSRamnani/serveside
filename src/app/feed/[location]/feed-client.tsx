@@ -84,6 +84,32 @@ export function applyMoved(orders: readonly FeedOrder[], moved: FeedOrder): Feed
   return orders.map((o) => (o.id === moved.id ? moved : o))
 }
 
+/**
+ * What the board says about its own liveness, and the `tone` is the whole point.
+ *
+ * A dropped poll and a dead session look identical from behind the counter — the
+ * cards are all still there — but they are not the same problem and they do not end
+ * the same way. Wifi comes back on its own; a session does not. Worse, a board that
+ * has stopped updating **can never chime again**: no poll means no new NEW order,
+ * which means silence, which in a kitchen reads as "no orders" rather than "no
+ * feed". So a dead session is rendered as an unmissable bar across the whole board
+ * rather than a chip in the corner.
+ *
+ * (Not an alarm: the chime is cleared by a tap, and a tap cannot fix a signed-out
+ * session, so sounding it would leave a kitchen with a noise nobody can stop.)
+ *
+ * `status` is `null` when the fetch itself failed — no wifi, no DNS, no server.
+ */
+export type Banner = { text: string; tone: 'stale' | 'dead' }
+
+export function pollBanner(status: number | null): Banner | null {
+  if (status !== null && status >= 200 && status < 300) return null
+  if (status === 401 || status === 403) {
+    return { text: 'SIGNED OUT — THIS BOARD HAS STOPPED UPDATING. RELOAD TO SIGN IN.', tone: 'dead' }
+  }
+  return { text: 'NO CONNECTION — showing the last board we had', tone: 'stale' }
+}
+
 /** Whole minutes between two instants, floored, never negative. Clocks disagree; a kitchen does not care. */
 export function minutesBetween(fromIso: string, toIso: string): number {
   return Math.max(0, Math.floor((Date.parse(toIso) - Date.parse(fromIso)) / 60_000))
@@ -100,7 +126,9 @@ export default function FeedClient({ locationSlug, locationName, initial, since 
   const [payload, setPayload] = useState<FeedPayload>(initial)
   const [acknowledged, setAcknowledged] = useState<ReadonlySet<string>>(() => new Set())
   const [pending, setPending] = useState<ReadonlySet<string>>(() => new Set())
-  const [problem, setProblem] = useState<string | null>(null)
+  const [banner, setBanner] = useState<Banner | null>(null)
+  /** A tap that did not take — separate from the board's liveness, which is `banner`. */
+  const [tapProblem, setTapProblem] = useState<string | null>(null)
   const [soundUnlocked, setSoundUnlocked] = useState(false)
 
   const audioRef = useRef<HTMLAudioElement>(null)
@@ -129,22 +157,27 @@ export default function FeedClient({ locationSlug, locationName, initial, since 
     let stopped = false
 
     async function poll() {
+      let status: number | null = null
       try {
         const res = await fetch(feedUrl, { signal: controller.signal, cache: 'no-store' })
-        if (!res.ok) throw new Error(`feed responded ${res.status}`)
-        const next: FeedPayload = await res.json()
-        if (!stopped) {
-          setPayload(next)
-          setProblem(null)
+        status = res.status
+        if (res.ok) {
+          const next: FeedPayload = await res.json()
+          if (!stopped) setPayload(next)
         }
       } catch {
         // Wifi in a kitchen drops. The board keeps showing what it last knew and says
         // so, rather than blanking — a blank board reads as "no orders", which is the
-        // one wrong answer it could give.
-        if (!stopped) setProblem('NO CONNECTION — showing the last board we had')
+        // one wrong answer it could give. `status` stays null, which `pollBanner`
+        // reads as "the request never landed".
+        status = null
       }
+      if (!stopped) setBanner(pollBanner(status))
     }
 
+    // The poll keeps running even once the session is dead: it costs one 401 every
+    // five seconds, and it means a board recovers by itself the moment somebody signs
+    // back in on another tab, instead of needing a reload nobody thinks to do.
     const timer = setInterval(poll, POLL_MS)
     return () => {
       stopped = true
@@ -216,18 +249,22 @@ export default function FeedClient({ locationSlug, locationName, initial, since 
         },
       )
       if (!res.ok) {
-        // Most likely a double-tap racing the first tap's answer, or another tablet
-        // in the same kitchen having already moved the card — both come back 422
-        // `illegal_transition`. The next poll is five seconds away and carries the
-        // truth, so nothing is invented here and nothing is rolled back.
-        setProblem('THAT TAP DIDN’T STICK — the board refreshes in a few seconds')
+        // A session that has expired says so the same way the poll does — the board
+        // is dead either way, and the kitchen must be told that rather than told a
+        // tap missed.
+        if (res.status === 401 || res.status === 403) setBanner(pollBanner(res.status))
+        // Otherwise: most likely a double-tap racing the first tap's answer, or
+        // another tablet in the same kitchen having already moved the card — both
+        // come back 422 `illegal_transition`. The next poll is five seconds away and
+        // carries the truth, so nothing is invented here and nothing is rolled back.
+        else setTapProblem('THAT TAP DIDN’T STICK — the board refreshes in a few seconds')
         return
       }
       const { order }: { order: FeedOrder } = await res.json()
       setPayload((prev) => ({ ...prev, orders: applyMoved(prev.orders, order) }))
-      setProblem(null)
+      setTapProblem(null)
     } catch {
-      setProblem('NO CONNECTION — that tap did not reach the kitchen')
+      setTapProblem('NO CONNECTION — that tap did not reach the kitchen')
     } finally {
       setPending((prev) => {
         const next = new Set(prev)
@@ -241,10 +278,18 @@ export default function FeedClient({ locationSlug, locationName, initial, since 
     <div style={styles.page} onPointerDown={acknowledgeEverything}>
       <audio ref={audioRef} src="/chime.wav" loop preload="auto" />
 
+      {/*
+        Across the whole board, not a chip in a corner. A signed-out board cannot
+        chime — no poll, no new order, no sound — so silence is not evidence of
+        calm, and this bar is the only thing that says so.
+      */}
+      {banner?.tone === 'dead' ? <div style={styles.deadBar}>{banner.text}</div> : null}
+
       <header style={styles.header}>
         <h1 style={styles.title}>{locationName}</h1>
         <div style={styles.headerRight}>
-          {problem ? <span style={styles.problem}>{problem}</span> : null}
+          {banner?.tone === 'stale' ? <span style={styles.problem}>{banner.text}</span> : null}
+          {tapProblem ? <span style={styles.problem}>{tapProblem}</span> : null}
           {wantsChime && !soundUnlocked
             ? <span style={styles.soundHint}>TAP ANYWHERE FOR SOUND</span>
             : null}
@@ -391,6 +436,16 @@ const styles = {
   title: { fontSize: '32px', fontWeight: 700 },
   headerRight: { display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' },
   problem: { background: '#a00', padding: '8px 12px', fontSize: '20px', fontWeight: 700 },
+  deadBar: {
+    background: '#ff1744',
+    color: '#fff',
+    padding: '20px 16px',
+    marginBottom: '16px',
+    fontSize: '30px',
+    fontWeight: 800,
+    textAlign: 'center',
+    letterSpacing: '1px',
+  },
   soundHint: { background: '#fc0', color: '#000', padding: '8px 12px', fontSize: '20px', fontWeight: 700 },
   count: { fontSize: '24px', color: '#aaa' },
   empty: { fontSize: '28px', color: '#aaa', padding: '32px 0' },
