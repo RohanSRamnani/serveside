@@ -3,6 +3,7 @@ import { isOpenAt } from './hours'
 import { db } from '@/db/client'
 import { businessHours, holidayClosures, orderPauses } from '@/db/schema'
 import { seedLocation } from '@/test/seed'
+import { errorChainText } from '@/test/errors'
 
 // Every instant is written as its UTC equivalent, never as a local-looking string:
 // `new Date('2026-09-22T18:00')` would mean 18:00 on whatever machine ran the test,
@@ -18,18 +19,6 @@ const TUE_23_30_ET = new Date('2026-09-23T03:30:00Z') // late night, past 22:00
 const WED_01_00_ET = new Date('2026-09-23T05:00:00Z') // the other side of midnight
 // Same 21:00 UTC as TUE_17_00_ET, but in standard time it is 16:00 local, not 17:00.
 const TUE_16_00_EST = new Date('2027-01-19T21:00:00Z')
-
-/**
- * Drizzle wraps driver errors in a DrizzleQueryError whose own message is only the
- * failed query, so the constraint name lives further down `cause`.
- */
-function errorChainText(err: unknown): string {
-  let text = ''
-  for (let e: unknown = err, depth = 0; e != null && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
-    text += `${(e as Error).message ?? ''} ${(e as { constraint?: string }).constraint ?? ''}\n`
-  }
-  return text
-}
 
 /** Tue (dow 2) split service: lunch 11:30–15:00, dinner 17:00–22:00. */
 async function seedTuesdaySplitService(locationId: string) {

@@ -14,6 +14,12 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **Menus, hours and orders scope to `location_id`, not `org_id`.** Every domain
   table carries one. One missing WHERE clause must not leak another restaurant's orders.
 - **Order rows snapshot names and prices.** Never join a historical order to a live menu item.
+  `orders.menu_snapshot_id` is NOT NULL — every order pins the menu it was quoted from.
+- **`order_events` is append-only**, and a trigger enforces it: UPDATE, DELETE and
+  TRUNCATE all raise. Every state change appends one. The legal moves are
+  `src/domain/order-status.ts` (`transition` returns the event to insert with it, and
+  COMPLETED/REJECTED/CANCELED are terminal — undo a completed order with a refund, not
+  a walk back up the machine).
 - **`menu_snapshots` is insert-only.** Never update or delete a row. `version` is
   `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
@@ -32,6 +38,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `npx drizzle-kit generate`, then `npm run db:migrate` — drizzle-kit reads no `.env`
   file, so bare `db:migrate` dies on `url: undefined`. Name the branch you mean:
   `DATABASE_URL=$(grep DATABASE_URL .env.test | cut -d= -f2-) npm run db:migrate`.
+- Triggers, RLS, roles — anything drizzle-kit does not model — go in a hand-written
+  migration: `npx drizzle-kit generate --custom --name=<what>`, fill the file, migrate
+  as above. `generate` afterwards must still say "No schema changes".
 
 ## Gotchas
 
