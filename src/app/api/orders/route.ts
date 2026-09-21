@@ -102,11 +102,15 @@ function hasOrderShape(body: unknown): body is CreateOrderInput {
   if (typeof contact !== 'object' || contact === null) return false
   if (typeof contact.name !== 'string' || typeof contact.phone !== 'string') return false
   if (!Array.isArray(b.items)) return false
-  return b.items.every((line) => (
-    typeof line === 'object' && line !== null
-    // `createOrder` iterates this one before it checks anything about it.
-    && Array.isArray((line as Record<string, unknown>).modifierOptionIds)
-  ))
+  return b.items.every((line) => {
+    if (typeof line !== 'object' || line === null) return false
+    // Absent is fine and is the common case — a line with no modifiers. `createOrder`
+    // defaults it to `[]` and refuses a present-but-not-an-array value itself, with a
+    // coded rejection; the guard here only has to keep it from being *iterated* as
+    // something non-iterable before that check runs.
+    const mods = (line as Record<string, unknown>).modifierOptionIds
+    return mods === undefined || Array.isArray(mods)
+  })
 }
 
 /**

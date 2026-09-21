@@ -40,13 +40,31 @@ const { POST } = await import('./webhook/route')
 
 /** How long after payment the kitchen promises the food — deliberately not the 20-minute default. */
 const PREP_TIME_MINUTES = 37
+/** The connected account every seeded restaurant here banks with. */
+const STRIPE_ACCOUNT = 'acct_test_kashi'
+/** What `seedCardOrder` / `seedPaidOrder` total to: (1800 + 50) × 2 + 324 tax + 500 tip. */
+const ORDER_TOTAL_CENTS = 4524
 
 let eventCounter = 0
 
-/** A `payment_intent.succeeded` as Stripe delivers it, down to the fields we read. */
+/** A restaurant that banks somewhere, which the provenance checks require. */
+function restaurant(over: Parameters<typeof seedLocationWithMenu>[0] = {}) {
+  return seedLocationWithMenu({
+    prepTimeMinutes: PREP_TIME_MINUTES, stripeAccountId: STRIPE_ACCOUNT, ...over,
+  })
+}
+
+/**
+ * A `payment_intent.succeeded` as Stripe delivers it, down to the fields we read.
+ *
+ * `account` is the connected account the event originated on — populated because the
+ * endpoint is a **Connect** webhook on the platform. It defaults to the seeded
+ * restaurant's, so a test only names it when provenance is what is under test.
+ */
 function succeededEvent(over: {
   id?: string
   type?: string
+  account?: string
   paymentIntentId?: string
   orderId?: string
   locationId?: string
@@ -55,11 +73,12 @@ function succeededEvent(over: {
   return {
     id: over.id ?? `evt_test_${Date.now()}_${eventCounter++}`,
     type: over.type ?? 'payment_intent.succeeded',
+    account: over.account ?? STRIPE_ACCOUNT,
     data: {
       object: {
         id: over.paymentIntentId ?? 'pi_test_1',
         object: 'payment_intent',
-        amount: over.amount ?? 4524,
+        amount: over.amount ?? ORDER_TOTAL_CENTS,
         currency: 'usd',
         status: 'succeeded',
         metadata: { orderId: over.orderId ?? '', locationId: over.locationId ?? '' },
@@ -117,7 +136,7 @@ beforeEach(() => {
 
 describe('POST /api/stripe/webhook', () => {
   it('flips a PENDING_PAYMENT order to NEW + PAID, quotes a ready time, and records the move', async () => {
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     expect(order.quotedReadyAt).toBeNull()
 
@@ -162,7 +181,7 @@ describe('POST /api/stripe/webhook', () => {
   })
 
   it('does nothing at all the second time the same event id arrives, and still answers 200', async () => {
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     const event = succeededEvent({
       orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
@@ -203,7 +222,7 @@ describe('POST /api/stripe/webhook', () => {
     //
     // Not a contrivance, either: this is the shape of a redelivery whose 200 was lost
     // in transit, or one another instance has already taken.
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     const event = succeededEvent({
       orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
@@ -228,7 +247,7 @@ describe('POST /api/stripe/webhook', () => {
   })
 
   it('refuses a bad signature with 400, before it has written anything', async () => {
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     constructEvent.mockImplementation(() => {
       throw new Error('No signatures found matching the expected signature for payload')
@@ -257,7 +276,7 @@ describe('POST /api/stripe/webhook', () => {
   })
 
   it('records an event type it does not handle and answers 200', async () => {
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     const event = succeededEvent({
       type: 'payment_intent.payment_failed', orderId: order.id, locationId: loc.id,
@@ -278,7 +297,7 @@ describe('POST /api/stripe/webhook', () => {
     // Stripe retries 5xx forever. An order that is already NEW — flipped by an earlier
     // delivery under a different event id, or by a human — is a legal state, so the
     // only thing a 500 would buy is a retry storm against a row nothing will change.
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedPaidOrder(loc.id)
     const eventsBefore = await countEvents(loc.id, order.id)
 
@@ -295,8 +314,8 @@ describe('POST /api/stripe/webhook', () => {
     // The scope comes from `metadata.locationId`, and RLS is what enforces it: opened
     // against the wrong location, the order is simply not there. A cross-tenant flip
     // has to read as "no such order", never as a 500 and never as a write.
-    const locA = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
-    const locB = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const locA = await restaurant()
+    const locB = await restaurant()
     const { order } = await seedCardOrder(locA.id)
 
     const res = await deliver(succeededEvent({ orderId: order.id, locationId: locB.id }))
@@ -307,11 +326,92 @@ describe('POST /api/stripe/webhook', () => {
     expect(sendOrderCreated).not.toHaveBeenCalled()
   })
 
+  it('will not flip an order with money that originated on another connected account', async () => {
+    // The attack this closes. A signed event proves Stripe sent it, not whose money it
+    // is — and every restaurant on this platform has a connected account and can mint
+    // a PaymentIntent with any metadata it likes. Without the account check, a
+    // competitor could pay 50¢ on their own account, name a victim's ids in the
+    // metadata, and have us mark the victim's order PAID and send it to the kitchen.
+    //
+    // The order here has no intent id of its own, which is the heal path — the one
+    // place the intent-mismatch check cannot help.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id, null)
+    expect(order.stripePaymentIntentId).toBeNull()
+
+    const event = succeededEvent({
+      orderId: order.id,
+      locationId: loc.id,
+      account: 'acct_test_the_competitor',
+      amount: ORDER_TOTAL_CENTS,
+    })
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+    // Recorded, so the attempt is on file — and refused.
+    expect(await claimRows(event.id)).toHaveLength(1)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(untouched.stripePaymentIntentId).toBeNull()
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('will not flip an order for less money than it is owed', async () => {
+    // The other half of provenance: right account, wrong amount. An intent for 50¢
+    // against a $45.24 order is not a payment, and "mark it paid and feed them" is the
+    // wrong answer even when the money genuinely came from this restaurant's account.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id,
+      locationId: loc.id,
+      paymentIntentId: order.stripePaymentIntentId!,
+      amount: 50,
+    }))
+    expect(res.status).toBe(200)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('answers a retryable 5xx — not 400 — when the signing secret is missing', async () => {
+    // The failure mode this prevents is silent and total. `env()` throws on a blank
+    // var; read inside the signature try, that throw comes back 400 `invalid_signature`
+    // — so one unset env var on a deploy answers every genuine payment with "you are a
+    // forger", flips nothing, and leaves a log that says only "forged request". A 5xx
+    // is retryable, so the orders flip once the config is fixed.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    vi.stubEnv('STRIPE_WEBHOOK_SECRET', '')
+
+    try {
+      const event = succeededEvent({
+        orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+      })
+      const res = await deliver(event)
+      expect(res.status).toBeGreaterThanOrEqual(500)
+      expect((await res.json()).error).toBe('webhook_misconfigured')
+      // Nothing claimed: the event is untouched and Stripe's retry gets a clean run
+      // the moment the secret is set.
+      expect(await claimRows(event.id)).toHaveLength(0)
+      expect(constructEvent).not.toHaveBeenCalled()
+
+      const untouched = await readOrder(loc.id, order.id)
+      expect(untouched.status).toBe('PENDING_PAYMENT')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('will not mark an order paid against an intent that is not the one it holds', async () => {
     // The order already named its PaymentIntent at checkout. An event about a
     // different one is either our bug or someone else's payment, and "mark it paid
     // and feed them" is the wrong guess either way — so it fails closed and loudly.
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
 
     const res = await deliver(succeededEvent({
@@ -339,7 +439,7 @@ describe('POST /api/stripe/webhook', () => {
     // The cost of claiming *before* handling: a handler that dies has already taken
     // the id, and the retry would read as "already processed" and be dropped. So the
     // claim is released on the way out of an unexpected failure.
-    const loc = await seedLocationWithMenu({ prepTimeMinutes: PREP_TIME_MINUTES })
+    const loc = await restaurant()
     const { order } = await seedCardOrder(loc.id)
     sendOrderCreated.mockRejectedValueOnce(new Error('inngest is down'))
 

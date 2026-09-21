@@ -37,7 +37,12 @@ export type CreateOrderInput = {
   /** Pickup only for now; the delivery fee below is hardcoded 0 because of it. */
   fulfillment: 'pickup'
   contact: { name: string; phone: string; email?: string }
-  items: Array<{ menuItemId: string; qty: number; modifierOptionIds: string[]; notes?: string }>
+  /**
+   * `modifierOptionIds` is optional and defaults to `[]`: a line with no modifiers is
+   * the most ordinary thing on a menu, and making the client send an empty array for
+   * it turns the commonest cart into a validation error.
+   */
+  items: Array<{ menuItemId: string; qty: number; modifierOptionIds?: string[]; notes?: string }>
   tipCents: number
   payment: 'card' | 'pay_on_pickup'
 }
@@ -341,14 +346,22 @@ function assertInputShape(input: CreateOrderInput): void {
 
   for (const line of input.items) {
     assertUuid('menuItemId', line.menuItemId)
-    for (const optionId of line.modifierOptionIds) assertUuid('modifierOptionId', optionId)
+    // `?? []` throughout: absent means "no modifiers on this line", which is the
+    // common case, not a malformed one. A present-but-not-an-array value is refused
+    // here rather than left to blow up as a TypeError deeper in.
+    if (line.modifierOptionIds !== undefined && !Array.isArray(line.modifierOptionIds)) {
+      throw new InvalidOrderInputError(
+        `modifierOptionIds must be an array when present, got ${JSON.stringify(line.modifierOptionIds)}`,
+      )
+    }
+    for (const optionId of line.modifierOptionIds ?? []) assertUuid('modifierOptionId', optionId)
     if (!Number.isInteger(line.qty) || line.qty < 1 || line.qty > MAX_QTY_PER_LINE) {
       throw new InvalidOrderInputError(
         `Quantity must be a whole number between 1 and ${MAX_QTY_PER_LINE}, got ${line.qty}`,
       )
     }
     const seen = new Set<string>()
-    for (const optionId of line.modifierOptionIds) {
+    for (const optionId of line.modifierOptionIds ?? []) {
       if (seen.has(optionId)) {
         // (order_item_id, modifier_option_id) is the primary key of
         // order_item_modifiers, so "extra shot ×2" cannot be recorded. Saying so
@@ -447,7 +460,7 @@ async function priceLines(tx: ScopedTx, input: CreateOrderInput): Promise<Priced
       options: link.group.options,
     }))
 
-    const chosen = line.modifierOptionIds.map((optionId) => {
+    const chosen = (line.modifierOptionIds ?? []).map((optionId) => {
       for (const group of groups) {
         const option = group.options.find((o) => o.id === optionId)
         if (option) return { group, option }

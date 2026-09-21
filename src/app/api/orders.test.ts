@@ -104,6 +104,18 @@ describe('POST /api/orders', () => {
     // The whole premise of the product: the charge is created ON the connected
     // account, so the restaurant is merchant of record and funds never touch us.
     expect(options).toEqual({ stripeAccount: STRIPE_ACCOUNT })
+    // **The exact key set, not field-by-field.** Checking the fields we care about
+    // individually would stay green while someone added `transfer_data`,
+    // `on_behalf_of` or `application_fee_amount` — each of which silently converts
+    // this into a destination or separate-charge arrangement, routes the money through
+    // our balance, and undoes the entire premise above. This assertion is what makes
+    // that a failing test rather than a quiet change of business model.
+    expect(Object.keys(params).sort()).toEqual(
+      ['amount', 'automatic_payment_methods', 'currency', 'metadata'],
+    )
+    expect(params).not.toHaveProperty('transfer_data')
+    expect(params).not.toHaveProperty('on_behalf_of')
+    expect(params).not.toHaveProperty('application_fee_amount')
     // Verbatim, not recomputed — a second arithmetic path is a second way for the
     // charge and the receipt to disagree.
     expect(params.amount).toBe(EXPECTED_TOTAL)
@@ -171,14 +183,36 @@ describe('POST /api/orders', () => {
       { locationId: loc.id, payment: 'card', fulfillment: 'pickup', tipCents: 0, contact: { name: 'A', phone: '+1' } },
       { locationId: loc.id, payment: 'card', fulfillment: 'pickup', tipCents: 0, items: [] },
       { ...cartFor(loc), contact: 'Rohan' },
-      { ...cartFor(loc), items: [{ menuItemId: loc.items[0].id, qty: 1 }] },
       { ...cartFor(loc), items: 'butter chicken' },
+      // Present but not iterable. Absence is legal (see the test below); a number is
+      // not, and it must be a coded 422 rather than a TypeError deeper in.
+      { ...cartFor(loc), items: [{ menuItemId: loc.items[0].id, qty: 1, modifierOptionIds: 123 }] },
     ]
     for (const body of malformed) {
       const res = await post(body)
       expect([422, 400], JSON.stringify(body)).toContain(res.status)
       expect((await res.json()).error, JSON.stringify(body)).toBe('invalid_input')
     }
+  })
+
+  it('takes a line with no modifierOptionIds at all — the most ordinary cart there is', async () => {
+    // Lamb Rogan Josh hangs off no modifier group, so "no modifiers" is not a missing
+    // choice, it is the whole truth about the line. Requiring the client to send an
+    // empty array for it would make the commonest order shape a validation error.
+    const loc = await openRestaurant()
+    const lamb = loc.items.find((i) => i.name === 'Lamb Rogan Josh')!
+
+    const res = await post(cartFor(loc, {
+      items: [{ menuItemId: lamb.id, qty: 1 }],
+      tipCents: 0,
+      payment: 'pay_on_pickup',
+    }))
+    expect(res.status).toBe(200)
+
+    const order = await readOrder(loc.id, (await res.json()).orderId)
+    // 2100 + 875bps tax (183.75 → 184, half up) and no tip.
+    expect(order.subtotalCents).toBe(2100)
+    expect(order.totalCents).toBe(2284)
   })
 
   it('answers 400 for a body that is not JSON at all', async () => {

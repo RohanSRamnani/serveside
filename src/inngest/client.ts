@@ -21,6 +21,13 @@
  *    claim and returns a 5xx when this rejects, which is what makes Stripe retry a
  *    fan-out that never happened. A silent failure here is an order that is paid,
  *    flipped, and that no kitchen ever hears about.
+ *
+ * **Making this idempotent is necessary but not sufficient**, and the rest of the fix
+ * is not in this file. Today a retry after a failed fan-out returns early in the
+ * webhook — the order is already NEW, so the handler no-ops and never calls this at
+ * all. Task 10 must *also* change that branch to re-fire: see the two `TODO(task-10)`
+ * markers in `src/app/api/stripe/webhook/route.ts`, which name the exact condition.
+ * Landing obligation 1 alone leaves the gap exactly where it is.
  */
 export async function sendOrderCreated(orderId: string, locationId: string): Promise<void> {
   // Deliberately inert, and deliberately not a `console.log` in production code.

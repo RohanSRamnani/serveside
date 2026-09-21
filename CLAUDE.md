@@ -76,7 +76,18 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **Stripe retries every 5xx forever, so 200 is the answer to anything a retry cannot
   fix** — an order already past PENDING_PAYMENT, an event type we ignore, metadata
   that names no order. Those are logged, not raised. 5xx is only for failures a retry
-  could genuinely repair.
+  could genuinely repair. A **config fault is one of them**: the signing secret and the
+  client are read *outside* the verification `try`, because caught by it a blank
+  `STRIPE_WEBHOOK_SECRET` would answer every real payment `400 invalid_signature` and
+  silently flip nothing.
+- **A signed event proves Stripe sent it, not whose money it is.** Every restaurant on
+  the platform has a connected account and can mint an intent with any metadata, so
+  the flip additionally requires `event.account === location.stripeAccountId` and
+  `intent.amount === order.totalCents` (and, when the order already holds one, a
+  matching intent id). All three are log-and-200 no-ops on mismatch.
+  **Deployment consequence:** the endpoint must be registered as a **Connect** webhook
+  on the platform account — that is what populates `event.account`. Registered on a
+  connected account it is absent, and every flip becomes a logged no-op.
 - **The `PENDING_PAYMENT → NEW` flip sets three things together**: `status`,
   `paymentStatus = 'PAID'`, and `quotedReadyAt = <flip time> + location.prepTimeMinutes`.
   The clock starts when the money lands, not at checkout — a promise made while the

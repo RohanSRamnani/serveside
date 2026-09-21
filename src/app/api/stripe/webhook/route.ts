@@ -48,9 +48,26 @@ export async function POST(req: Request): Promise<Response> {
   // against a payload that is not the one that was signed.
   const raw = await req.text()
 
+  // **Config is read outside the verification try, and the distinction is not
+  // cosmetic.** A missing or blank `STRIPE_WEBHOOK_SECRET` throws from `env()`; caught
+  // by the signature handler below it would come back 400 `invalid_signature` — a
+  // deploy with one env var unset would then answer every genuine payment with "you
+  // are a forger", and every order would silently never flip while the logs said
+  // nothing but "forged request". A config fault is ours and is fixable, so it is a
+  // 5xx with its own log line.
+  let client: Stripe
+  let signingSecret: string
+  try {
+    client = stripe()
+    signingSecret = env('STRIPE_WEBHOOK_SECRET')
+  } catch (err) {
+    console.error('[stripe webhook] MISCONFIGURED — cannot verify any delivery:', err)
+    return Response.json({ error: 'webhook_misconfigured' }, { status: 500 })
+  }
+
   let event: Stripe.Event
   try {
-    event = stripe().webhooks.constructEvent(raw, signature, env('STRIPE_WEBHOOK_SECRET'))
+    event = client.webhooks.constructEvent(raw, signature, signingSecret)
   } catch (err) {
     // Deliberately opaque to the caller: a forged request learns nothing about why.
     console.warn('[stripe webhook] signature rejected:', (err as Error).message)
@@ -141,17 +158,47 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
       console.error('[stripe webhook] no order', orderId, 'in location', locationId, 'for intent', intent.id)
       return false
     }
-    // A legal state, not a failure: already flipped by an earlier delivery, or
-    // cancelled while the customer was paying (which is a refund's problem, not the
-    // state machine's). `transition` would throw here, and a throw means a 5xx, and a
-    // 5xx means Stripe retries this forever.
-    if (order.status !== 'PENDING_PAYMENT') {
-      console.warn('[stripe webhook] order', orderId, 'is', order.status, '— nothing to flip')
+    // `locations` is not under RLS, and is read on `tx` so the prep time that makes the
+    // promise — and the account the money is checked against — are the ones in force in
+    // the transaction that records them.
+    const [location] = await tx
+      .select({ prepTimeMinutes: locations.prepTimeMinutes, stripeAccountId: locations.stripeAccountId })
+      .from(locations).where(eq(locations.id, locationId)).limit(1)
+    if (!location) throw new Error(`Unknown location ${locationId} on intent ${intent.id}`)
+
+    // ---- Provenance. Three fail-closed checks, and they are a security boundary. ----
+    //
+    // A signed event proves Stripe sent it. It does **not** prove whose money it is:
+    // every restaurant on this platform has a connected account and can create their
+    // own PaymentIntent with any metadata they like. Without these, a competitor could
+    // mint a 50¢ intent carrying a victim's `orderId` and `locationId`, pay it, and
+    // have us mark the victim's order PAID and send it to the kitchen.
+    //
+    // 1. The money must have originated on **this restaurant's** account.
+    //
+    // This requires the endpoint to be registered as a **Connect** webhook on the
+    // platform account, which is what populates `event.account`. Registered on a
+    // connected account instead, `account` is absent and every flip becomes a no-op —
+    // loudly logged, per the config-fault discipline at the top of this file.
+    if (event.account !== location.stripeAccountId) {
+      console.error(
+        '[stripe webhook] intent', intent.id, 'originated on account', event.account,
+        'but location', locationId, 'banks with', location.stripeAccountId, '— refusing to flip',
+      )
       return false
     }
-    // The order already named a different intent. Marking it paid against a payment
-    // that is not its own is a money error, so it fails closed and loudly rather than
-    // guessing which of the two is real.
+    // 2. The amount paid must be the amount owed. Cheap, and it is the check that
+    //    turns "wrong payment" into "no payment" rather than a free dinner.
+    if (intent.amount !== order.totalCents) {
+      console.error(
+        '[stripe webhook] intent', intent.id, 'paid', intent.amount,
+        'but order', orderId, 'totals', order.totalCents, '— refusing to flip',
+      )
+      return false
+    }
+    // 3. The order already named a different intent. Marking it paid against a payment
+    //    that is not its own is a money error, so it fails closed rather than guessing
+    //    which of the two is real.
     if (order.stripePaymentIntentId && order.stripePaymentIntentId !== intent.id) {
       console.error(
         '[stripe webhook] order', orderId, 'holds intent', order.stripePaymentIntentId,
@@ -160,12 +207,24 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
       return false
     }
 
-    // `locations` is not under RLS, and is read on `tx` so the prep time that makes the
-    // promise is the one in force in the transaction that records it.
-    const [location] = await tx
-      .select({ prepTimeMinutes: locations.prepTimeMinutes })
-      .from(locations).where(eq(locations.id, locationId)).limit(1)
-    if (!location) throw new Error(`Unknown location ${locationId} on intent ${intent.id}`)
+    // A legal state, not a failure: already flipped by an earlier delivery, or
+    // cancelled while the customer was paying (which is a refund's problem, not the
+    // state machine's). `transition` would throw here, and a throw means a 5xx, and a
+    // 5xx means Stripe retries this forever.
+    //
+    // TODO(task-10): this early return is what makes a failed fan-out unrecoverable,
+    // and it is the blocker — not the stub. When `sendOrderCreated` becomes an Inngest
+    // send keyed on `orderId` (idempotent per order), change this branch to **re-fire
+    // `sendOrderCreated(orderId, locationId)` and return true** when the order is
+    // already NEW *and* `order.stripePaymentIntentId === intent.id` *and*
+    // `paymentStatus === 'PAID'` — i.e. we flipped it ourselves and the caller never
+    // got our 200. Idempotency is what makes the re-fire safe; until it exists, a
+    // re-fire would print a second ticket, so this stays a no-op. Leave every other
+    // status (CANCELED, ACCEPTED, …) returning false.
+    if (order.status !== 'PENDING_PAYMENT') {
+      console.warn('[stripe webhook] order', orderId, 'is', order.status, '— nothing to flip')
+      return false
+    }
 
     // The machine decides the move and hands back the event to append with it — the
     // two are written together or not at all.
@@ -202,6 +261,9 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     return true
   })
 
+  // TODO(task-10): see the marker on the status branch above — this guard is the other
+  // half of it. Once the fan-out is idempotent per order, the already-NEW-and-ours case
+  // returns true and falls through to the re-fire below.
   if (!flipped) return
 
   // **After the commit, never inside it.** The fan-out reads the order row it is told

@@ -196,7 +196,13 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
  */
 export async function seedCardOrder(
   locationId: string,
-  paymentIntentId = `pi_test_${Date.now()}_${counter++}`,
+  /**
+   * `null` seeds the **heal path**: an order whose checkout died after the intent
+   * existed but before the id reached the row. It is the one state where the webhook
+   * cannot check the event against an intent it already knows, so it is the state the
+   * account and amount provenance checks have to carry on their own.
+   */
+  paymentIntentId: string | null = `pi_test_${Date.now()}_${counter++}`,
 ): Promise<SeededOrder> {
   return seedOrder(locationId, {
     status: 'PENDING_PAYMENT',
