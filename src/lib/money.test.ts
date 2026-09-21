@@ -1,0 +1,157 @@
+import { describe, it, expect } from 'vitest'
+import {
+  roundHalfUp, taxCentsFor, unitPriceCentsFor, lineTotalCentsFor, totalCentsFor, assertTotalsBalance,
+} from './money'
+
+describe('roundHalfUp', () => {
+  it('rounds a half up, and anything below it down', () => {
+    // The two numbers the plan names. Half-up, not banker's: 174.5 is 175 here and
+    // 174 under round-half-to-even, and a tax line that disagrees with the receipt
+    // by a cent is a support ticket.
+    expect(roundHalfUp(174.5)).toBe(175)
+    expect(roundHalfUp(174.4)).toBe(174)
+    expect(roundHalfUp(174.6)).toBe(175)
+  })
+
+  it('rounds half to even nowhere — both 0.5 cases go up', () => {
+    // Banker's rounding would send one of these down. The pair is the test.
+    expect(roundHalfUp(0.5)).toBe(1)
+    expect(roundHalfUp(1.5)).toBe(2)
+    expect(roundHalfUp(2.5)).toBe(3)
+  })
+
+  it('leaves whole numbers alone', () => {
+    expect(roundHalfUp(350)).toBe(350)
+    expect(roundHalfUp(0)).toBe(0)
+  })
+
+  it('does not round up the largest double below a half', () => {
+    // `Math.floor(v + 0.5)` is the obvious implementation and it is wrong here:
+    // 0.49999999999999994 + 0.5 rounds to exactly 1 in binary, so that version
+    // answers 1 for a number that is less than a half.
+    expect(roundHalfUp(0.49999999999999994)).toBe(0)
+  })
+
+  it('refuses a value that is not a finite number', () => {
+    // NaN would sail through every later comparison and land as a NULL-ish total.
+    expect(() => roundHalfUp(Number.NaN)).toThrow(/finite/i)
+    expect(() => roundHalfUp(Number.POSITIVE_INFINITY)).toThrow(/finite/i)
+  })
+})
+
+describe('taxCentsFor', () => {
+  it('taxes the plan\'s order: 4000 at 875 bps is 350', () => {
+    expect(taxCentsFor(4000, 875)).toBe(350)
+  })
+
+  it('rounds the half up rather than truncating it', () => {
+    // 1960 × 875 / 10000 = 171.5 exactly. Truncation says 171, banker's says 172
+    // by luck here, half-up says 172 by rule. 40 × 875 / 10000 = 3.5 → 4 is the
+    // case where truncation and banker's both disagree with us.
+    expect(taxCentsFor(1960, 875)).toBe(172)
+    expect(taxCentsFor(40, 875)).toBe(4)
+  })
+
+  it('keeps sub-cent fractions exact rather than drifting', () => {
+    // 1815 × 875 / 10000 = 158.8125 — a fraction that no float represents exactly.
+    expect(taxCentsFor(1815, 875)).toBe(159)
+    expect(taxCentsFor(1, 875)).toBe(0)
+  })
+
+  it('taxes nothing at nothing, and at a zero rate', () => {
+    expect(taxCentsFor(0, 875)).toBe(0)
+    expect(taxCentsFor(4000, 0)).toBe(0)
+  })
+
+  it('refuses a negative subtotal or rate', () => {
+    // A negative tax is a refund, and a refund is a payment_status, never a total.
+    expect(() => taxCentsFor(-1, 875)).toThrow(/negative/i)
+    expect(() => taxCentsFor(4000, -1)).toThrow(/negative/i)
+  })
+
+  it('refuses a fractional subtotal — cents are whole', () => {
+    expect(() => taxCentsFor(4000.5, 875)).toThrow(/whole/i)
+  })
+})
+
+describe('unitPriceCentsFor', () => {
+  it('adds every modifier delta to the base price', () => {
+    expect(unitPriceCentsFor(1800, [200])).toBe(2000)
+    expect(unitPriceCentsFor(1800, [])).toBe(1800)
+    expect(unitPriceCentsFor(1800, [50, 150, 25])).toBe(2025)
+  })
+
+  it('lets a delta be negative — a size down is a real modifier', () => {
+    expect(unitPriceCentsFor(1800, [-300])).toBe(1500)
+  })
+
+  it('refuses to price a unit below zero', () => {
+    // order_items has a `unit_price_cents >= 0` CHECK; failing here names the dish
+    // instead of surfacing a constraint violation from three layers down.
+    expect(() => unitPriceCentsFor(200, [-300])).toThrow(/negative/i)
+  })
+})
+
+describe('lineTotalCentsFor', () => {
+  it('multiplies the unit price by the quantity', () => {
+    expect(lineTotalCentsFor(2000, 2)).toBe(4000)
+    expect(lineTotalCentsFor(1800, 1)).toBe(1800)
+  })
+
+  it('refuses a quantity that is not a whole number above zero', () => {
+    expect(() => lineTotalCentsFor(2000, 0)).toThrow(/quantity/i)
+    expect(() => lineTotalCentsFor(2000, -1)).toThrow(/quantity/i)
+    expect(() => lineTotalCentsFor(2000, 1.5)).toThrow(/quantity/i)
+  })
+})
+
+describe('totalCentsFor', () => {
+  it('totals the plan\'s order: 4000 + 350 + 500 = 4850', () => {
+    expect(totalCentsFor({
+      subtotalCents: 4000, taxCents: 350, tipCents: 500, deliveryFeeCents: 0, discountCents: 0,
+    })).toBe(4850)
+  })
+
+  it('adds the delivery fee and subtracts the discount', () => {
+    // A discount is stored positive and subtracted — never a negative number.
+    expect(totalCentsFor({
+      subtotalCents: 4000, taxCents: 350, tipCents: 500, deliveryFeeCents: 399, discountCents: 1000,
+    })).toBe(4249)
+  })
+
+  it('refuses a discount that would make the total negative', () => {
+    expect(() => totalCentsFor({
+      subtotalCents: 4000, taxCents: 350, tipCents: 0, deliveryFeeCents: 0, discountCents: 9999,
+    })).toThrow(/negative/i)
+  })
+})
+
+describe('assertTotalsBalance', () => {
+  const balanced = {
+    subtotalCents: 4000, taxCents: 350, tipCents: 500, deliveryFeeCents: 0, discountCents: 0, totalCents: 4850,
+  }
+
+  it('passes the identity it is there to defend', () => {
+    expect(() => assertTotalsBalance(balanced)).not.toThrow()
+  })
+
+  it('throws when the total does not equal the parts', () => {
+    // The bug this traps is not arithmetic, it is assembly: a field copied into the
+    // wrong key on the way to the INSERT. So it must be run on the row itself.
+    expect(() => assertTotalsBalance({ ...balanced, totalCents: 4851 })).toThrow(/balance/i)
+    // Tip dropped from the total — the shape of a real mis-assembly.
+    expect(() => assertTotalsBalance({ ...balanced, totalCents: 4350 })).toThrow(/balance/i)
+  })
+
+  it('throws on a fractional cent, which no money column can hold', () => {
+    expect(() => assertTotalsBalance({
+      ...balanced, taxCents: 350.5, totalCents: 4850.5,
+    })).toThrow(/whole/i)
+  })
+
+  it('throws on a negative component even when the sum happens to balance', () => {
+    expect(() => assertTotalsBalance({
+      ...balanced, tipCents: -500, totalCents: 3850,
+    })).toThrow(/negative/i)
+  })
+})

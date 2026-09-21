@@ -11,11 +11,11 @@
 import { db } from '@/db/client'
 import {
   organizations, locations, menus, menuCategories, menuItems,
-  modifierGroups, modifierOptions, itemModifierGroups, orderEvents,
+  modifierGroups, modifierOptions, itemModifierGroups, businessHours, orderEvents,
 } from '@/db/schema'
 import type { Location, Order, OrderItem } from '@/db/schema'
 import { eq } from 'drizzle-orm'
-import { withLocation } from '@/repo/scoped'
+import { withLocation, type ScopedTx } from '@/repo/scoped'
 import { ordersRepo } from '@/repo/orders-repo'
 import { buildMenuSnapshot } from '@/domain/snapshot'
 
@@ -40,6 +40,42 @@ export async function seedLocation(overrides: LocationOverrides = {}): Promise<L
     ...overrides,
   }).returning()
   return loc
+}
+
+/** One row of the weekly grid, minus the ids the seeder fills in. */
+export type BusinessHoursRow = Omit<typeof businessHours.$inferInsert, 'id' | 'locationId'>
+
+/**
+ * Open every day, all day. `24:00:00` is a legal Postgres `time` and satisfies the
+ * `close_time > open_time` CHECK, so this is the whole week in seven rows.
+ *
+ * The default because most tests want "the restaurant is open" as a precondition,
+ * not as the thing under test — and `createOrder` asks `isOpenAt(now)`, where `now`
+ * is the real clock, so a fixed Tuesday evening would pass only on Tuesday evening.
+ */
+export const OPEN_ALL_WEEK: BusinessHoursRow[] = [0, 1, 2, 3, 4, 5, 6].map((dow) => ({
+  dow, openTime: '00:00:00', closeTime: '24:00:00',
+}))
+
+/**
+ * Posts business hours for a location. `business_hours` is under RLS, so the write
+ * is scoped; pass a `tx` to seed inside a caller's transaction.
+ *
+ * Hours are deliberately **not** part of `seedLocationWithMenu`: "closed" is a real
+ * state a test needs to be able to seed by simply not calling this.
+ */
+export async function seedBusinessHours(
+  locationId: string,
+  rows: BusinessHoursRow[] = OPEN_ALL_WEEK,
+  tx?: ScopedTx,
+): Promise<void> {
+  const values = rows.map((row) => ({ ...row, locationId }))
+  if (values.length === 0) return
+  if (!tx) {
+    await withLocation(locationId, (scoped) => scoped.insert(businessHours).values(values))
+    return
+  }
+  await tx.insert(businessHours).values(values)
 }
 
 export type SeededMenu = Location & {

@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, sql } from 'drizzle-orm'
 import {
   menus, menuCategories, menuItems, itemModifierGroups, modifierOptions, menuSnapshots,
 } from '@/db/schema'
@@ -28,6 +28,35 @@ export async function buildMenuSnapshot(
   if (!tx) return withLocation(locationId, (scoped) => buildMenuSnapshot(locationId, scoped))
   const payload = await readActiveMenu(tx, locationId)
   return insertWithNextVersion(tx, locationId, payload)
+}
+
+/**
+ * The snapshot an order pins to: the location's newest, or a fresh one if it has
+ * never had any.
+ *
+ * **Not a build per order.** Two hundred tickets on a Friday would mean two hundred
+ * byte-identical copies of the whole menu, and the evidence value of a snapshot
+ * comes from it being the menu that was live, not from it being freshly written.
+ * What keeps "newest" honest is that the menu editor rebuilds after a change that
+ * alters what may be ordered — 86'ing in particular (Task 13).
+ *
+ * Takes a `tx` rather than opening its own scope: the caller is `createOrder`, and
+ * the snapshot must be pinned by the same transaction that writes the order, or an
+ * order can outlive the snapshot it names.
+ */
+export async function getOrBuildCurrentSnapshot(
+  locationId: string,
+  tx: ScopedTx,
+): Promise<{ id: string; version: number }> {
+  // Ordered by version, not createdAt: version is the thing that is unique and
+  // monotonic per location, and two snapshots can share a millisecond.
+  const [current] = await tx
+    .select({ id: menuSnapshots.id, version: menuSnapshots.version })
+    .from(menuSnapshots)
+    .where(eq(menuSnapshots.locationId, locationId))
+    .orderBy(desc(menuSnapshots.version))
+    .limit(1)
+  return current ?? buildMenuSnapshot(locationId, tx)
 }
 
 /** One relational query down the whole chain, ordered so two builds of an unchanged menu are byte-identical. */

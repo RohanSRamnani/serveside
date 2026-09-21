@@ -24,6 +24,18 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   a walk back up the machine).
 - **`menu_snapshots` is insert-only.** Never update or delete a row. `version` is
   `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
+  Orders pin the **current** snapshot (`getOrBuildCurrentSnapshot`), never a fresh build
+  per order — so anything that changes what may be ordered or what it costs (86'ing,
+  repricing, retiring an item) must rebuild the snapshot, or the pinned price evidence
+  goes stale while orders keep charging live prices.
+- **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
+  the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
+  effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
+  same transaction that writes the order. Money is `src/lib/money.ts`: integer cents,
+  tax rounded **half-up, never banker's**, and `subtotal + tax + tip + fee − discount
+  = total` asserted on the row itself immediately before the INSERT. Customer-facing
+  rejections are the `OrderRejectedError` family, each with a `code` for the HTTP layer;
+  a plain `Error` out of here is our bug, not the customer's.
 - **Tenancy is enforced twice: by `withLocation` and by Postgres RLS.** Every read
   or write of a location's menus, snapshots or orders goes through
   `withLocation(locationId, fn)` (`src/repo/scoped.ts`) — a websocket-pool
@@ -81,7 +93,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `next dev` rewrites the marker block in `AGENTS.md`. Commit the change, don't fight it.
 - **Two drivers, and the choice is not stylistic.** `db()` is neon-http: stateless,
   no session, no transactions (`db().transaction()` throws), so it can never carry
-  the RLS scope — it is for `organizations`, `locations` and `memberships` only.
+  the RLS scope — it is for the three tables that are not location-scoped
+  (`organizations`, `locations`, `memberships`). A scoped transaction may read those
+  three as well, and `createOrder` reads `locations` on its own `tx` so the tax rate
+  it prices with is the one in force when the order is written.
   `withLocation` is neon-serverless over a websocket Pool. Node 22 supplies the
   global `WebSocket`, so `ws` is not a dependency.
 - `buildMenuSnapshot(locationId, tx?)` and `isOpenAt(locationId, at, tx?)` open
@@ -101,8 +116,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
-  `seedPaidOrder`) — import them; don't re-inline a seeder per test file. Slugs must
-  stay unique: nothing tears the test branch down, and `Date.now()` alone collides.
+  `seedBusinessHours`, `seedPaidOrder`) — import them; don't re-inline a seeder per test
+  file. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
+  alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test
+  of `createOrder` needs: it asks `isOpenAt(new Date())`, so hours pinned to one weekday
+  would only pass on that weekday.
 - `.env.local` still points `DATABASE_URL` at the owner. Migrate `main` and run
   `ENV_FILE=.env.local npm run db:app-user` before anything serves real traffic —
   until then the app bypasses its own RLS on that branch.

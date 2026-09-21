@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildMenuSnapshot, isVersionRace } from './snapshot'
+import { buildMenuSnapshot, getOrBuildCurrentSnapshot, isVersionRace } from './snapshot'
 import { menuSnapshots, menuItems, modifierOptions, menus, itemModifierGroups } from '@/db/schema'
 import type { MenuSnapshotPayload } from '@/db/schema'
 import { eq } from 'drizzle-orm'
@@ -135,5 +135,49 @@ describe('buildMenuSnapshot', () => {
     const loc = await seedLocationWithMenu()
     await withLocation(loc.id, (tx) => tx.insert(menus).values({ locationId: loc.id, name: 'Late Night', isActive: true }))
     await expect(buildMenuSnapshot(loc.id)).rejects.toThrow(/more than one active menu/i)
+  })
+})
+
+/**
+ * What `createOrder` pins to. A rebuild per order would copy the whole menu into a
+ * new row for every ticket on a Friday night, and every one of those copies would
+ * be identical — so the order path reads the current one and only builds when there
+ * is none. Task 13 rebuilds after an 86 change, which is what keeps "current" true.
+ */
+describe('getOrBuildCurrentSnapshot', () => {
+  it('builds one when the location has none', async () => {
+    const loc = await seedLocationWithMenu()
+    const built = await withLocation(loc.id, (tx) => getOrBuildCurrentSnapshot(loc.id, tx))
+    expect(built.version).toBe(1)
+    const rows = await withLocation(loc.id, (tx) => tx.select().from(menuSnapshots))
+    expect(rows).toHaveLength(1)
+    expect(rows[0].id).toBe(built.id)
+  })
+
+  it('returns the existing one rather than building a second', async () => {
+    const loc = await seedLocationWithMenu()
+    const first = await buildMenuSnapshot(loc.id)
+    const current = await withLocation(loc.id, (tx) => getOrBuildCurrentSnapshot(loc.id, tx))
+    expect(current).toEqual(first)
+    expect(await withLocation(loc.id, (tx) => tx.select().from(menuSnapshots))).toHaveLength(1)
+  })
+
+  it('returns the newest version, not the oldest', async () => {
+    const loc = await seedLocationWithMenu()
+    await buildMenuSnapshot(loc.id)
+    const newest = await buildMenuSnapshot(loc.id)
+    const current = await withLocation(loc.id, (tx) => getOrBuildCurrentSnapshot(loc.id, tx))
+    expect(current).toEqual(newest)
+    expect(current.version).toBe(2)
+  })
+
+  it('answers per location, never with the neighbour\'s menu', async () => {
+    const a = await seedLocationWithMenu()
+    const b = await seedLocationWithMenu()
+    await buildMenuSnapshot(a.id)
+    const forB = await withLocation(b.id, (tx) => getOrBuildCurrentSnapshot(b.id, tx))
+    const rowsForB = await withLocation(b.id, (tx) => tx.select().from(menuSnapshots))
+    expect(rowsForB.map((r) => r.id)).toEqual([forB.id])
+    expect(rowsForB[0].payload.menuId).toBe(b.menu.id)
   })
 })
