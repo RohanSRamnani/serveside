@@ -1,7 +1,9 @@
 import { eq, inArray } from 'drizzle-orm'
-import { locations, menuItems, modifierOptions, orderEvents, paymentStatus as paymentStatusEnum } from '@/db/schema'
+import {
+  locations, menus, menuItems, modifierOptions, orderEvents, paymentStatus as paymentStatusEnum,
+} from '@/db/schema'
 import type { OrderEventPayload } from '@/db/schema'
-import { withLocation, type ScopedTx } from '@/repo/scoped'
+import { withLocation, isUuid, type ScopedTx } from '@/repo/scoped'
 import { ordersRepo, type NewOrderLine } from '@/repo/orders-repo'
 import { isOpenAt, type ClosedReason } from './hours'
 import { getOrBuildCurrentSnapshot } from './snapshot'
@@ -93,6 +95,27 @@ export class LocationClosedError extends OrderRejectedError {
   constructor(locationId: string, reason: ClosedReason) {
     super(`Location ${locationId} is not taking orders right now (${reason})`)
     this.reason = reason
+  }
+}
+
+/**
+ * The location does not have exactly one active menu, so there is no defensible
+ * answer to "what is on sale and for how much".
+ *
+ * A rejection rather than the plain `Error` `buildMenuSnapshot` raises for the same
+ * two states, because this one is reachable from the public write path: an owner who
+ * switches a menu off mid-service must get a closed door, not a 500 — and above all
+ * not a sale priced off a menu nobody can pin.
+ */
+export class MenuUnavailableError extends OrderRejectedError {
+  readonly code = 'menu_unavailable'
+  readonly activeMenuCount: number
+
+  constructor(locationId: string, activeMenuCount: number) {
+    super(activeMenuCount === 0
+      ? `Location ${locationId} has no active menu`
+      : `Location ${locationId} has ${activeMenuCount} active menus; exactly one must be active to take orders`)
+    this.activeMenuCount = activeMenuCount
   }
 }
 
@@ -281,8 +304,15 @@ async function readLocation(tx: ScopedTx, locationId: string) {
   return location
 }
 
-/** The input shape, checked before a connection is opened. Nothing here reads the database. */
+/**
+ * The input shape, checked before a connection is opened. Nothing here reads the
+ * database — and the id checks are the reason it has to stay that way: a malformed
+ * uuid raises 22P02 inside the query, which poisons the whole transaction and comes
+ * back as a 500 on a public write path, for whatever a client happened to put in the
+ * body.
+ */
 function assertInputShape(input: CreateOrderInput): void {
+  assertUuid('locationId', input.locationId)
   if (input.items.length === 0) {
     throw new InvalidOrderInputError('An order must have at least one line')
   }
@@ -310,6 +340,8 @@ function assertInputShape(input: CreateOrderInput): void {
   if (input.contact.phone.trim() === '') throw new InvalidOrderInputError('An order needs a contact phone number')
 
   for (const line of input.items) {
+    assertUuid('menuItemId', line.menuItemId)
+    for (const optionId of line.modifierOptionIds) assertUuid('modifierOptionId', optionId)
     if (!Number.isInteger(line.qty) || line.qty < 1 || line.qty > MAX_QTY_PER_LINE) {
       throw new InvalidOrderInputError(
         `Quantity must be a whole number between 1 and ${MAX_QTY_PER_LINE}, got ${line.qty}`,
@@ -330,6 +362,25 @@ function assertInputShape(input: CreateOrderInput): void {
   }
 }
 
+function assertUuid(label: string, value: string): void {
+  if (!isUuid(value)) throw new InvalidOrderInputError(`${label} must be a uuid, got ${JSON.stringify(value)}`)
+}
+
+/**
+ * The one menu an order may be priced from — the same one `buildMenuSnapshot` roots
+ * at, and the same ruling: exactly one active menu or nothing.
+ *
+ * This is deliberately checked on the order path as well as in the snapshot builder.
+ * `getOrBuildCurrentSnapshot` hands back the last good snapshot when a location has
+ * none or two active menus, and without this check an order would take that stale
+ * payload and sell from a menu that cannot currently be pinned at all.
+ */
+async function activeMenuIdFor(tx: ScopedTx, locationId: string): Promise<string> {
+  const active = await tx.select({ id: menus.id }).from(menus).where(eq(menus.isActive, true))
+  if (active.length !== 1) throw new MenuUnavailableError(locationId, active.length)
+  return active[0].id
+}
+
 type PricedLine = { row: NewOrderLine; lineTotalCents: number }
 
 /**
@@ -342,6 +393,10 @@ type PricedLine = { row: NewOrderLine; lineTotalCents: number }
  * payload, so what is enforced and what is on file cannot disagree.
  */
 async function priceLines(tx: ScopedTx, input: CreateOrderInput): Promise<PricedLine[]> {
+  // Resolved first, and it can refuse the order outright: the snapshot roots at the
+  // single active menu, so pricing from anywhere else would charge for a dish the
+  // pinned evidence does not contain.
+  const activeMenuId = await activeMenuIdFor(tx, input.locationId)
   const requestedIds = [...new Set(input.items.map((line) => line.menuItemId))]
   // RLS narrows this to the scoped location, which is what makes another
   // restaurant's item id read as "no such dish" rather than pricing onto the order.
@@ -349,6 +404,9 @@ async function priceLines(tx: ScopedTx, input: CreateOrderInput): Promise<Priced
     where: inArray(menuItems.id, requestedIds),
     columns: { id: true, name: true, basePriceCents: true, is86d: true, isActive: true },
     with: {
+      // Which menu the dish hangs off. `menu_items.isActive` does not answer that:
+      // a whole menu can be switched off with every item on it still flagged active.
+      category: { columns: { menuId: true } },
       modifierGroupLinks: {
         columns: { minOverride: true, maxOverride: true },
         with: {
@@ -371,9 +429,12 @@ async function priceLines(tx: ScopedTx, input: CreateOrderInput): Promise<Priced
 
   return input.items.map((line) => {
     const item = byId.get(line.menuItemId)
-    // `isActive: false` is a retired dish: still referenced by old orders, not
-    // orderable, and absent from the menu the customer saw.
-    if (!item || !item.isActive) throw new UnknownMenuItemError(line.menuItemId)
+    // Three ways to not be on sale, one answer. `isActive: false` is a retired dish —
+    // still referenced by old orders, absent from the menu the customer saw. A dish on
+    // a different menu is last winter's, whatever its own flag says.
+    if (!item || !item.isActive || item.category.menuId !== activeMenuId) {
+      throw new UnknownMenuItemError(line.menuItemId)
+    }
     if (item.is86d) throw new ItemUnavailableError(item.id, item.name)
 
     // Only the groups this dish actually offers, with the limits this dish enforces.

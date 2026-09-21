@@ -3,12 +3,13 @@ import { desc, eq, inArray } from 'drizzle-orm'
 import {
   createOrder, OrderRejectedError,
   InvalidOrderInputError, ItemUnavailableError, LocationClosedError, LocationInactiveError,
-  ModifierSelectionError, OptionUnavailableError, UnknownMenuItemError, UnknownModifierOptionError,
+  MenuUnavailableError, ModifierSelectionError, OptionUnavailableError,
+  UnknownMenuItemError, UnknownModifierOptionError,
   type CreateOrderInput,
 } from './create-order'
 import { buildMenuSnapshot } from './snapshot'
 import {
-  menuItems, modifierOptions, itemModifierGroups, menuSnapshots,
+  menus, menuCategories, menuItems, modifierOptions, itemModifierGroups, menuSnapshots,
   orders, orderItems, orderItemModifiers, orderEvents, orderPauses,
 } from '@/db/schema'
 import type { MenuSnapshotPayload } from '@/db/schema'
@@ -134,6 +135,11 @@ describe('createOrder — the happy path', () => {
     expect(order.status).toBe('PENDING_PAYMENT')
     expect(order.paymentStatus).toBe('REQUIRES_PAYMENT')
     expect(order.stripePaymentIntentId).toBeNull()
+    // No promise is made while the customer is still on the payment form: a quote
+    // issued now would have an unknown amount of itself already spent by the time the
+    // kitchen sees the ticket. **Task 9 must set `quotedReadyAt` on the
+    // PENDING_PAYMENT → NEW transition**, or a card order never gets a ready time.
+    expect(order.quotedReadyAt).toBeNull()
   })
 
   it('starts a pay-at-pickup order at NEW / PAY_ON_PICKUP', async () => {
@@ -283,6 +289,58 @@ describe('createOrder — the pinned menu', () => {
     const result = await createOrder(planOrder(loc))
     const { order } = await readOrder(loc.id, result.orderId)
     expect(order.menuSnapshotId).toBe(newest.id)
+  })
+})
+
+/**
+ * The order has to be priced from the same universe the snapshot pins: the
+ * location's one active menu. `menu_items.isActive` alone does not say that — a whole
+ * menu can be switched off with every item on it still flagged active.
+ */
+describe('createOrder — the menu it prices from', () => {
+  it('refuses to sell off a deactivated menu, even with a snapshot already on file', async () => {
+    const loc = await openRestaurant()
+    // The stale snapshot is the point: without this the order would land, pinned to
+    // a payload that does not contain the dish it charged for.
+    await buildMenuSnapshot(loc.id)
+    await withLocation(loc.id, (tx) => tx.update(menus)
+      .set({ isActive: false }).where(eq(menus.id, loc.menu.id)))
+
+    await expect(createOrder(planOrder(loc))).rejects.toThrow(MenuUnavailableError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('refuses to guess when the location has two active menus', async () => {
+    const loc = await openRestaurant()
+    await buildMenuSnapshot(loc.id)
+    // buildMenuSnapshot refuses this state outright; the order path must refuse it
+    // too rather than quietly falling back on the last good snapshot.
+    await withLocation(loc.id, (tx) => tx.insert(menus)
+      .values({ locationId: loc.id, name: 'Late Night', isActive: true }))
+
+    await expect(createOrder(planOrder(loc))).rejects.toThrow(MenuUnavailableError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('refuses an item that lives on a menu other than the active one', async () => {
+    const loc = await openRestaurant()
+    // Last winter's menu, switched off, its dishes still flagged active. They are
+    // not on sale and they are not in the snapshot — so they are not orderable.
+    const offMenuItemId = await withLocation(loc.id, async (tx) => {
+      const [old] = await tx.insert(menus)
+        .values({ locationId: loc.id, name: 'Last Winter', isActive: false }).returning()
+      const [category] = await tx.insert(menuCategories)
+        .values({ menuId: old.id, name: 'Mains', sort: 1 }).returning()
+      const [dish] = await tx.insert(menuItems)
+        .values({ categoryId: category.id, name: 'Goat Curry', basePriceCents: 2400, sort: 1 }).returning()
+      return dish.id
+    })
+
+    await expect(createOrder(planOrder(loc, {
+      items: [{ menuItemId: offMenuItemId, qty: 1, modifierOptionIds: [] }],
+    }))).rejects.toThrow(UnknownMenuItemError)
+    // And the active menu still sells, priced the same as ever.
+    await expect(createOrder(planOrder(loc))).resolves.toMatchObject({ totalCents: TOTAL })
   })
 })
 
@@ -446,6 +504,22 @@ describe('createOrder — server-side validation', () => {
     // One INSERT per line, inside the open transaction.
     await expect(createOrder(planOrder(loc, { items: Array.from({ length: 101 }, () => ({ ...line, qty: 1 })) })))
       .rejects.toThrow(InvalidOrderInputError)
+  })
+
+  it('refuses an id that is not a uuid, before it queries anything', async () => {
+    const loc = await openRestaurant()
+    // A junk id reaching the query is a 22P02 that poisons the whole transaction and
+    // surfaces as a 500 — on the public write path, triggered by whatever a client
+    // puts in the body. Shape is checked with everything else in the request.
+    await expect(createOrder(planOrder(loc, { locationId: 'not-a-uuid' })))
+      .rejects.toThrow(InvalidOrderInputError)
+    await expect(createOrder(planOrder(loc, {
+      items: [{ menuItemId: 'butter-chicken', qty: 1, modifierOptionIds: [] }],
+    }))).rejects.toThrow(InvalidOrderInputError)
+    await expect(createOrder(planOrder(loc, {
+      items: [{ menuItemId: item(loc, 'Butter Chicken').id, qty: 1, modifierOptionIds: ['hot'] }],
+    }))).rejects.toThrow(InvalidOrderInputError)
+    expect(await orderCount(loc.id)).toBe(0)
   })
 
   it('rejects with a coded, named error the HTTP layer can map', async () => {

@@ -94,6 +94,16 @@ export async function closeScopedPool(): Promise<void> {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
+ * Shared with anything that takes an id from outside and puts it in a query.
+ * Postgres raises 22P02 on a malformed uuid, which inside a transaction poisons
+ * every statement after it — so the check belongs in front of the query, not around
+ * it. `createOrder` uses this on every id in a request body.
+ */
+export function isUuid(value: string): boolean {
+  return UUID.test(value)
+}
+
+/**
  * Runs `fn` inside one transaction scoped to a single location.
  *
  * `set_config('app.location_id', $1, true)` is `SET LOCAL` with a bind parameter —
@@ -109,7 +119,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 export async function withLocation<T>(locationId: string, fn: (tx: ScopedTx) => Promise<T>): Promise<T> {
   // The policies cast the GUC to uuid, so anything else would fail deep inside an
   // unrelated query with a 22P02. Fail here, naming the argument.
-  if (!UUID.test(locationId)) throw new Error(`withLocation: not a location id: ${JSON.stringify(locationId)}`)
+  if (!isUuid(locationId)) throw new Error(`withLocation: not a location id: ${JSON.stringify(locationId)}`)
   // Cached, so it is one extra round trip per process, not per transaction. Cleared
   // on failure so a transient connection error does not poison every later call.
   _roleCheck ??= assertUnprivilegedRole().catch((err) => { _roleCheck = null; throw err })

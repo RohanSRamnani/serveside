@@ -31,7 +31,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
-  same transaction that writes the order. Money is `src/lib/money.ts`: integer cents,
+  same transaction that writes the order, and only from the location's **one active
+  menu** — the universe `buildMenuSnapshot` roots at, so nothing can be sold that the
+  pinned snapshot could not contain. Zero or two active menus rejects the order rather
+  than falling back on the last good snapshot. Every id from the request is shape-checked
+  as a uuid first: a malformed one is 22P02, which poisons the transaction. Money is `src/lib/money.ts`: integer cents,
   tax rounded **half-up, never banker's**, and `subtotal + tax + tip + fee − discount
   = total` asserted on the row itself immediately before the INSERT. Customer-facing
   rejections are the `OrderRejectedError` family, each with a `code` for the HTTP layer;
