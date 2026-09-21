@@ -18,7 +18,8 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
-  17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`). `isOpenAt`
+  17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a
+  `close_time > open_time` CHECK enforces — a wrapped row would close the day. `isOpenAt`
   reads wall-clock times in `locations.timezone` — never the server's — treats
   `close_time` as exclusive, and reports **paused > holiday > closed_hours**.
 
@@ -45,6 +46,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **neon-http has no transactions**: `db().transaction()` throws at runtime. Make a
   multi-row write atomic with one statement plus a constraint (the version race in
   `src/domain/snapshot.ts`), or `db().batch([...])`.
+- A migration that adds a CHECK validates rows already on the `test` branch, and
+  nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
+  migration. Delete the offending rows, then migrate.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`) —
   import them; don't re-inline a seeder per test file. Slugs must stay unique: nothing
   tears the test branch down, and `Date.now()` alone collides.
