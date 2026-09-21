@@ -126,12 +126,41 @@ async function claimRows(externalId: string) {
   return db().select().from(webhookEvents).where(eq(webhookEvents.externalId, externalId))
 }
 
+
+/**
+ * An order in the state a completed flip leaves behind: NEW, PAID, holding its intent,
+ * with the `payment_succeeded` audit row the webhook writes alongside the flip.
+ *
+ * `flippedHoursAgo` back-dates that row, which is the only clock the re-fire window
+ * has — `order_events` is append-only (a trigger enforces it), so the age has to be
+ * written at insert time rather than updated afterwards. `null` leaves no audit row at
+ * all: an order flipped by something that is not this handler.
+ */
+async function alreadyFlipped(locationId: string, flippedHoursAgo: number | null) {
+  const { order } = await seedCardOrder(locationId)
+  await withLocation(locationId, async (tx) => {
+    await tx.update(orders)
+      .set({ status: 'NEW', paymentStatus: 'PAID', quotedReadyAt: new Date() })
+      .where(eq(orders.id, order.id))
+    if (flippedHoursAgo !== null) {
+      await tx.insert(orderEvents).values({
+        orderId: order.id,
+        type: 'payment_succeeded',
+        actor: 'stripe',
+        at: new Date(Date.now() - flippedHoursAgo * 3_600_000),
+      })
+    }
+  })
+  return order
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   // The default for every test but the bad-signature one: the body parses and the
   // signature is good, so `constructEvent` hands back what was posted.
   constructEvent.mockImplementation((payload: string) => JSON.parse(payload))
-  sendOrderCreated.mockResolvedValue(undefined)
+  // The real one answers with the ids Inngest accepted; the re-fire path logs them.
+  sendOrderCreated.mockResolvedValue(['01JEVENTID'])
 })
 
 describe('POST /api/stripe/webhook', () => {
@@ -353,6 +382,69 @@ describe('POST /api/stripe/webhook', () => {
     // audit row. The re-fire announces, it does not re-do.
     expect(await readOrder(loc.id, order.id)).toEqual(flipped)
     expect(await countEvents(loc.id, order.id)).toBe(eventsAfterFlip)
+  })
+
+  it('does not re-fire for an order that is NEW and holds this intent but has been refunded', async () => {
+    // **The conjunct that stops a refund being re-served.** A refunded order is still
+    // NEW and still holds the intent that paid for it, so every other check in the
+    // re-fire branch passes — `paymentStatus` is the only thing standing between a
+    // refunded order and a ticket going back on a kitchen printer.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 1)
+    await withLocation(loc.id, (tx) =>
+      tx.update(orders).set({ paymentStatus: 'REFUNDED' }).where(eq(orders.id, order.id)))
+    sendOrderCreated.mockClear()
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('still re-fires hours after the flip, while the dedupe window is open', async () => {
+    // The positive control for the pair below: same seeding, same delivery, and the
+    // only difference between re-firing and not is how old the flip is.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 2)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(sendOrderCreated).toHaveBeenCalledWith(order.id, loc.id)
+  })
+
+  it('does not re-fire once the flip is older than the fan-out dedupe window', async () => {
+    // Inngest deduplicates an event id for 24 hours; Stripe retries a 5xx for three
+    // days, and in a printer-only shop an order sits at NEW indefinitely. So a day-three
+    // retry would find NEW + PAID + the same intent and — without this bound — re-run
+    // the fan-out for real and text the owner about an order they served yesterday.
+    // The print leg would still refuse a second ticket; the SMS leg has no such guard.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 30)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('does not re-fire a flip that left no audit row, because it was not ours', async () => {
+    // The re-fire reads the flip's own `payment_succeeded` event for its age, and the
+    // absence of one is a provenance signal rather than a missing timestamp: this
+    // handler always writes that row, so an order that is NEW and paid without one was
+    // put there by something else — a migration, a repair script, a future admin action.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, null)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
   })
 
   it('does not re-fire for a paid order that is past NEW', async () => {

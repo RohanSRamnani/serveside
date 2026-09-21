@@ -1,5 +1,5 @@
 import type Stripe from 'stripe'
-import { eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { locations, orders, orderEvents, webhookEvents } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
@@ -140,6 +140,22 @@ async function release(externalId: string): Promise<void> {
 type FlipOutcome = 'flipped' | 're-fired' | 'nothing-to-do'
 
 /**
+ * How long a flip stays re-announceable, and the number is **Inngest's event-id dedupe
+ * window**, not a guess.
+ *
+ * Inside it, a re-fire is free either way: it rescues a fan-out that never happened, or
+ * it is dropped as a duplicate of one that did. Outside it the dedupe has expired, so a
+ * re-fire genuinely runs again — the print leg still refuses to queue a second ticket,
+ * but the owner gets a second text about an order they served yesterday.
+ *
+ * That window is reachable in ordinary operation, which is why this is a bound and not
+ * a comment: Stripe retries a 5xx for up to three days, and in a printer-only shop an
+ * order sits at NEW indefinitely, so a day-three retry would find NEW + PAID + the same
+ * intent and re-text on the strength of it.
+ */
+const RE_FIRE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
  * PENDING_PAYMENT → NEW, paymentStatus → PAID, and a promised ready time — one
  * transaction, three facts that are really one: the kitchen owns this order now.
  *
@@ -247,11 +263,31 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
       // Without both, this would print a second ticket on every retry.
       if (order.status === 'NEW' && order.paymentStatus === 'PAID'
         && order.stripePaymentIntentId === intent.id) {
+        // `paymentStatus` is a conjunct in its own right: a refunded order is still NEW
+        // and still holds this intent, and putting its ticket back on a printer is
+        // sending out food that has been paid back.
+        //
+        // The flip's own audit row is the clock — the order row records no flip time
+        // (`quotedReadyAt` is a promise, not an event) — and its absence is a provenance
+        // signal too: no `payment_succeeded` row means this flip was not ours to re-announce.
+        const [flip] = await tx.select({ at: orderEvents.at }).from(orderEvents)
+          .where(and(eq(orderEvents.orderId, order.id), eq(orderEvents.type, 'payment_succeeded')))
+          .orderBy(desc(orderEvents.at)).limit(1)
+        const age = flip ? paidAt.getTime() - flip.at.getTime() : Infinity
+
+        if (age < RE_FIRE_WINDOW_MS) {
+          console.warn(
+            '[stripe webhook] order', orderId, 'was already flipped for intent', intent.id,
+            `${Math.round(age / 1000)}s ago — re-announcing it in case the first fan-out never landed`,
+          )
+          return 're-fired'
+        }
         console.warn(
-          '[stripe webhook] order', orderId, 'was already flipped for intent', intent.id,
-          '— re-firing the fan-out in case the first one never landed',
+          '[stripe webhook] order', orderId, 'was flipped for intent', intent.id,
+          flip ? `${Math.round(age / 3_600_000)}h ago` : 'by something that left no payment_succeeded event',
+          '— too late to re-announce: past the dedupe window this would text the owner again',
         )
-        return 're-fired'
+        return 'nothing-to-do'
       }
       console.warn('[stripe webhook] order', orderId, 'is', order.status, '— nothing to flip')
       return 'nothing-to-do'
@@ -301,5 +337,13 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
   // It throws on failure, which is what makes the handler above release its claim and
   // answer 5xx: a fan-out that did not happen has to be retried, and the retry lands
   // on the `re-fired` branch.
-  await sendOrderCreated(orderId, locationId)
+  const eventIds = await sendOrderCreated(orderId, locationId)
+
+  // Logged **after** the send and only on the re-fire path, because "re-firing" on its
+  // own is a sentence about an intention. Inngest does not report whether it kept the
+  // event or dropped it as a duplicate, so the ids are the honest artefact: they are
+  // what an operator searches the dashboard with to find out which of the two happened.
+  if (outcome === 're-fired') {
+    console.warn('[stripe webhook] re-announced order', orderId, 'to inngest as', eventIds)
+  }
 }

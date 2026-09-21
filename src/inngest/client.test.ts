@@ -58,6 +58,16 @@ describe('sendOrderCreated', () => {
     expect(ids[2]).not.toBe(ids[0])
   })
 
+  it('hands back the event ids Inngest accepted', async () => {
+    // The only handle anyone gets on what actually happened: the API does not say
+    // whether it kept the event or dropped it as a duplicate, so the webhook logs these
+    // on the re-fire path and an operator searches the dashboard with them.
+    send.mockResolvedValueOnce({ ids: ['01JEVENT1'] })
+    await expect(
+      sendOrderCreated('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'),
+    ).resolves.toEqual(['01JEVENT1'])
+  })
+
   it('throws when the send fails rather than reporting a fan-out that never happened', async () => {
     send.mockRejectedValueOnce(new Error('inngest is down'))
     await expect(

@@ -92,13 +92,17 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   client are read *outside* the verification `try`, because caught by it a blank
   `STRIPE_WEBHOOK_SECRET` would answer every real payment `400 invalid_signature` and
   silently flip nothing.
-- **One "already done" state is not done: NEW + PAID + holding *this* intent.** That is
-  the fingerprint of a flip we made whose fan-out never landed — the fan-out runs after
-  the commit, so a crash or a 500 in between loses it — and the webhook **re-fires
-  `sendOrderCreated`** rather than shrugging, or every later delivery finds a legal
-  state and nobody is ever told. All three conjuncts are required: a pay-at-pickup order
-  is NEW and paid too, and a CANCELED one must never be re-announced to a kitchen. Safe
-  only because the fan-out is idempotent per order (see the fan-out rule below).
+- **One "already done" state is not done: NEW + PAID + holding *this* intent, flipped
+  within 24h.** That is the fingerprint of a flip we made whose fan-out never landed —
+  the fan-out runs after the commit, so a crash or a 500 in between loses it — and the
+  webhook **re-fires `sendOrderCreated`** rather than shrugging, or every later delivery
+  finds a legal state and nobody is ever told. Every conjunct earns its place: a
+  pay-at-pickup order is NEW and paid too, a CANCELED one must never be re-announced,
+  and a REFUNDED one is still NEW and still holds its intent. The 24h bound is Inngest's
+  dedupe window — inside it a re-fire is free (rescue, or silently dropped), outside it
+  the SMS leg would text the owner about yesterday's order, and Stripe retries for three
+  days. Age comes from the flip's own `payment_succeeded` event; no such row means the
+  flip was not ours, so it is not re-announced.
 - **A signed event proves Stripe sent it, not whose money it is.** Every restaurant on
   the platform has a connected account and can mint an intent with any metadata, so
   the flip additionally requires `event.account === location.stripeAccountId` and
@@ -243,9 +247,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   can land during the next test (hence per-test phone numbers in
   `order-created.test.ts`). And it re-executes steps whose results have not reached its
   shared state, so step call *counts* are not pinnable; assert side effects and
-  arguments. A mocked step that throws is **not** delivered to the function body, so
-  the "a leg exhausted its retries" path cannot be driven at all — `fanOutFailure` is
-  exported and unit-tested for that reason.
+  arguments. A mocked step that throws is **not** delivered to the function body, so the
+  "a leg exhausted its retries" path cannot be driven through the harness at all — hence
+  `fanOut(data, step)` is exported and called directly with a two-line fake `step`,
+  which is also the only crisp way to race the print leg against itself.
 - **Route handlers are tested by importing and calling them**, not through a server:
   `const { POST } = await import('./webhook/route')`, then `POST(new Request(...))`.
   They take a Web `Request` and return a Web `Response`, with nothing imported from

@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
 import { InngestTestEngine } from '@inngest/test'
+import type { GetStepTools } from 'inngest'
+import { inngest as inngestClient } from '@/inngest/client'
 import { printJobs } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { ordersRepo } from '@/repo/orders-repo'
@@ -36,7 +38,7 @@ vi.mock('@/domain/ticket', async (importOriginal) => {
 })
 
 const { renderTicket } = await import('@/domain/ticket')
-const { orderCreated, fanOutFailure } = await import('./order-created')
+const { orderCreated, fanOut: fanOutHandler } = await import('./order-created')
 
 /** Pinned so the expected SMS body is a literal, not a restatement of the code. */
 const FEED_URL = 'https://serveside.test/feed'
@@ -257,41 +259,86 @@ describe('orderCreated fan-out', () => {
 })
 
 /**
- * The branch that turns two settled legs into a failed run.
+ * The fan-out called directly, with a `step` of our own making.
  *
- * Tested directly because it cannot be reached through the harness: `@inngest/test`
- * reports a run as failed the moment a step errors and never resumes the function
- * body, while production resumes it once a step's retries are exhausted — which is
- * the only path that reaches this. Deleting the `throw` it feeds therefore survives
- * every test above, and is called out in the task report rather than left to be
- * discovered.
+ * This is the only way to reach two things at all. `@inngest/test@1.0.0` reports a run
+ * as failed the moment a step errors and never resumes the function body, and a mocked
+ * failed step is swallowed rather than delivered — so the throw that turns a broken leg
+ * into a failed run, and the value the function returns, are both invisible to the
+ * tests above. A fake `step` is two lines and reaches both.
+ *
+ * It is also the crisper place to race the print leg against itself: no harness in the
+ * middle re-issuing steps of its own accord.
  */
-describe('fanOutFailure', () => {
-  const ok = { status: 'fulfilled', value: undefined } as const
-  const broke = (why: string) => ({ status: 'rejected', reason: new Error(why) }) as const
+describe('fanOut, driven directly', () => {
+  /** A `step` that simply runs the work, except for the leg named as broken. */
+  function step(broken?: 'queue-print-job' | 'sms-owner', reason: unknown = new Error('leg is down')) {
+    return {
+      run: (id: string, fn: () => Promise<unknown>) => (id === broken ? Promise.reject(reason) : fn()),
+    } as unknown as GetStepTools<typeof inngestClient>
+  }
 
-  it('says nothing when both legs landed', () => {
-    expect(fanOutFailure('order-1', ok, ok)).toBeNull()
+  it('returns the queued ticket when both legs land', async () => {
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+
+    const result = await fanOutHandler({ orderId: order.id, locationId: loc.id }, step())
+
+    const [job] = await jobsFor(loc.id, order.id)
+    expect(result).toEqual({ orderId: order.id, printJobId: job.id, alreadyQueued: false })
   })
 
-  it('names the leg that failed, and the order it belonged to', () => {
-    expect(fanOutFailure('order-1', ok, broke('twilio is down')))
-      .toBe('order order-1 fan-out incomplete — sms-owner: twilio is down')
-    expect(fanOutFailure('order-1', broke('db is down'), ok))
-      .toBe('order order-1 fan-out incomplete — queue-print-job: db is down')
+  it('fails the run when the SMS leg is dead, having queued the ticket anyway', async () => {
+    // The assertion the survived mutation was hiding: delete the throw and this
+    // resolves instead of rejecting, so a fan-out that half happened reports success.
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+
+    await expect(fanOutHandler({ orderId: order.id, locationId: loc.id }, step('sms-owner', new Error('twilio is down'))))
+      .rejects.toThrow(`order ${order.id} fan-out incomplete — sms-owner: twilio is down`)
+
+    expect(await jobsFor(loc.id, order.id)).toHaveLength(1)
   })
 
-  it('names both when both failed, rather than reporting only the first', () => {
-    // "The fan-out failed" is not an actionable sentence at 7pm on a Friday. Which
-    // half reached a human is the first thing anyone needs to know.
-    expect(fanOutFailure('order-1', broke('db is down'), broke('twilio is down')))
-      .toBe('order order-1 fan-out incomplete — queue-print-job: db is down; sms-owner: twilio is down')
+  it('fails the run when the print leg is dead, having texted the owner anyway', async () => {
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+
+    await expect(fanOutHandler({ orderId: order.id, locationId: loc.id }, step('queue-print-job', new Error('db is down'))))
+      .rejects.toThrow(`order ${order.id} fan-out incomplete — queue-print-job: db is down`)
+
+    expect(await jobsFor(loc.id, order.id)).toHaveLength(0)
+    expect(textsTo(loc.phoneE164)).toHaveLength(1)
   })
 
-  it('survives a rejection that is not an Error', () => {
-    // A `throw 'string'` from a dependency must not turn a failure report into
-    // `[object Object]` or a second exception on the way out.
-    expect(fanOutFailure('order-1', { status: 'rejected', reason: 'plain string' }, ok))
-      .toContain('queue-print-job: plain string')
+  it('names both legs when both broke, and survives a rejection that is not an Error', async () => {
+    // "The fan-out failed" is not an actionable sentence at 7pm on a Friday: which half
+    // reached a human is the first thing anyone needs to know. And a `throw 'string'`
+    // from a dependency must not turn the report into `[object Object]`.
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+    sendSms.mockRejectedValue('twilio said no')
+
+    await expect(fanOutHandler({ orderId: order.id, locationId: loc.id }, step('queue-print-job', 'db said no')))
+      .rejects.toThrow(`order ${order.id} fan-out incomplete — queue-print-job: db said no; sms-owner: twilio said no`)
+  })
+
+  it('queues one ticket when two fan-outs of the same order run at the same time', async () => {
+    // **The race the advisory lock exists for**, run for real rather than argued about.
+    // Two runs in flight at once is not exotic: Inngest is at-least-once, so a redelivery
+    // can land on top of a run that has not finished, and the check-then-insert in the
+    // print leg is two statements that READ COMMITTED will happily interleave.
+    //
+    // Sequential fan-outs cannot show this — the first row is committed before the
+    // second one looks — which is why they are concurrent here.
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+
+    await Promise.all([
+      fanOutHandler({ orderId: order.id, locationId: loc.id }, step()),
+      fanOutHandler({ orderId: order.id, locationId: loc.id }, step()),
+    ])
+
+    expect(await jobsFor(loc.id, order.id)).toHaveLength(1)
   })
 })

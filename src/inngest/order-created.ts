@@ -1,4 +1,4 @@
-import { NonRetriableError } from 'inngest'
+import { NonRetriableError, type GetStepTools } from 'inngest'
 import { eq, sql } from 'drizzle-orm'
 import { locations, printJobs } from '@/db/schema'
 import { withLocation, isUuid, type ScopedTx } from '@/repo/scoped'
@@ -31,41 +31,56 @@ import { inngest, ORDER_CREATED, type OrderCreatedData } from './client'
  * reports success is a failed print job nobody is ever told about; a red run is what
  * an alert hangs off (Task 14) and what a human goes and looks at.
  *
+ * That throw costs nothing but visibility, and the installed SDK is where that is
+ * checked rather than assumed. `node_modules/inngest/components/StepError.d.ts`: a
+ * `StepError` "represents a step exhausting all retries and failing… thrown by an
+ * Inngest step if it fails" — so the body really is resumed with the failure, which is
+ * the only path that reaches the throw. And
+ * `node_modules/inngest/components/execution/engine.js` (~1464) replays a memoized
+ * failure as `setActualHandler(() => Promise.reject(stepError))` — the callback is
+ * **not** re-run. So the function-level retries this throw provokes re-run the body
+ * only: no second text, no second ticket, just a run that ends red.
+ *
  * What the two legs *do* share is the order row: neither a ticket nor a text can be
  * produced without it. An unreadable order therefore fails both, which is not a
  * coupling but a prerequisite — there is nothing to tell anyone.
  */
 export const orderCreated = inngest.createFunction(
   { id: 'order-created-fan-out', name: 'Order fan-out', triggers: { event: ORDER_CREATED } },
-  async ({ event, step }) => {
-    const { orderId, locationId } = fanOutTarget(event.data)
-
-    const [print, sms] = await Promise.allSettled([
-      step.run('queue-print-job', () => queuePrintJob(orderId, locationId)),
-      step.run('sms-owner', () => smsOwner(orderId, locationId)),
-    ])
-
-    const incomplete = fanOutFailure(orderId, print, sms)
-    if (incomplete) throw new Error(incomplete)
-
-    // Narrowing: `fanOutFailure` returning null means neither leg rejected, but the
-    // compiler cannot know that, so the check is repeated here rather than cast away.
-    return print.status === 'fulfilled' ? { orderId, ...print.value } : { orderId }
-  },
+  ({ event, step }) => fanOut(event.data, step),
 )
 
 /**
- * Which legs failed, as one line — or `null` when the fan-out is whole.
+ * The fan-out itself, one step-tool short of being an Inngest function.
  *
- * **Exported only so it can be tested, and that is worth saying out loud.** The
- * branch that calls it is unreachable from `@inngest/test@1.0.0`: the harness reports
- * a run as failed the moment a step errors and never resumes the function body, so
- * the path where a permanently-failed step surfaces *into* the body — which is what
- * production does once a step's retries are exhausted — cannot be driven from a test.
- * Extracting the decision leaves one untestable line (`if (incomplete) throw`) instead
- * of eight.
+ * Split out from `createFunction` so it can be called with a `step` of the test's own
+ * making. That is not a convenience: `@inngest/test@1.0.0` reports a run as failed the
+ * moment a step errors and never resumes the function body, and a *mocked* failed step
+ * is swallowed rather than delivered — so through the harness alone, neither the throw
+ * below nor this function's return value can be reached at all. A two-line fake `step`
+ * reaches both.
  */
-export function fanOutFailure(
+export async function fanOut(
+  data: unknown,
+  step: GetStepTools<typeof inngest>,
+): Promise<{ orderId: string; printJobId?: string; alreadyQueued?: boolean }> {
+  const { orderId, locationId } = fanOutTarget(data)
+
+  const [print, sms] = await Promise.allSettled([
+    step.run('queue-print-job', () => queuePrintJob(orderId, locationId)),
+    step.run('sms-owner', () => smsOwner(orderId, locationId)),
+  ])
+
+  const incomplete = fanOutFailure(orderId, print, sms)
+  if (incomplete) throw new Error(incomplete)
+
+  // Narrowing: `fanOutFailure` returning null means neither leg rejected, but the
+  // compiler cannot know that, so the check is repeated here rather than cast away.
+  return print.status === 'fulfilled' ? { orderId, ...print.value } : { orderId }
+}
+
+/** Which legs failed, as one line — or `null` when the fan-out is whole. */
+function fanOutFailure(
   orderId: string,
   print: PromiseSettledResult<unknown>,
   sms: PromiseSettledResult<unknown>,

@@ -44,11 +44,18 @@ export type OrderCreatedData = { orderId: string; locationId: string }
  * and answers 5xx when this rejects, which is what makes Stripe retry a fan-out that
  * never happened. A silent failure here is an order that is paid, flipped, and that
  * no kitchen ever hears about.
+ *
+ * Returns the event ids Inngest accepted. The API does **not** say whether an event
+ * was deduplicated — a dropped duplicate and a fresh run look identical from here — so
+ * the ids are the only handle an operator has: they are what you search the Inngest
+ * dashboard with to find out which of the two happened. The re-fire path logs them for
+ * exactly that reason.
  */
-export async function sendOrderCreated(orderId: string, locationId: string): Promise<void> {
-  await inngest.send({
+export async function sendOrderCreated(orderId: string, locationId: string): Promise<string[]> {
+  const { ids } = await inngest.send({
     name: ORDER_CREATED,
     data: { orderId, locationId } satisfies OrderCreatedData,
     id: `order-created-${orderId}`,
   })
+  return ids
 }
