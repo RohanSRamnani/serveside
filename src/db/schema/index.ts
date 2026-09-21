@@ -3,3 +3,4 @@
 // here as it lands; `db()` and drizzle-kit both read the schema through this file.
 export * from './tenancy'
 export * from './menu'
+export * from './snapshots'

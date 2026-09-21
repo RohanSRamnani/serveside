@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, integer, bigint, boolean, timestamp, time, primaryKey } from 'drizzle-orm/pg-core'
+import { relations } from 'drizzle-orm'
 import { locations } from './tenancy'
 
 // Declared first: menuCategories carries an FK to it.
@@ -70,3 +71,34 @@ export const itemModifierGroups = pgTable('item_modifier_groups', {
   minOverride: integer('min_override'),
   maxOverride: integer('max_override'),
 }, (t) => [primaryKey({ columns: [t.itemId, t.groupId] })])
+
+// Relations exist for one reason: buildMenuSnapshot walks menu → categories →
+// items → group links → groups → options in a single relational query. Both
+// sides of every edge are declared — drizzle cannot infer a `many` without the
+// matching `one`. Add more only when a query needs them.
+export const menusRelations = relations(menus, ({ many }) => ({
+  categories: many(menuCategories),
+}))
+
+export const menuCategoriesRelations = relations(menuCategories, ({ one, many }) => ({
+  menu: one(menus, { fields: [menuCategories.menuId], references: [menus.id] }),
+  items: many(menuItems),
+}))
+
+export const menuItemsRelations = relations(menuItems, ({ one, many }) => ({
+  category: one(menuCategories, { fields: [menuItems.categoryId], references: [menuCategories.id] }),
+  modifierGroupLinks: many(itemModifierGroups),
+}))
+
+export const itemModifierGroupsRelations = relations(itemModifierGroups, ({ one }) => ({
+  item: one(menuItems, { fields: [itemModifierGroups.itemId], references: [menuItems.id] }),
+  group: one(modifierGroups, { fields: [itemModifierGroups.groupId], references: [modifierGroups.id] }),
+}))
+
+export const modifierGroupsRelations = relations(modifierGroups, ({ many }) => ({
+  options: many(modifierOptions),
+}))
+
+export const modifierOptionsRelations = relations(modifierOptions, ({ one }) => ({
+  group: one(modifierGroups, { fields: [modifierOptions.groupId], references: [modifierGroups.id] }),
+}))

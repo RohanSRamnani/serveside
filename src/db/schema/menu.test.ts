@@ -1,15 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { db } from '@/db/client'
-import { organizations, locations, menus, menuCategories, menuItems, modifierGroups, modifierOptions, itemModifierGroups, availabilityWindows } from '@/db/schema'
-
-async function seedLocation() {
-  const [org] = await db().insert(organizations).values({ name: 'M', slug: `m-${Date.now()}` }).returning()
-  const [loc] = await db().insert(locations).values({
-    orgId: org.id, name: 'Main', slug: 'main', address: 'x', timezone: 'America/New_York',
-    phoneE164: '+15550000002', taxRateBps: 875,
-  }).returning()
-  return loc
-}
+import { menus, menuCategories, menuItems, modifierGroups, modifierOptions, itemModifierGroups, availabilityWindows } from '@/db/schema'
+import { seedLocation } from '@/test/seed'
 
 describe('menu schema', () => {
   it('models items with a reusable location-scoped modifier group', async () => {

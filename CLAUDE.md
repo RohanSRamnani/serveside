@@ -14,6 +14,8 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **Menus, hours and orders scope to `location_id`, not `org_id`.** Every domain
   table carries one. One missing WHERE clause must not leak another restaurant's orders.
 - **Order rows snapshot names and prices.** Never join a historical order to a live menu item.
+- **`menu_snapshots` is insert-only.** Never update or delete a row. `version` is
+  `(location_id, version)`-unique and computed inside the INSERT — see `src/domain/snapshot.ts`.
 
 ## Commands
 
@@ -35,3 +37,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `@types/node` stays on `^22` (Node 22, and vitest 5 peer-requires it). The Next
   template's `^20` fails the install.
 - `next dev` rewrites the marker block in `AGENTS.md`. Commit the change, don't fight it.
+- **neon-http has no transactions**: `db().transaction()` throws at runtime. Make a
+  multi-row write atomic with one statement plus a constraint (the version race in
+  `src/domain/snapshot.ts`), or `db().batch([...])`.
+- Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`) —
+  import them; don't re-inline a seeder per test file. Slugs must stay unique: nothing
+  tears the test branch down, and `Date.now()` alone collides.
