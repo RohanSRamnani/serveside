@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import { isOpenAt } from './hours'
-import { db } from '@/db/client'
 import { businessHours, holidayClosures, orderPauses } from '@/db/schema'
 import { seedLocation } from '@/test/seed'
+import { withLocation } from '@/repo/scoped'
 import { errorChainText } from '@/test/errors'
+
+// business_hours, holiday_closures and order_pauses went under RLS in 0009 — one
+// restaurant inserting an order_pause against another is a revenue denial-of-service,
+// not a privacy question. So every write here is scoped, and `isOpenAt` scopes its
+// own reads. A bare db() write is refused (42501), not silently misfiled.
 
 // Every instant is written as its UTC equivalent, never as a local-looking string:
 // `new Date('2026-09-22T18:00')` would mean 18:00 on whatever machine ran the test,
@@ -22,10 +27,10 @@ const TUE_16_00_EST = new Date('2027-01-19T21:00:00Z')
 
 /** Tue (dow 2) split service: lunch 11:30–15:00, dinner 17:00–22:00. */
 async function seedTuesdaySplitService(locationId: string) {
-  await db().insert(businessHours).values([
+  await withLocation(locationId, (tx) => tx.insert(businessHours).values([
     { locationId, dow: 2, openTime: '11:30:00', closeTime: '15:00:00' },
     { locationId, dow: 2, openTime: '17:00:00', closeTime: '22:00:00' },
-  ])
+  ]))
 }
 
 describe('isOpenAt', () => {
@@ -44,12 +49,11 @@ describe('isOpenAt', () => {
   it('is paused while an order pause is live, even mid-service', async () => {
     const loc = await seedLocation()
     await seedTuesdaySplitService(loc.id)
-    await db().insert(orderPauses).values({
-      locationId: loc.id,
-      until: new Date(TUE_18_00_ET.getTime() + 60 * 60_000),
-      reason: 'slammed',
-      createdBy: 'user_owner',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(orderPauses).values({
+        locationId: loc.id,
+        until: new Date(TUE_18_00_ET.getTime() + 60 * 60_000),
+        reason: 'slammed',
+        createdBy: 'user_owner',  }))
     expect(await isOpenAt(loc.id, TUE_18_00_ET)).toEqual({ open: false, reason: 'paused' })
   })
 
@@ -58,11 +62,10 @@ describe('isOpenAt', () => {
     await seedTuesdaySplitService(loc.id)
     // Auto-resume is the whole point of `until`: a stale row must not keep a
     // location dark forever.
-    await db().insert(orderPauses).values({
-      locationId: loc.id,
-      until: new Date(TUE_18_00_ET.getTime() - 60_000),
-      reason: 'slammed',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(orderPauses).values({
+        locationId: loc.id,
+        until: new Date(TUE_18_00_ET.getTime() - 60_000),
+        reason: 'slammed',  }))
     expect(await isOpenAt(loc.id, TUE_18_00_ET)).toEqual({ open: true })
   })
 
@@ -78,24 +81,22 @@ describe('isOpenAt', () => {
   it('is closed for a holiday that falls inside posted hours', async () => {
     const loc = await seedLocation()
     await seedTuesdaySplitService(loc.id)
-    await db().insert(holidayClosures).values({
-      locationId: loc.id,
-      startsAt: new Date('2026-09-22T04:00:00Z'), // local midnight
-      endsAt: new Date('2026-09-23T04:00:00Z'),
-      reason: 'Staff party',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(holidayClosures).values({
+        locationId: loc.id,
+        startsAt: new Date('2026-09-22T04:00:00Z'), // local midnight
+        endsAt: new Date('2026-09-23T04:00:00Z'),
+        reason: 'Staff party',  }))
     expect(await isOpenAt(loc.id, TUE_18_00_ET)).toEqual({ open: false, reason: 'holiday' })
   })
 
   it('ends a closure exclusively, so the next service opens on time', async () => {
     const loc = await seedLocation()
     await seedTuesdaySplitService(loc.id)
-    await db().insert(holidayClosures).values({
-      locationId: loc.id,
-      startsAt: new Date('2026-09-22T04:00:00Z'),
-      endsAt: TUE_17_00_ET, // reopening for dinner
-      reason: 'Morning deep clean',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(holidayClosures).values({
+        locationId: loc.id,
+        startsAt: new Date('2026-09-22T04:00:00Z'),
+        endsAt: TUE_17_00_ET, // reopening for dinner
+        reason: 'Morning deep clean',  }))
     expect(await isOpenAt(loc.id, TUE_16_00_ET)).toEqual({ open: false, reason: 'holiday' })
     expect(await isOpenAt(loc.id, TUE_17_00_ET)).toEqual({ open: true })
   })
@@ -103,20 +104,18 @@ describe('isOpenAt', () => {
   it('reports paused over holiday over closed_hours when all three apply', async () => {
     const loc = await seedLocation()
     await seedTuesdaySplitService(loc.id)
-    await db().insert(holidayClosures).values({
-      locationId: loc.id,
-      startsAt: new Date('2026-09-22T04:00:00Z'),
-      endsAt: new Date('2026-09-23T04:00:00Z'),
-      reason: 'Staff party',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(holidayClosures).values({
+        locationId: loc.id,
+        startsAt: new Date('2026-09-22T04:00:00Z'),
+        endsAt: new Date('2026-09-23T04:00:00Z'),
+        reason: 'Staff party',  }))
     // TUE_16_00_ET is already outside hours and already inside the closure.
     expect(await isOpenAt(loc.id, TUE_16_00_ET)).toEqual({ open: false, reason: 'holiday' })
 
-    await db().insert(orderPauses).values({
-      locationId: loc.id,
-      until: new Date(TUE_16_00_ET.getTime() + 60 * 60_000),
-      reason: 'slammed',
-    })
+    await withLocation(loc.id, (tx) => tx.insert(orderPauses).values({
+        locationId: loc.id,
+        until: new Date(TUE_16_00_ET.getTime() + 60 * 60_000),
+        reason: 'slammed',  }))
     expect(await isOpenAt(loc.id, TUE_16_00_ET)).toEqual({ open: false, reason: 'paused' })
   })
 
@@ -143,10 +142,10 @@ describe('isOpenAt', () => {
   it('serves past midnight when the shift is stored as two rows', async () => {
     const loc = await seedLocation()
     // The documented way to post a 17:00–02:00 shift: it must not wrap within a row.
-    await db().insert(businessHours).values([
+    await withLocation(loc.id, (tx) => tx.insert(businessHours).values([
       { locationId: loc.id, dow: 2, openTime: '17:00:00', closeTime: '24:00:00' },
       { locationId: loc.id, dow: 3, openTime: '00:00:00', closeTime: '02:00:00' },
-    ])
+    ]))
     expect(await isOpenAt(loc.id, TUE_23_30_ET)).toEqual({ open: true })
     expect(await isOpenAt(loc.id, WED_01_00_ET)).toEqual({ open: true })
   })
@@ -156,11 +155,10 @@ describe('isOpenAt', () => {
     const busy = await seedLocation()
     await seedTuesdaySplitService(paused.id)
     await seedTuesdaySplitService(busy.id)
-    await db().insert(orderPauses).values({
-      locationId: paused.id,
-      until: new Date(TUE_18_00_ET.getTime() + 60 * 60_000),
-      reason: 'slammed',
-    })
+    await withLocation(paused.id, (tx) => tx.insert(orderPauses).values({
+        locationId: paused.id,
+        until: new Date(TUE_18_00_ET.getTime() + 60 * 60_000),
+        reason: 'slammed',  }))
     // One restaurant hitting pause must never close the one next door.
     expect(await isOpenAt(paused.id, TUE_18_00_ET)).toEqual({ open: false, reason: 'paused' })
     expect(await isOpenAt(busy.id, TUE_18_00_ET)).toEqual({ open: true })
@@ -172,17 +170,17 @@ describe('isOpenAt', () => {
     // post a dinner service and close the restaurant for the entire day instead,
     // silently. The database has to be the one that says no — this is data entry,
     // not arithmetic, so no amount of care in isOpenAt can prevent it.
-    const err = await db().insert(businessHours)
-      .values({ locationId: loc.id, dow: 2, openTime: '22:00:00', closeTime: '02:00:00' })
+    const err = await withLocation(loc.id, (tx) => tx.insert(businessHours)
+      .values({ locationId: loc.id, dow: 2, openTime: '22:00:00', closeTime: '02:00:00' }))
       .then(() => null, (e: unknown) => e)
     expect(err).not.toBeNull()
     expect(errorChainText(err)).toMatch(/business_hours_no_midnight_wrap/)
 
     // The documented alternative must stay legal, 24:00:00 boundary included.
-    await expect(db().insert(businessHours).values([
+    await expect(withLocation(loc.id, (tx) => tx.insert(businessHours).values([
       { locationId: loc.id, dow: 2, openTime: '22:00:00', closeTime: '24:00:00' },
       { locationId: loc.id, dow: 3, openTime: '00:00:00', closeTime: '02:00:00' },
-    ])).resolves.toBeDefined()
+    ]))).resolves.toBeDefined()
   })
 
   it('is closed when no hours are posted at all', async () => {

@@ -1,6 +1,7 @@
 import { and, eq, gt, lte } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { businessHours, holidayClosures, locations, orderPauses } from '@/db/schema'
+import { withLocation, type ScopedTx } from '@/repo/scoped'
 
 export type ClosedReason = 'closed_hours' | 'holiday' | 'paused'
 export type OpenState = { open: boolean; reason?: ClosedReason }
@@ -23,8 +24,16 @@ const DOW_BY_WEEKDAY: Record<string, number> = {
  * Everything is evaluated in `locations.timezone`. The server's own clock zone
  * is never consulted: `at` is an instant, and the weekly grid is wall-clock
  * local time, so the only correct bridge between them is the location's zone.
+ *
+ * All three hours tables are under RLS as of `drizzle/0009_...`, so the reads run
+ * scoped. Pass a `tx` to answer inside a caller's transaction — Task 8's checkout
+ * wants "are you open" and "write the order" to see one consistent database.
+ * Without one it opens its own scope, so the original two-argument call still works.
+ *
+ * `locations` itself is not under RLS and is read through `db()`: there is nothing
+ * to scope to until we know the location exists.
  */
-export async function isOpenAt(locationId: string, at: Date): Promise<OpenState> {
+export async function isOpenAt(locationId: string, at: Date, tx?: ScopedTx): Promise<OpenState> {
   const location = await db().query.locations.findFirst({
     where: eq(locations.id, locationId),
     columns: { timezone: true },
@@ -33,7 +42,24 @@ export async function isOpenAt(locationId: string, at: Date): Promise<OpenState>
   // "closed" would hide it behind a plausible-looking result.
   if (!location) throw new Error(`Unknown location ${locationId}`)
 
-  const [pause] = await db().select({ id: orderPauses.id }).from(orderPauses)
+  const local = localWallClock(at, location.timezone)
+  if (!tx) return withLocation(locationId, (scoped) => readState(scoped, locationId, at, local))
+  return readState(tx, locationId, at, local)
+}
+
+/**
+ * The three scoped reads, in precedence order. The `location_id` predicates are
+ * kept even though RLS already supplies them: this function is the one place the
+ * scope and the argument could disagree, and a row from the wrong location is a
+ * restaurant told it is closed when it is open.
+ */
+async function readState(
+  tx: ScopedTx,
+  locationId: string,
+  at: Date,
+  local: { dow: number; time: string },
+): Promise<OpenState> {
+  const [pause] = await tx.select({ id: orderPauses.id }).from(orderPauses)
     .where(and(
       eq(orderPauses.locationId, locationId),
       // `until > at` alone decides it — an expired row is history, not a switch.
@@ -42,7 +68,7 @@ export async function isOpenAt(locationId: string, at: Date): Promise<OpenState>
     .limit(1)
   if (pause) return { open: false, reason: 'paused' }
 
-  const [closure] = await db().select({ id: holidayClosures.id }).from(holidayClosures)
+  const [closure] = await tx.select({ id: holidayClosures.id }).from(holidayClosures)
     .where(and(
       eq(holidayClosures.locationId, locationId),
       lte(holidayClosures.startsAt, at),
@@ -51,8 +77,7 @@ export async function isOpenAt(locationId: string, at: Date): Promise<OpenState>
     .limit(1)
   if (closure) return { open: false, reason: 'holiday' }
 
-  const local = localWallClock(at, location.timezone)
-  const [service] = await db().select({ id: businessHours.id }).from(businessHours)
+  const [service] = await tx.select({ id: businessHours.id }).from(businessHours)
     .where(and(
       eq(businessHours.locationId, locationId),
       eq(businessHours.dow, local.dow),

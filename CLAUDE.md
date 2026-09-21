@@ -30,9 +30,16 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction that `SET LOCAL`s `app.location_id`, which the policies in
   `drizzle/0008_rls_tenancy.sql` read. Repos (`ordersRepo`, `menuRepo`) therefore
   carry **no** `location_id` filter of their own; writing one back would hide the
-  day RLS stops working. Unscoped means *no rows*, never all rows. The leak test
-  `src/repo/rls.test.ts` is the proof and must never be weakened — including its
-  first case, which asserts the connection cannot bypass RLS.
+  day RLS stops working. Unscoped means *no rows*, never all rows. `withLocation`
+  refuses to open a scope at all if `DATABASE_URL` connects as a role that bypasses
+  RLS — the failure is otherwise silent. The leak test `src/repo/rls.test.ts` is the
+  proof and must never be weakened: one case asserts the **exact** set of
+  RLS-enabled tables, so a new table fails there by name until it is policied or
+  consciously exempted.
+- **A new table under RLS needs three things, not one**: `.enableRLS()` in the
+  drizzle schema (or `push` would disable the policy — see Commands), `CREATE POLICY`
+  and an explicit `GRANT` in its migration (`app_user` has no default privileges),
+  and its name added to the catalog assertion in `rls.test.ts`.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
   17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a
@@ -58,6 +65,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   migration: `npx drizzle-kit generate --custom --name=<what>`, fill the file, migrate
   as above. `generate` afterwards must still say "No schema changes". Write them
   idempotently (`DROP POLICY IF EXISTS`, `IF NOT EXISTS`): Neon branches get reset.
+- **Never `drizzle-kit push`.** It diffs the live database against the schema and
+  "corrects" anything the schema does not model — which is every policy, grant,
+  trigger and role in this repo. `generate` + `migrate`, always.
 
 ## Gotchas
 
@@ -71,9 +81,12 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `next dev` rewrites the marker block in `AGENTS.md`. Commit the change, don't fight it.
 - **Two drivers, and the choice is not stylistic.** `db()` is neon-http: stateless,
   no session, no transactions (`db().transaction()` throws), so it can never carry
-  the RLS scope — it is for `organizations`, `locations`, `memberships` and the
-  hours tables only. `withLocation` is neon-serverless over a websocket Pool. Node 22
-  supplies the global `WebSocket`, so `ws` is not a dependency.
+  the RLS scope — it is for `organizations`, `locations` and `memberships` only.
+  `withLocation` is neon-serverless over a websocket Pool. Node 22 supplies the
+  global `WebSocket`, so `ws` is not a dependency.
+- `buildMenuSnapshot(locationId, tx?)` and `isOpenAt(locationId, at, tx?)` open
+  their own scope when given no `tx`, so a checkout can run both plus its writes in
+  one transaction and see one consistent database.
 - A failed statement poisons its whole transaction (25P02), so a retry inside
   `withLocation` must wrap the attempt in `tx.transaction()` — a SAVEPOINT — as the
   snapshot version race does. Retrying in place only turns one error into another.
@@ -81,10 +94,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction on that pooled backend has set it. Policies use
   `nullif(current_setting(...), '')::uuid` for that reason; the bare cast raises
   22P02 on every unscoped query instead of quietly matching nothing.
-- **Still owner-only, on purpose**: `organizations`, `locations`, `memberships` (the
-  tenancy root — nothing to scope to until a location exists) and `business_hours`,
-  `holiday_closures`, `order_pauses` have no RLS. A new location-scoped table needs
-  its own policy; it inherits the grant but never a policy.
+- **Exempt from RLS, on purpose and only these three**: `organizations`, `locations`,
+  `memberships` — the tenancy root, with nothing to scope to until a location exists.
+  `memberships` is the one worth revisiting; it maps Clerk user ids to orgs.
 - A migration that adds a CHECK validates rows already on the `test` branch, and
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.

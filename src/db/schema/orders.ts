@@ -121,7 +121,7 @@ export const orders = pgTable('orders', {
     ${t.subtotalCents} >= 0 AND ${t.taxCents} >= 0 AND ${t.tipCents} >= 0
     AND ${t.deliveryFeeCents} >= 0 AND ${t.discountCents} >= 0 AND ${t.totalCents} >= 0
   `),
-])
+]).enableRLS()
 
 /**
  * One line of the order, with the menu item's name and price **copied in**.
@@ -151,7 +151,7 @@ export const orderItems = pgTable('order_items', {
   // printed ticket and a charge.
   check('order_items_qty_positive', sql`${t.qty} > 0`),
   check('order_items_money_non_negative', sql`${t.unitPriceCents} >= 0 AND ${t.lineTotalCents} >= 0`),
-])
+]).enableRLS()
 
 /**
  * The modifiers chosen on one line — "Hot", "+ Extra Paneer" — again with the name
@@ -172,7 +172,7 @@ export const orderItemModifiers = pgTable('order_item_modifiers', {
   modifierOptionId: uuid('modifier_option_id').notNull().references(() => modifierOptions.id),
   nameSnapshot: text('name_snapshot').notNull(),
   priceDeltaCents: bigint('price_delta_cents', { mode: 'number' }).notNull(),
-}, (t) => [primaryKey({ columns: [t.orderItemId, t.modifierOptionId] })])
+}, (t) => [primaryKey({ columns: [t.orderItemId, t.modifierOptionId] })]).enableRLS()
 
 /** What an `order_events.payload` holds. Shape is per `type`; `status_changed` carries `{ from, to }`. */
 export type OrderEventPayload = Record<string, unknown>
@@ -199,7 +199,7 @@ export const orderEvents = pgTable('order_events', {
   actor: text('actor').notNull(),
   payload: jsonb('payload').$type<OrderEventPayload>().notNull().default({}),
   at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
-})
+}).enableRLS()
 
 export type Order = typeof orders.$inferSelect
 export type NewOrder = typeof orders.$inferInsert

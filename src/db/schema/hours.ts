@@ -30,7 +30,7 @@ export const businessHours = pgTable('business_hours', {
 }, (t) => [
   // Strict `>`: a zero-length range is as unorderable as a wrapped one.
   check('business_hours_no_midnight_wrap', sql`${t.closeTime} > ${t.openTime}`),
-])
+]).enableRLS()
 
 /**
  * Dated overrides of the weekly grid — Thanksgiving, a private event, a flood.
@@ -45,7 +45,7 @@ export const holidayClosures = pgTable('holiday_closures', {
   endsAt: timestamp('ends_at', { withTimezone: true }).notNull(),
   /** Nullable: worth showing the customer when it exists, never worth blocking on. */
   reason: text('reason'),
-})
+}).enableRLS()
 
 /**
  * The "we're slammed, stop taking orders" button, with auto-resume.
@@ -63,7 +63,7 @@ export const orderPauses = pgTable('order_pauses', {
   /** Clerk user id, as in `memberships.userId`. Null = paused by the system. */
   createdBy: text('created_by'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-})
+}).enableRLS()
 
 export type BusinessHours = typeof businessHours.$inferSelect
 export type HolidayClosure = typeof holidayClosures.$inferSelect

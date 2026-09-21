@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { eq, sql } from 'drizzle-orm'
-import { db } from '@/db/client'
-import { withLocation } from './scoped'
+import { withLocation, scopedPool } from './scoped'
 import { ordersRepo } from './orders-repo'
 import { menuRepo } from './menu-repo'
 import { menus, menuItems } from '@/db/schema'
@@ -14,15 +13,37 @@ describe('withLocation', () => {
     await expect(withLocation('not-a-uuid', async () => 1)).rejects.toThrow(/not a location id/)
   })
 
-  it('does not leak the scope into the next transaction on the same connection', async () => {
-    // SET LOCAL, not SET: the pool reuses backends, and a leftover GUC would hand
-    // the next caller the last caller's restaurant.
+  it('does not leak the scope into the next transaction on the same pooled backend', async () => {
+    // SET LOCAL, not SET — and this is the test that can tell the difference. Both
+    // transactions below run on the **same** websocket Pool. Reading through `db()`
+    // would prove nothing at all: neon-http is a different connection that could
+    // never have seen the GUC in the first place.
     const loc = await seedLocationWithMenu()
-    await withLocation(loc.id, async () => {})
-    const after = await db().execute(sql`select id from menus`)
-    expect(after.rows).toHaveLength(0)
+    const PROBE = `select pg_backend_pid() as pid,
+                          current_setting('app.location_id', true) as guc,
+                          (select count(*) from menus) as visible`
+
+    const scoped = (await withLocation(loc.id, (tx) => tx.execute(sql.raw(PROBE)))).rows[0] as Probe
+    expect(scoped.guc).toBe(loc.id)
+    expect(Number(scoped.visible)).toBeGreaterThan(0)
+
+    // Neon's pooled endpoint is PgBouncer in transaction mode, so the backend behind
+    // the socket can change between transactions — which is exactly the hazard worth
+    // testing, not a reason to skip it. Probe unscoped until we land back on the very
+    // backend that was scoped to `loc`, and assert on that one.
+    let reused: Probe | undefined
+    for (let attempt = 0; attempt < 20 && !reused; attempt++) {
+      const row = (await scopedPool().query(PROBE)).rows[0] as Probe
+      // Every unscoped probe must be blind, whichever backend answered it.
+      expect(row.guc ?? '').toBe('')
+      expect(Number(row.visible)).toBe(0)
+      if (row.pid === scoped.pid) reused = row
+    }
+    expect(reused, 'never landed back on the scoped backend, so reuse went untested').toBeDefined()
   })
 })
+
+type Probe = { pid: number; guc: string | null; visible: string }
 
 describe('ordersRepo', () => {
   it('writes an order and its lines in one transaction, and reads them back', async () => {

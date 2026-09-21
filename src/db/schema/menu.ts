@@ -9,14 +9,14 @@ export const availabilityWindows = pgTable('availability_windows', {
   dow: integer('dow').notNull(),
   startTime: time('start_time').notNull(),
   endTime: time('end_time').notNull(),
-})
+}).enableRLS()
 
 export const menus = pgTable('menus', {
   id: uuid('id').primaryKey().defaultRandom(),
   locationId: uuid('location_id').notNull().references(() => locations.id),
   name: text('name').notNull(),
   isActive: boolean('is_active').notNull().default(true),
-})
+}).enableRLS()
 
 export const menuCategories = pgTable('menu_categories', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -24,7 +24,7 @@ export const menuCategories = pgTable('menu_categories', {
   name: text('name').notNull(),
   sort: integer('sort').notNull().default(0),
   availabilityWindowId: uuid('availability_window_id').references(() => availabilityWindows.id),
-})
+}).enableRLS()
 
 export const menuItems = pgTable('menu_items', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -40,7 +40,7 @@ export const menuItems = pgTable('menu_items', {
   // 86: is86d is the switch, unsnoozeAt the "86 until tomorrow" expiry a nightly job clears.
   is86d: boolean('is_86d').notNull().default(false),
   unsnoozeAt: timestamp('unsnooze_at', { withTimezone: true }),
-})
+}).enableRLS()
 
 // Location-scoped, not item-scoped: one "Spice Level" group hangs off forty dishes.
 export const modifierGroups = pgTable('modifier_groups', {
@@ -50,7 +50,7 @@ export const modifierGroups = pgTable('modifier_groups', {
   minSelect: integer('min_select').notNull().default(0),
   maxSelect: integer('max_select').notNull().default(1),
   required: boolean('required').notNull().default(false),
-})
+}).enableRLS()
 
 export const modifierOptions = pgTable('modifier_options', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -61,7 +61,7 @@ export const modifierOptions = pgTable('modifier_options', {
   // Running out of a topping is as common as running out of a dish.
   is86d: boolean('is_86d').notNull().default(false),
   unsnoozeAt: timestamp('unsnooze_at', { withTimezone: true }),
-})
+}).enableRLS()
 
 export const itemModifierGroups = pgTable('item_modifier_groups', {
   itemId: uuid('item_id').notNull().references(() => menuItems.id),
@@ -70,7 +70,7 @@ export const itemModifierGroups = pgTable('item_modifier_groups', {
   // Null overrides mean "use the group's own min/max".
   minOverride: integer('min_override'),
   maxOverride: integer('max_override'),
-}, (t) => [primaryKey({ columns: [t.itemId, t.groupId] })])
+}, (t) => [primaryKey({ columns: [t.itemId, t.groupId] })]).enableRLS()
 
 // Relations exist for one reason: buildMenuSnapshot walks menu → categories →
 // items → group links → groups → options in a single relational query. Both

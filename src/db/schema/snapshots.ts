@@ -71,6 +71,6 @@ export const menuSnapshots = pgTable('menu_snapshots', {
   // "this order pins another restaurant's menu" unrepresentable rather than merely
   // unlikely; a plain FK to `id` would let it through. See `orders.ts`.
   unique('menu_snapshots_location_id_id_unq').on(t.locationId, t.id),
-])
+]).enableRLS()
 
 export type MenuSnapshot = typeof menuSnapshots.$inferSelect

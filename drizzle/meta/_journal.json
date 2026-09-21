@@ -64,6 +64,13 @@
       "when": 1789965909451,
       "tag": "0008_rls_tenancy",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789967235838,
+      "tag": "0009_rls_hours_and_enable_flags",
+      "breakpoints": true
     }
   ]
 }

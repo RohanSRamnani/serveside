@@ -33,6 +33,7 @@ export type ScopedTx = Parameters<Parameters<ScopedDb['transaction']>[0]>[0]
 
 let _pool: Pool | null = null
 let _db: ScopedDb | null = null
+let _roleCheck: Promise<void> | null = null
 
 function pool(): Pool {
   return (_pool ??= new Pool({ connectionString: env('DATABASE_URL') }))
@@ -42,11 +43,51 @@ function scopedDb(): ScopedDb {
   return (_db ??= drizzle(pool(), { schema }))
 }
 
+/**
+ * Every policy in `drizzle/0008_rls_tenancy.sql` is a no-op against a role that
+ * owns the tables, is a superuser, or has BYPASSRLS — and the failure is silent:
+ * nothing errors, every query simply returns every restaurant's rows. So the check
+ * happens here, once, the first time a scoped transaction opens.
+ *
+ * `scripts/create-app-user.mjs` makes the same assertion before it will write an
+ * env file. This is the one that catches the env file being edited afterwards.
+ */
+async function assertUnprivilegedRole(): Promise<void> {
+  const { rows: [row] } = await pool().query(`
+    SELECT current_user AS who,
+           (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS is_super,
+           (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user) AS bypasses_rls,
+           (SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = current_user) AS owns`)
+  const reasons: string[] = []
+  if (row.is_super) reasons.push('it is a superuser')
+  if (row.bypasses_rls) reasons.push('it has BYPASSRLS')
+  if (Number(row.owns) > 0) reasons.push(`it owns ${row.owns} tables in public (RLS does not bind a table's owner)`)
+  if (reasons.length === 0) return
+  throw new Error(
+    `DATABASE_URL connects as "${row.who}", which bypasses row-level security: ${reasons.join('; ')}. `
+    + 'Every tenancy policy is silently inert for this role. Point DATABASE_URL at app_user '
+    + '(npm run db:app-user) and keep the owner in MIGRATION_DATABASE_URL, which only drizzle-kit reads.',
+  )
+}
+
+/**
+ * The websocket pool `withLocation` runs on — for teardown, health checks, and the
+ * one test that has to prove `SET LOCAL` does not outlive its transaction, which can
+ * only be observed on the backend `withLocation` itself used.
+ *
+ * Not a query handle for application code. A raw query here carries no scope and so
+ * sees nothing; everything tenant-scoped goes through `withLocation`.
+ */
+export function scopedPool(): Pool {
+  return pool()
+}
+
 /** Releases the websocket pool. Tests call this in teardown; a server never does. */
 export async function closeScopedPool(): Promise<void> {
   const p = _pool
   _pool = null
   _db = null
+  _roleCheck = null
   if (p) await p.end()
 }
 
@@ -61,7 +102,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
  * dies with the transaction, so a pooled connection can never hand the next
  * caller the last caller's tenant.
  *
- * Every RLS policy in `drizzle/0007_rls_tenancy.sql` reads that GUC. A statement
+ * Every RLS policy in `drizzle/0008_rls_tenancy.sql` reads that GUC. A statement
  * outside this wrapper sees **no rows**, not all rows: `current_setting(...)`
  * returns NULL, and `location_id = NULL` is NULL, which is not true.
  */
@@ -69,6 +110,10 @@ export async function withLocation<T>(locationId: string, fn: (tx: ScopedTx) => 
   // The policies cast the GUC to uuid, so anything else would fail deep inside an
   // unrelated query with a 22P02. Fail here, naming the argument.
   if (!UUID.test(locationId)) throw new Error(`withLocation: not a location id: ${JSON.stringify(locationId)}`)
+  // Cached, so it is one extra round trip per process, not per transaction. Cleared
+  // on failure so a transient connection error does not poison every later call.
+  _roleCheck ??= assertUnprivilegedRole().catch((err) => { _roleCheck = null; throw err })
+  await _roleCheck
   return scopedDb().transaction(async (tx) => {
     await tx.execute(sql`select set_config('app.location_id', ${locationId}, true)`)
     return fn(tx)
