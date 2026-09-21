@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   roundHalfUp, taxCentsFor, unitPriceCentsFor, lineTotalCentsFor, totalCentsFor, assertTotalsBalance,
+  formatCents,
 } from './money'
 
 describe('roundHalfUp', () => {
@@ -153,5 +154,38 @@ describe('assertTotalsBalance', () => {
     expect(() => assertTotalsBalance({
       ...balanced, tipCents: -500, totalCents: 3850,
     })).toThrow(/negative/i)
+  })
+})
+
+describe('formatCents', () => {
+  it('writes the cents out as dollars without ever dividing by a hundred', () => {
+    expect(formatCents(7351)).toBe('73.51')
+    expect(formatCents(551)).toBe('5.51')
+    // Under a dollar, and exactly nothing: both need the leading zero the naive
+    // string slice would drop.
+    expect(formatCents(99)).toBe('0.99')
+    expect(formatCents(5)).toBe('0.05')
+    expect(formatCents(0)).toBe('0.00')
+  })
+
+  it('prints a discount as the negative it becomes on the ticket', () => {
+    // Stored positive and subtracted (`orders.ts`); the ticket is where it turns.
+    expect(formatCents(-250)).toBe('-2.50')
+    expect(formatCents(-5)).toBe('-0.05')
+  })
+
+  it('agrees with the float version everywhere the float version is right', () => {
+    // The point of not using `(c / 100).toFixed(2)` is not that it is usually wrong —
+    // it is that it asks binary floating point for a second opinion on an exact
+    // integer. This sweeps the range a restaurant order lives in and pins that the
+    // two never disagree, so the replacement is a strict improvement rather than a
+    // behaviour change nobody checked.
+    for (let cents = 0; cents <= 200_000; cents += 7) {
+      expect(formatCents(cents), `${cents} cents`).toBe((cents / 100).toFixed(2))
+    }
+  })
+
+  it('refuses a fractional cent rather than rounding one away', () => {
+    expect(() => formatCents(12.5)).toThrow(/whole/i)
   })
 })

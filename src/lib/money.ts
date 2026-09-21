@@ -144,6 +144,26 @@ export function assertTotalsBalance(totals: Totals): void {
   }
 }
 
+/**
+ * Cents as a string of dollars, for a printed ticket or an SMS — the one place
+ * dollars are allowed to exist, and still without a float in sight.
+ *
+ * `(cents / 100).toFixed(2)` is the obvious version and it is wrong in the way this
+ * file exists to prevent: it converts money to a binary fraction and rounds it back,
+ * so the arithmetic that produced an exact integer gets a second, lossy opinion on
+ * what it meant. Slicing the decimal string cannot round anything, because there is
+ * nothing to round — the value is already exact.
+ *
+ * No currency symbol: the ticket right-aligns these in a column, and a `$` that
+ * sometimes appears is a column that never lines up. Negatives print with a leading
+ * `-` (a discount is stored positive and printed negative).
+ */
+export function formatCents(cents: number): string {
+  assertWholeCents('cents', cents)
+  const digits = String(Math.abs(cents)).padStart(3, '0')
+  return `${cents < 0 ? '-' : ''}${digits.slice(0, -2)}.${digits.slice(-2)}`
+}
+
 function assertPartsAreCents(parts: TotalsParts): void {
   for (const key of PART_KEYS) {
     assertWholeCents(key, parts[key])

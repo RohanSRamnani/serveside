@@ -52,6 +52,18 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   proof and must never be weakened: one case asserts the **exact** set of
   RLS-enabled tables, so a new table fails there by name until it is policied or
   consciously exempted.
+- **There is exactly one way around RLS, and it is `printer_lookup`** — a
+  SECURITY DEFINER function (`drizzle/0012_printer_lookup.sql`) that turns a printer
+  serial into `(printer_id, location_id)` and nothing else. It exists because a Star
+  CloudPRNT printer can only present the MAC burnt into it, and the location that
+  would scope a read of `printers` is the very thing being looked up. Safe because
+  the serial *is* the credential, it returns only ids (no row, no enumeration), an
+  unknown serial returns zero rows so nothing can register itself, and everything
+  after it is ordinary `withLocation` code. Its `search_path` is pinned, EXECUTE is
+  revoked from PUBLIC, and `rls.test.ts` asserts it is still the *only* such
+  function — a second bypass has to be argued for there, by name. Its mechanism is
+  that the owner is not bound by RLS, so **never add `FORCE ROW LEVEL SECURITY` to
+  `printers`**: every kitchen would stop printing, silently.
 - **A new table under RLS needs three things, not one**: `.enableRLS()` in the
   drizzle schema (or `push` would disable the policy — see Commands), `CREATE POLICY`
   and an explicit `GRANT` in its migration (`app_user` has no default privileges),
@@ -92,6 +104,26 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `paymentStatus = 'PAID'`, and `quotedReadyAt = <flip time> + location.prepTimeMinutes`.
   The clock starts when the money lands, not at checkout — a promise made while the
   customer is still typing a card number has an unknown amount of it already spent.
+- **The kitchen printer polls us, and the serial is the whole of its identity.**
+  `/api/printers/cloudprnt` is unauthenticated by protocol — a thermal printer has no
+  session to hold. POST is the poll and the heartbeat; GET hands over the payload and
+  marks `delivered`; DELETE with `code=OK` marks `confirmed`. **All three carry the
+  MAC** (Star sends it on the query string too), because that is what makes a
+  `jobToken` redeemable only in the context that was offered it — a token from another
+  restaurant is a 404 with an empty body, never a 403. An unknown serial is answered
+  `jobReady: false` and **writes nothing**: auto-registration would let anyone who can
+  reach the URL claim a location and collect its tickets. A non-OK `code` leaves the
+  job at `delivered` rather than requeuing it — a jammed printer would otherwise fail
+  the same ticket forever and never reach the orders behind it.
+- **`renderTicket` (`src/domain/ticket.ts`) runs once, at fan-out, and its output is
+  stored verbatim** in `print_jobs.payload` — same reasoning as `orders.menu_snapshot_id`:
+  a reprint must reproduce the ticket that printed, not re-render against a menu that
+  has moved. 32 columns, hard: the printer drops a 33rd character rather than wrapping
+  it, so the renderer wraps everything itself and truncates nothing — otherwise a dish
+  loses the half of its name that said "no peanuts". Takes the location's
+  `timezone` because a ticket prints the restaurant's wall clock, never the server's,
+  and that column is not on the order row. `src/domain/ticket.test.ts` pins the exact
+  output — change the layout and you change the golden, deliberately.
 - **`business_hours` is many rows per day, and a row never wraps midnight.** Split
   service is the norm, so nothing may unique on `(location_id, dow)`; post a
   17:00–02:00 shift as two rows (`17:00–24:00` + next dow `00:00–02:00`), which a
@@ -158,8 +190,13 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - A migration that adds a CHECK validates rows already on the `test` branch, and
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.
+- `order_items` has **no sort column**, so the order a customer built their cart in is
+  not recoverable. `ordersRepo.getWithItems` sorts by name so a ticket at least reads
+  the same on every reprint; `gen_random_uuid()` order would reshuffle it. Add a `sort`
+  column and this should follow the cart.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
-  `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`) — import them; don't re-inline
+  `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`, `seedTicketOrder`,
+  `seedPrinter`, `seedPrintJob`) — import them; don't re-inline
   a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT / REQUIRES_PAYMENT
   order the Stripe webhook flips; `seedPaidOrder` is the one already at NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
   alone collides. `seedBusinessHours` defaults to `OPEN_ALL_WEEK`, which is what a test

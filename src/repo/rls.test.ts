@@ -71,6 +71,25 @@ describe('RLS tenancy', () => {
     ])
   })
 
+  it('has exactly one way around row security, and it is the printer lookup', async () => {
+    // A SECURITY DEFINER function runs as its owner, and this database's owner owns
+    // every table — so one of these is a hole straight through everything above.
+    // There is exactly one, `printer_lookup` (drizzle/0012), because a CloudPRNT
+    // printer can only present the MAC burnt into it and the location that would
+    // scope the lookup is the thing being looked up. The next one must be argued for
+    // here, by name, rather than appearing quietly in a migration.
+    const defs = await db().execute(sql`
+      select p.proname as name, coalesce(array_to_string(p.proconfig, ' '), '') as cfg
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.prosecdef
+      order by p.proname`)
+    const fns = defs.rows as { name: string; cfg: string }[]
+    expect(fns.map((f) => f.name)).toEqual(['printer_lookup'])
+    // And its search_path is pinned, or a role able to create objects could shadow
+    // `printers` with its own table and have the owner read that instead.
+    expect(fns[0].cfg).toMatch(/search_path=/)
+  })
+
   it('grants app_user nothing on tables that do not exist yet', async () => {
     // Backs the REVOKE in 0008: a table added later is unreadable until its migration
     // grants it, which is the moment someone has to think about its policy. Also

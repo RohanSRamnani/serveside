@@ -1,7 +1,16 @@
-import { asc, eq, gte } from 'drizzle-orm'
+import { asc, eq, gte, inArray } from 'drizzle-orm'
 import { orders, orderItems, orderItemModifiers } from '@/db/schema'
-import type { Order, NewOrder } from '@/db/schema'
+import type { Order, OrderItem, OrderItemModifier, NewOrder } from '@/db/schema'
 import type { ScopedTx } from './scoped'
+
+/**
+ * One order with everything printed on its ticket: the lines, and the modifiers
+ * chosen on each. Structural on purpose — `renderTicket`'s `OrderWithItems` is this
+ * plus the location's timezone, so a column added to either side stops compiling
+ * rather than quietly vanishing off a ticket.
+ */
+export type OrderLineWithModifiers = OrderItem & { modifiers: OrderItemModifier[] }
+export type OrderWithLines = Order & { items: OrderLineWithModifiers[] }
 
 /** One line of a new order, with its chosen modifiers. Ids are filled in by `insertOrder`. */
 export type NewOrderLine = Omit<typeof orderItems.$inferInsert, 'id' | 'orderId'> & {
@@ -64,6 +73,41 @@ export function ordersRepo(tx: ScopedTx) {
     /** The lines of one order. `order_items` has no sort column, so id is the stable order. */
     async itemsFor(orderId: string) {
       return tx.select().from(orderItems).where(eq(orderItems.orderId, orderId)).orderBy(asc(orderItems.id))
+    },
+
+    /**
+     * The whole order, ready to print: the row, its lines, and the modifiers on each.
+     * What the Inngest fan-out hands `renderTicket`, and the only read in here that
+     * is allowed to be three round trips — a ticket is printed once per order.
+     *
+     * **Ordered by name, not by id, and that is a compromise worth naming.**
+     * `order_items` carries neither a sort column nor a `created_at`, so the order
+     * the customer built their cart in is not recoverable from the database at all.
+     * Falling back on `id` would mean `gen_random_uuid()` decides what order a
+     * kitchen reads the dishes in, and shuffles it on a reprint. Alphabetical is at
+     * least the same every time and groups a repeated dish together. Give
+     * `order_items` a `sort` column and this should follow the cart.
+     */
+    async getWithItems(orderId: string): Promise<OrderWithLines | undefined> {
+      const [order] = await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1)
+      if (!order) return undefined
+
+      const lines = await tx.select().from(orderItems)
+        .where(eq(orderItems.orderId, orderId))
+        .orderBy(asc(orderItems.nameSnapshot), asc(orderItems.id))
+      if (lines.length === 0) return { ...order, items: [] }
+
+      const mods = await tx.select().from(orderItemModifiers)
+        .where(inArray(orderItemModifiers.orderItemId, lines.map((l) => l.id)))
+        .orderBy(asc(orderItemModifiers.nameSnapshot), asc(orderItemModifiers.modifierOptionId))
+
+      return {
+        ...order,
+        items: lines.map((line) => ({
+          ...line,
+          modifiers: mods.filter((m) => m.orderItemId === line.id),
+        })),
+      }
     },
   }
 }

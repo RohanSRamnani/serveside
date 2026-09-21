@@ -12,8 +12,9 @@ import { db } from '@/db/client'
 import {
   organizations, locations, menus, menuCategories, menuItems,
   modifierGroups, modifierOptions, itemModifierGroups, businessHours, orders, orderEvents,
+  printers, printJobs,
 } from '@/db/schema'
-import type { Location, Order, OrderItem } from '@/db/schema'
+import type { Location, Order, OrderItem, Printer, PrintJob } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { withLocation, type ScopedTx } from '@/repo/scoped'
 import { ordersRepo } from '@/repo/orders-repo'
@@ -183,6 +184,110 @@ async function seedOrder(locationId: string, over: OrderOverrides): Promise<Seed
 /** The order as the kitchen sees it: money taken, ticket owed. */
 export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
   return seedOrder(locationId, {})
+}
+
+/**
+ * A provisioned printer. `serial` is the unit's MAC address and is UNIQUE across
+ * the **platform**, so it has to be collision-proof the way slugs are — the `test`
+ * branch is never torn down, and a fixed MAC here passes once and 23505s forever
+ * after. Shaped like a MAC so a log line from a test reads like a log line from a
+ * kitchen.
+ */
+export async function seedPrinter(locationId: string, serial = macAddress()): Promise<Printer> {
+  return withLocation(locationId, async (tx) => {
+    const [printer] = await tx.insert(printers)
+      .values({ locationId, provider: 'star_cloudprnt', serial })
+      .returning()
+    return printer
+  })
+}
+
+/** A MAC in Star's OUI (`00:11:62`), unique per call. */
+export function macAddress(): string {
+  const tail = (Date.now() * 1000 + counter++).toString(16).padStart(12, '0').slice(-6)
+  return `00:11:62:${tail.slice(0, 2)}:${tail.slice(2, 4)}:${tail.slice(4, 6)}`
+}
+
+/** One ticket waiting to be collected. `payload` is already-rendered text — see `printJobs`. */
+export async function seedPrintJob(locationId: string, orderId: string, payload: string): Promise<PrintJob> {
+  return withLocation(locationId, async (tx) => {
+    const [job] = await tx.insert(printJobs).values({ locationId, orderId, payload }).returning()
+    return job
+  })
+}
+
+/** Fixed, so the golden's printed pickup time never moves with the clock. */
+export const TICKET_READY_AT = new Date('2026-09-21T23:45:00Z')
+
+/**
+ * The fully-loaded order the ticket golden pins: two lines, two modifiers and a
+ * line note on the first, an order note, and a pickup time that does not move.
+ *
+ * Its own add-on group rather than `seedLocationWithMenu`'s "Spice Level", because
+ * two modifiers off a `maxSelect: 1` group would print a ticket no kitchen could
+ * cook ("Mild" and "Hot" on one dish). Inserted directly, not through `createOrder`:
+ * this is the renderer under test, not the write path.
+ *
+ * Priced off the seeded menu, so nothing here is a magic number:
+ *   Butter Chicken 1800 + Hot 50 + Extra Paneer 250 = 2100/unit × 2 = 4200
+ *   Lamb Rogan Josh 2100 × 1                                       = 2100
+ *   subtotal 6300, tax 6300 × 875bps = 551.25 → 551 (half up), tip 500
+ *   total 7351
+ */
+export async function seedTicketOrder(locationId: string): Promise<Order> {
+  return withLocation(locationId, async (tx) => {
+    const snapshot = await buildMenuSnapshot(locationId, tx)
+    const [butterChicken] = await tx.select().from(menuItems).where(eq(menuItems.name, 'Butter Chicken'))
+    const [rogan] = await tx.select().from(menuItems).where(eq(menuItems.name, 'Lamb Rogan Josh'))
+    const [hot] = await tx.select().from(modifierOptions).where(eq(modifierOptions.name, 'Hot'))
+
+    const [addOns] = await tx.insert(modifierGroups).values({
+      locationId, name: 'Add-ons', minSelect: 0, maxSelect: 3, required: false,
+    }).returning()
+    const [paneer] = await tx.insert(modifierOptions).values({
+      groupId: addOns.id, name: 'Extra Paneer', priceDeltaCents: 250,
+    }).returning()
+    await tx.insert(itemModifierGroups).values({ itemId: butterChicken.id, groupId: addOns.id, sort: 2 })
+
+    const order = await ordersRepo(tx).insertOrder({
+      locationId,
+      shortCode: 'K7M2',
+      channel: 'web',
+      fulfillment: 'pickup',
+      contactName: 'Rohan R',
+      contactPhone: '+15551234567',
+      contactEmail: 'rohan@example.com',
+      quotedReadyAt: TICKET_READY_AT,
+      subtotalCents: 6300,
+      taxCents: 551,
+      tipCents: 500,
+      totalCents: 7351,
+      menuSnapshotId: snapshot.id,
+      notes: 'no cilantro',
+      status: 'NEW',
+      paymentStatus: 'PAID',
+    }, [{
+      menuItemId: butterChicken.id,
+      nameSnapshot: butterChicken.name,
+      qty: 2,
+      unitPriceCents: 2100,
+      lineTotalCents: 4200,
+      notes: 'extra crispy',
+      modifiers: [
+        { modifierOptionId: hot.id, nameSnapshot: hot.name, priceDeltaCents: hot.priceDeltaCents },
+        { modifierOptionId: paneer.id, nameSnapshot: paneer.name, priceDeltaCents: paneer.priceDeltaCents },
+      ],
+    }, {
+      menuItemId: rogan.id,
+      nameSnapshot: rogan.name,
+      qty: 1,
+      unitPriceCents: 2100,
+      lineTotalCents: 2100,
+    }])
+
+    await tx.insert(orderEvents).values({ orderId: order.id, type: 'created', actor: 'system' })
+    return order
+  })
 }
 
 /**

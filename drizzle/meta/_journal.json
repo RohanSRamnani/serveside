@@ -85,6 +85,13 @@
       "when": 1789970892770,
       "tag": "0011_platform_rls_and_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789974477185,
+      "tag": "0012_printer_lookup",
+      "breakpoints": true
     }
   ]
 }
