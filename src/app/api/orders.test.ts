@@ -323,6 +323,62 @@ describe('POST /api/orders', () => {
     expect(order.totalCents).toBe(2284)
   })
 
+  it('persists SMS marketing consent, with the moment it was given', async () => {
+    // Captured at checkout on day one (Plan 3 migrates it to a `customers` row), and
+    // the pair is the point: the boolean is what was agreed to, the timestamp is the
+    // evidence of when. Marketing only — the "your order is ready" text is
+    // transactional and needs no consent, so nothing in the fan-out reads either one.
+    const loc = await openRestaurant({ stripeAccountId: null })
+
+    const res = await post(cartFor(loc, { payment: 'pay_on_pickup', smsMarketingConsent: true }))
+    expect(res.status).toBe(200)
+
+    const order = await readOrder(loc.id, (await res.json()).orderId)
+    expect(order.smsMarketingConsent).toBe(true)
+    expect(order.consentAt).not.toBeNull()
+  })
+
+  it('defaults consent to false, and leaves consentAt null, when the box was not ticked', async () => {
+    const loc = await openRestaurant({ stripeAccountId: null })
+
+    // Both the explicit `false` a ticked-then-unticked checkbox posts and the absent
+    // field an older client sends. They must be the same row.
+    for (const body of [
+      cartFor(loc, { payment: 'pay_on_pickup', smsMarketingConsent: false }),
+      cartFor(loc, { payment: 'pay_on_pickup' }),
+    ]) {
+      const res = await post(body)
+      expect(res.status).toBe(200)
+      const order = await readOrder(loc.id, (await res.json()).orderId)
+      expect(order.smsMarketingConsent).toBe(false)
+      expect(order.consentAt).toBeNull()
+    }
+  })
+
+  it('answers 422 for a consent flag that is not a boolean', async () => {
+    // The structural guard's job: `'false'` is truthy, and a coercion here would opt a
+    // customer into marketing they declined. Refused at the boundary, with a code.
+    const loc = await openRestaurant({ stripeAccountId: null })
+    for (const bad of ['true', 'false', 'on', 1, null]) {
+      const res = await post(cartFor(loc, { payment: 'pay_on_pickup', smsMarketingConsent: bad }))
+      expect(res.status, JSON.stringify(bad)).toBe(422)
+      expect((await res.json()).error, JSON.stringify(bad)).toBe('invalid_input')
+    }
+  })
+
+  it('answers 422 for a phone that is not E.164', async () => {
+    // The web form normalises before it posts, so this is the guard for everything
+    // that is not the web form — and for a form that stops normalising.
+    const loc = await openRestaurant({ stripeAccountId: null })
+    for (const phone of ['5551234567', '(555) 123-4567', '+1']) {
+      const res = await post(cartFor(loc, {
+        payment: 'pay_on_pickup', contact: { name: 'Rohan R', phone },
+      }))
+      expect(res.status, phone).toBe(422)
+      expect((await res.json()).error, phone).toBe('invalid_input')
+    }
+  })
+
   it('answers 400 for a body that is not JSON at all', async () => {
     const res = await POST(new Request('https://serveside.test/api/orders', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json',

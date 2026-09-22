@@ -611,6 +611,47 @@ describe('createOrder — server-side validation', () => {
     expect(await orderCount(loc.id)).toBe(0)
   })
 
+  it('refuses a phone that is not E.164, whatever channel it arrived on', async () => {
+    const loc = await openRestaurant()
+    // The column is plain `text`, and everything downstream of it assumes E.164: the
+    // owner's SMS goes through `sendSms`, which refuses anything else *at send time* —
+    // by which point the order is committed, the kitchen has the ticket, and the
+    // customer is simply never texted. Checked here instead, where it is still a
+    // rejection the caller can act on.
+    //
+    // **Every channel, not just the web form.** The web form normalises before it
+    // posts, so on that path this is belt and braces; the voice and SMS agents call
+    // `createOrder` directly, and "(555) 123-4567" is exactly what a transcription
+    // hands back. One rule, applied to every writer, is the only version of this that
+    // cannot be routed around.
+    const notE164 = ['5551234567', '(555) 123-4567', '+1', '', '  ', '+0555123456', 'five five five']
+    for (const phone of notE164) {
+      await expect(
+        createOrder(planOrder(loc, { contact: { name: 'Rohan R', phone } })),
+        JSON.stringify(phone),
+      ).rejects.toThrow(InvalidOrderInputError)
+    }
+    for (const channel of ['voice', 'sms'] as const) {
+      await expect(createOrder(planOrder(loc, {
+        channel, contact: { name: 'Rohan R', phone: '5551234567' },
+      }))).rejects.toThrow(InvalidOrderInputError)
+    }
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('takes the E.164 numbers a real order arrives with', async () => {
+    const loc = await openRestaurant()
+    // The shape rule is not a US rule: a `+44` number is a legitimate E.164 value and
+    // must not be refused by a regex written around the one country we launch in.
+    for (const phone of ['+15551234567', '+442071234567']) {
+      const { orderId } = await createOrder(planOrder(loc, {
+        contact: { name: 'Rohan R', phone }, payment: 'pay_on_pickup',
+      }))
+      const { order } = await readOrder(loc.id, orderId)
+      expect(order.contactPhone).toBe(phone)
+    }
+  })
+
   it('writes nothing at all when one line of a multi-line order is rejected', async () => {
     const loc = await openRestaurant()
     await withLocation(loc.id, (tx) => tx.update(menuItems)
@@ -629,6 +670,67 @@ describe('createOrder — server-side validation', () => {
       expect(await tx.select().from(orderItems)).toHaveLength(0)
       expect(await tx.select().from(orderEvents)).toHaveLength(0)
     })
+  })
+})
+
+/**
+ * TCPA consent, captured at checkout and stored on the order row.
+ *
+ * The legal shape of this is not a preference, and it is why the two columns are
+ * separate: `sms_marketing_consent` is *what* was agreed to, and `consent_at` is the
+ * evidence of *when* — which is the half a regulator, or a plaintiff's lawyer, asks
+ * for. A boolean on its own cannot say whether consent was given today or inherited
+ * from a row written before the box existed.
+ *
+ * Marketing only. Transactional messages — "your order is ready" — need no consent
+ * and are not gated on this, which is why nothing in the fan-out reads it.
+ */
+describe('createOrder — SMS marketing consent', () => {
+  it('stamps both columns only when the box was actually ticked', async () => {
+    const loc = await openRestaurant()
+
+    const opted = await createOrder(planOrder(loc, {
+      payment: 'pay_on_pickup', smsMarketingConsent: true,
+    }))
+    const yes = (await readOrder(loc.id, opted.orderId)).order
+    expect(yes.smsMarketingConsent).toBe(true)
+    // The moment, not merely a non-null: this is the evidence half of the record.
+    expect(yes.consentAt).toBeInstanceOf(Date)
+    expect(Math.abs(yes.consentAt!.getTime() - yes.createdAt.getTime())).toBeLessThan(60_000)
+
+    const declined = await createOrder(planOrder(loc, {
+      payment: 'pay_on_pickup', smsMarketingConsent: false,
+    }))
+    const no = (await readOrder(loc.id, declined.orderId)).order
+    expect(no.smsMarketingConsent).toBe(false)
+    // **Null, not "some time".** A timestamp beside a false flag is a row that cannot
+    // be read as anything but consent, whatever the boolean says.
+    expect(no.consentAt).toBeNull()
+  })
+
+  it('defaults to no consent when the field is absent entirely', async () => {
+    // The voice and SMS agents predate this field and will keep posting without it.
+    // Absent must mean "did not consent" — never "unknown", and never true.
+    const loc = await openRestaurant()
+    const { orderId } = await createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))
+    const { order } = await readOrder(loc.id, orderId)
+    expect(order.smsMarketingConsent).toBe(false)
+    expect(order.consentAt).toBeNull()
+  })
+
+  it('refuses a consent flag that is not a boolean', async () => {
+    const loc = await openRestaurant()
+    // `'false'`, `0` and `'on'` are the three shapes a form serialiser actually
+    // produces, and two of them are truthy. Coerced rather than refused, the string
+    // `'false'` would opt a customer in to marketing they declined — which is the one
+    // bug in this file that is a legal problem rather than a support ticket.
+    for (const bad of ['true', 'false', 'on', 1, 0, null, {}]) {
+      await expect(
+        createOrder(planOrder(loc, { smsMarketingConsent: bad as unknown as boolean })),
+        JSON.stringify(bad),
+      ).rejects.toThrow(InvalidOrderInputError)
+    }
+    expect(await orderCount(loc.id)).toBe(0)
   })
 })
 

@@ -46,6 +46,19 @@ export type CreateOrderInput = {
   items: Array<{ menuItemId: string; qty: number; modifierOptionIds?: string[]; notes?: string }>
   tipCents: number
   payment: 'card' | 'pay_on_pickup'
+  /**
+   * **TCPA marketing opt-in, and only ever `true` because a customer ticked a box.**
+   *
+   * Optional and defaulting to false: the voice and SMS agents predate this field and
+   * will keep posting without it, and for consent "absent" must mean "did not
+   * consent" rather than "unknown". `assertInputShape` refuses anything that is not a
+   * boolean — including the string `'false'`, which is truthy and is exactly what a
+   * careless form serialiser produces.
+   *
+   * Marketing only. The order's own messages are transactional and are never gated on
+   * this.
+   */
+  smsMarketingConsent?: boolean
 }
 
 export type CreateOrderResult = {
@@ -197,6 +210,18 @@ export class ModifierSelectionError extends OrderRejectedError {
   }
 }
 
+/**
+ * E.164, as the standard writes it: a `+`, a country code whose first digit is not 0,
+ * and 7 to 15 digits in total.
+ *
+ * The lower bound is the one worth stating. `sendSms` uses `^\+[1-9]\d{1,14}$`, which
+ * accepts `+12` — a legal *shape* and not a number anyone can be reached on. This is
+ * the write path rather than the send path, so it is the place to be stricter: the
+ * shortest real E.164 numbers in service are 7 digits, so `+` and at least 7 digits it
+ * is. Anything shorter that reaches storage is a typo nobody can call back.
+ */
+const E164 = /^\+[1-9]\d{6,14}$/
+
 /** Pickup only, so there is no fee to compute. Named rather than inlined as a bare 0. */
 const PICKUP_DELIVERY_FEE_CENTS = 0
 /** Discounts land with promotions; the column exists and is always 0 for now. */
@@ -249,6 +274,17 @@ export async function createOrder(input: CreateOrderInput): Promise<CreateOrderR
       contactName: input.contact.name,
       contactPhone: input.contact.phone,
       contactEmail: input.contact.email ?? null,
+      /**
+       * `=== true`, not `??`: the shape check has already refused everything that is
+       * not a boolean, and this stays an identity test so that a future relaxation of
+       * that check cannot turn a truthy string into an opt-in here.
+       *
+       * The timestamp is `placedAt` — the order's one instant — rather than a second
+       * `new Date()`, so consent is stamped at the same moment the order is, and the
+       * two can never be read as having happened in the wrong sequence.
+       */
+      smsMarketingConsent: input.smsMarketingConsent === true,
+      consentAt: input.smsMarketingConsent === true ? placedAt : null,
       /**
        * Only for an order that is already the kitchen's problem. A card order sits
        * at PENDING_PAYMENT until Stripe confirms, and a promise made before the
@@ -348,6 +384,40 @@ function assertInputShape(input: CreateOrderInput): void {
   // chases a no-show pickup — so a blank one is not a valid order.
   if (input.contact.name.trim() === '') throw new InvalidOrderInputError('An order needs a contact name')
   if (input.contact.phone.trim() === '') throw new InvalidOrderInputError('An order needs a contact phone number')
+  /**
+   * **E.164 or nothing, on every channel.**
+   *
+   * `orders.contact_phone` is plain `text`, and everything downstream of it assumes
+   * E.164 — most sharply `sendSms`, which refuses any other shape *at send time*. By
+   * then the order is committed, the kitchen has the ticket, and the only symptom is
+   * a customer who is never texted. Checked here it is a rejection the caller can
+   * still act on.
+   *
+   * **Shape, not plausibility.** This says "a `+`, a country code that does not start
+   * with 0, 7 to 15 digits" — the standard's own grammar. It deliberately does not
+   * know that US area codes never start with 1, because that is a NANP rule and this
+   * column holds every country's numbers. Turning what a US customer *types* into
+   * this shape is the web form's job (`normalizePhone`); re-checking it here is what
+   * makes the rule hold for the voice and SMS agents too, which call `createOrder`
+   * directly with whatever a transcription handed back.
+   */
+  if (!E164.test(input.contact.phone)) {
+    throw new InvalidOrderInputError(
+      `Contact phone must be an E.164 number like +15551234567, got ${JSON.stringify(input.contact.phone)}`,
+    )
+  }
+  /**
+   * Consent is a boolean or it is absent. **Not coerced**, because the two shapes a
+   * form serialiser actually produces — the string `'false'` and the string `'on'` —
+   * are both truthy, and a coercion here opts a customer into marketing they
+   * declined. That is a legal problem rather than a support ticket, so it is a
+   * refusal.
+   */
+  if (input.smsMarketingConsent !== undefined && typeof input.smsMarketingConsent !== 'boolean') {
+    throw new InvalidOrderInputError(
+      `smsMarketingConsent must be a boolean when present, got ${JSON.stringify(input.smsMarketingConsent)}`,
+    )
+  }
   // Lower stakes than channel — `contact_email` is a nullable text column, so
   // there is no constraint for a wrong-typed value to violate — but still a value
   // the client fully controls reaching storage with no shape check at all today.

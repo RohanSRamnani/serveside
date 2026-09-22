@@ -51,6 +51,21 @@ export type CartLine = {
 
 export type Cart = {
   lines: CartLine[]
+  /**
+   * Has `localStorage` actually been read for this slug yet?
+   *
+   * **The difference between "no dishes" and "don't know yet", and checkout needs
+   * it.** The read happens in an effect, so the first paint of a page — server and
+   * client alike — legitimately has `lines: []` whatever is stored. The menu can
+   * ignore that: an empty cart bar for one frame says nothing. A checkout page
+   * cannot, because the thing it renders for an empty cart is "there is nothing in
+   * your order", and showing that to somebody who has just tapped Checkout tells
+   * them their dinner is gone and sends them back to the menu.
+   *
+   * It is `shouldPersist`'s own answer, published rather than recomputed — the same
+   * one question that decides whether a write is safe.
+   */
+  hydrated: boolean
   addLine: (line: CartLine) => void
   removeLine: (ix: number) => void
   setQty: (ix: number, qty: number) => void
@@ -304,8 +319,8 @@ export function CartProvider({ slug, children }: { slug: string; children: React
   const clear = useCallback(() => update(() => []), [update])
 
   const value = useMemo<Cart>(
-    () => ({ lines, addLine, removeLine, setQty, clear }),
-    [lines, addLine, removeLine, setQty, clear],
+    () => ({ lines, hydrated, addLine, removeLine, setQty, clear }),
+    [lines, hydrated, addLine, removeLine, setQty, clear],
   )
 
   return <CartContext.Provider value={value}>{children}</CartContext.Provider>

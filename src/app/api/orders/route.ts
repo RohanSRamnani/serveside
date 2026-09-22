@@ -137,6 +137,17 @@ function hasOrderShape(body: unknown): body is CreateOrderInput {
   const contact = b.contact as Record<string, unknown> | undefined
   if (typeof contact !== 'object' || contact === null) return false
   if (typeof contact.name !== 'string' || typeof contact.phone !== 'string') return false
+  /**
+   * Consent is a boolean or it is not there. **Refused rather than coerced**, and
+   * this is the one value in this guard that is about more than a dereference: the
+   * two shapes a careless form serialiser produces are the strings `'false'` and
+   * `'on'`, and both are truthy. Coerced, `'false'` opts a customer into marketing
+   * they explicitly declined, which is a legal problem rather than a support ticket.
+   *
+   * `assertInputShape` refuses it too, with a coded rejection — this is the copy that
+   * covers the HTTP boundary, where the value arrives as untrusted JSON.
+   */
+  if (b.smsMarketingConsent !== undefined && typeof b.smsMarketingConsent !== 'boolean') return false
   if (!Array.isArray(b.items)) return false
   return b.items.every((line) => {
     if (typeof line !== 'object' || line === null) return false

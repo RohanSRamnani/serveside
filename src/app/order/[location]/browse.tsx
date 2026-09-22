@@ -9,6 +9,8 @@ import type { ServiceWindow, OpenState } from '@/domain/hours'
 import type { StorefrontView } from '@/domain/storefront'
 import { CART_CSS, CartDrawer } from './cart-drawer'
 import { CartProvider, cartCount, useCart, type CartLine } from './cart-provider'
+import { SHELL_CSS } from './shell-css'
+import { checkoutHref, closedNotice, formatPhone, formatServiceWindows } from './storefront-copy'
 import { useDismissablePanel } from './use-dismissable-panel'
 
 /**
@@ -218,60 +220,13 @@ export function tagPills(tags: string[] | undefined): TagPill[] {
 }
 
 /**
- * A phone number as a customer reads one, and **verbatim for anything that is not a
- * plain US number**. `phone_e164` is the storage format and the `tel:` href stays
- * exactly that; this is only the label. A "clever" formatter applied to, say, a
- * +44 number would garble it, so anything that is not `+1` plus ten digits is
- * printed as it was stored.
+ * **Re-exported, not defined here.** `formatPhone`, `formatServiceWindows` and
+ * `closedNotice` moved to `./storefront-copy` when checkout became the second page
+ * that has to say the same things — one sentence about a shut kitchen, not two. They
+ * are re-exported so this module stays the place a reader (and this page's tests)
+ * expects to find them.
  */
-export function formatPhone(e164: string): string {
-  const match = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(e164)
-  if (!match) return e164
-  return `(${match[1]}) ${match[2]}-${match[3]}`
-}
-
-/** `HH:MM:SS` as a customer reads a clock. `24:00:00` is a legal Postgres `time`. */
-function wallClock(time: string): string {
-  const [hh, mm] = time.split(':')
-  const hour = Number(hh)
-  if (hour === 0 || hour === 24) return 'midnight'
-  const suffix = hour < 12 ? 'AM' : 'PM'
-  const twelve = hour % 12 === 0 ? 12 : hour % 12
-  return `${twelve}:${mm} ${suffix}`
-}
-
-/**
- * Today's posted hours, as one line. Several windows is the normal case — lunch and
- * dinner are two rows of `business_hours`, not one.
- */
-export function formatServiceWindows(windows: readonly ServiceWindow[]): string {
-  if (windows.length === 0) return 'Closed today'
-  // The dev seed's whole-day grid, and any genuine 24-hour kitchen. "midnight –
-  // midnight" is not a sentence anybody has ever read off a door.
-  if (windows.length === 1 && windows[0].openTime === '00:00:00' && windows[0].closeTime === '24:00:00') {
-    return 'Open 24 hours'
-  }
-  return windows.map((w) => `${wallClock(w.openTime)} – ${wallClock(w.closeTime)}`).join(', ')
-}
-
-/**
- * What a closed restaurant tells a customer — or `null`, which is what an open one
- * says about it.
- *
- * The three reasons stay three sentences. `isOpenAt` goes to real trouble to tell a
- * "we're slammed" pause from a dated closure from the weekly grid, and each one is a
- * different next move for the customer: wait a bit, come back another day, come back
- * later today. Flattening them into "closed" throws away the only part of this the
- * customer can act on.
- */
-export function closedNotice(open: OpenState, todayHours: readonly ServiceWindow[]): string | null {
-  if (open.open) return null
-  if (open.reason === 'paused') {
-    return 'Not taking orders right now — the kitchen is slammed. Try again in a little while.'
-  }
-  if (open.reason === 'holiday' || todayHours.length === 0) return 'Closed today.'
-  return `Closed right now. Today: ${formatServiceWindows(todayHours)}.`
-}
+export { closedNotice, formatPhone, formatServiceWindows } from './storefront-copy'
 
 // ---------------------------------------------------------------------------
 // The page.
@@ -314,18 +269,23 @@ function Menu({ view, todayHours }: BrowseProps) {
   }, [cart])
 
   /**
-   * **Task 4 owns checkout; this is the seam it plugs into.**
+   * To the checkout page, which is a separate route and a fresh server render.
    *
-   * Deliberately a no-op rather than a `router.push` to a route that does not exist
-   * yet: a button that navigates to a 404 is worse than one that does nothing, and
-   * the contact/tip/consent step plus `POST /api/orders` is a task, not a href. The
-   * button itself is real — it is enabled exactly when the restaurant is open, which
-   * is the decision this task owns.
+   * **A full navigation rather than `useRouter().push`, on purpose.** This component
+   * is rendered by `browse.test.tsx` through `renderToStaticMarkup`, and
+   * `useRouter()` outside an App Router provider throws — so the hook would cost the
+   * page's whole render test to buy a soft transition. Nothing is lost by the hard
+   * one: the cart lives in `localStorage` keyed by this slug, so it survives the
+   * navigation intact, and checkout has to reach the database anyway for the hours
+   * and the prep time. `checkoutHref` is shared with the checkout page's own tests so
+   * the two cannot disagree about where this goes.
+   *
+   * The button is enabled exactly when the restaurant is open — `cart-drawer.tsx`
+   * decides that from `closedNotice`, and it is unchanged.
    */
   const checkout = useCallback(() => {
-    // TODO(plan-2/task-4): open the checkout step (contact, tip, consent) and POST
-    // the cart to /api/orders, which recomputes the money and returns the order.
-  }, [])
+    window.location.assign(checkoutHref(location.slug))
+  }, [location.slug])
 
   /**
    * Stable, because `useDismissablePanel` keys its effect on the identity of the
@@ -881,28 +841,10 @@ function useActiveChipInView(active: string | null) {
  * 600px because a list shows four dishes where a photo grid shows one and a half,
  * then a photo-led grid once there is room for one.
  */
-const CSS = `
-.ss {
-  --paper: #fbf7f2;
-  --card: #ffffff;
-  --ink: #17120f;
-  --ink-soft: #6a5f57;
-  --line: #e7ded3;
-  --accent: #a9271d;
-  --accent-ink: #fff8f6;
-  --diet-bg: #e9f4ec;
-  --diet-ink: #1d6440;
-  --allergen-bg: #fbeadb;
-  --allergen-ink: #8a4a12;
-  color-scheme: light;
-  min-height: 100dvh;
-  background: var(--paper);
-  color: var(--ink);
-  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
-  font-size: 16px;
-  line-height: 1.4;
-  padding-bottom: calc(96px + env(safe-area-inset-bottom));
-}
+const CSS = SHELL_CSS + `
+/* Clears the sticky bottom bar, which is this page's and not the shell's — the
+   checkout page has no such bar and must not reserve a thumb's worth of nothing. */
+.ss { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
 .ss-head { padding: 14px 16px 10px; }
 .ss-head-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 /*

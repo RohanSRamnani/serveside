@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, text, integer, bigint, jsonb, timestamp, primaryKey, check, foreignKey, index } from 'drizzle-orm/pg-core'
+import { pgTable, pgEnum, uuid, text, integer, bigint, boolean, jsonb, timestamp, primaryKey, check, foreignKey, index } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { locations } from './tenancy'
 import { menuItems, modifierOptions } from './menu'
@@ -68,6 +68,32 @@ export const orders = pgTable('orders', {
   contactName: text('contact_name').notNull(),
   contactPhone: text('contact_phone').notNull(),
   contactEmail: text('contact_email'),
+  /**
+   * **TCPA marketing consent, captured at checkout and stored on the order.**
+   *
+   * Two columns rather than one, and the pair is the record: the boolean is *what*
+   * was agreed to, `consentAt` is the evidence of *when*. A boolean alone cannot tell
+   * consent given today from a default inherited by a row written before the box
+   * existed — and "when" is the half that is asked for in a complaint.
+   *
+   * **Marketing only.** Transactional messages ("your order is ready", the owner's
+   * new-order text) are not marketing and are not gated on this; nothing in the
+   * fan-out reads either column. Gating them here would be reading the law backwards
+   * and would silence the alerts a kitchen runs on.
+   *
+   * `NOT NULL DEFAULT false` is deliberate: consent is something a customer does, so
+   * its absence is a refusal, never an unknown. A nullable column would invite a
+   * reader to treat NULL as "ask them again" and mail the ones who said no.
+   *
+   * It lives on the **order**, not on a customer, because there is no `customers`
+   * table yet — Plan 3 brings one with retention and migrates these forward. Until
+   * then each order carries the consent that was given at the moment it was placed,
+   * which is also the most defensible shape: consent is a point in time, not a
+   * property of a person.
+   */
+  smsMarketingConsent: boolean('sms_marketing_consent').notNull().default(false),
+  /** When consent was given. **Null unless the flag is true** — see above. */
+  consentAt: timestamp('consent_at', { withTimezone: true }),
   /** Null = ASAP. Set only for an order placed for later. */
   scheduledFor: timestamp('scheduled_for', { withTimezone: true }),
   /** What the customer was promised, from `locations.prepTimeMinutes` — kept so a late order is provable. */

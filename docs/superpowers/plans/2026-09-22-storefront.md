@@ -161,8 +161,8 @@ route rather than riding inside a storefront task.
 - Checkout form: name (required), phone (required, US-normalized to E.164 client-side, server re-validates shape), email (optional), tip presets 0/10/15/20% + custom cents, pickup time = ASAP with live quote (`prepTimeMinutes` from the view, rendered in the LOCATION's timezone), the consent checkbox — UNCHECKED, its own block, with disclosure: "Yes, text me offers and updates from {restaurant name}. Msg & data rates may apply. Reply STOP to opt out." — and payment mode: Card | Pay at pickup.
 - Submit → `POST /api/orders`; card → Task 5 takes the `clientSecret`; pay_on_pickup → straight to status page.
 
-- [ ] **Step 1: Failing tests** — consent columns land on the order row only when the box was checked (both states asserted); unchecked-by-default is a UI render test; tip custom path produces exact cents; `consentAt` null when false.
-- [ ] **Step 2: Implement; full suite green (462+ floor); commit** — `feat: guest checkout with TCPA consent capture on the order row`
+- [x] **Step 1: Failing tests** — consent columns land on the order row only when the box was checked (both states asserted); unchecked-by-default is a UI render test; tip custom path produces exact cents; `consentAt` null when false.
+- [x] **Step 2: Implement; full suite green (462+ floor); commit** — `feat: guest checkout with TCPA consent capture on the order row`
 
 ---
 

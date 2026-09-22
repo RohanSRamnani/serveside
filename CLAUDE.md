@@ -107,6 +107,30 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   imported by both `create-order.ts` and the cart. It has **no imports of its own** on
   purpose: the browser needs those numbers and must not reach a server module for
   them.
+- **`/order/[location]/checkout` is the second and last page of the funnel**, built
+  exactly like the menu page: resolve the public slug, one `withLocation` for the view
+  and today's hours, the same every-miss-is-`notFound()` doctrine. It **resolves the
+  location id on the server and hands it to the form as a prop** — `StorefrontView`
+  publishes no id on purpose, so the id never travels to the browser to come back
+  again. `CartProvider` is mounted with the same public slug, which is the whole of how
+  the cart gets here. `checkout-form.tsx` is the client: contact, tip, the consent
+  block, the payment mode, split into a stateful `CheckoutForm` and a controlled
+  `CheckoutFormView` because there is no jsdom. **The Card option renders only when
+  `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is non-empty** (blank-safe — an unset Vercel var
+  arrives as `''`), so locally pay-at-pickup is the only mode; choosing Card parks on a
+  `PaymentStep` placeholder that is deliberately **not** a success screen and does
+  **not** clear the cart, because nothing has been paid. Pay-at-pickup clears the cart
+  and pushes to the status page. A 422 keeps the cart **and** the form: losing both at
+  that moment is what makes somebody phone the restaurant instead. Tip presets are
+  0/10/15/20% **of the pre-tax subtotal**, `roundHalfUp`, and a custom tip is read out
+  of the dollars string by `customTipCents` — never `parseFloat`, which turns `3.35`
+  into 334.999…. `Cart.hydrated` exists for this page: the cart is read from
+  `localStorage` in an effect, so "no dishes" and "not read yet" have to be different
+  renders or a real cart flashes "your order is empty". `shell-css.ts` (the `.ss`
+  tokens) and `storefront-copy.ts` (`closedNotice`, `formatServiceWindows`,
+  `formatPhone`, `quoteLabel`, the hrefs) are shared by both pages so one shut kitchen
+  is one sentence — and `storefront-copy.ts` carries no `'use client'` **because the
+  page calls `quoteLabel` on the server**; see Gotchas.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
@@ -119,6 +143,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   = total` asserted on the row itself immediately before the INSERT. Customer-facing
   rejections are the `OrderRejectedError` family, each with a `code` for the HTTP layer;
   a plain `Error` out of here is our bug, not the customer's.
+  **`contact.phone` must be E.164 (`^\+[1-9]\d{6,14}$`), on every channel.** The column
+  is plain `text` and everything downstream assumes the shape — most sharply `sendSms`,
+  which refuses anything else *at send time*, by which point the order is committed and
+  the only symptom is a customer who is never texted. The web form normalises US input
+  with `normalizePhone` before it posts; the rule is re-checked here because the voice
+  and SMS agents call this directly with whatever a transcription returned.
+  **`smsMarketingConsent` is TCPA consent and is a boolean or absent** — absent means
+  *declined*, never unknown, and a non-boolean is refused rather than coerced (`'false'`
+  is truthy, and coercing it opts a customer into marketing they declined). It writes
+  `orders.sms_marketing_consent` plus `consent_at = placedAt` **only when true**: the
+  boolean is what was agreed to, the timestamp is the evidence of when, and a stamp
+  beside a false flag is a row that cannot be read as anything but consent. Marketing
+  only — the owner's text and "your order is ready" are transactional and are gated on
+  neither column.
 - **Tenancy is enforced twice: by `withLocation` and by Postgres RLS.** Every read
   or write of a location's menus, snapshots or orders goes through
   `withLocation(locationId, fn)` (`src/repo/scoped.ts`) — a websocket-pool
@@ -433,6 +471,21 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   since Next 15, and a dynamic route ignores its segment's revalidate. So a page is
   always fresh — and gets no CDN staleness to survive a database blip with. Caching a
   DB-backed page means `unstable_cache` or a CDN header, not a segment config.
+- **Every export of a `'use client'` module is a client reference, re-exports
+  included.** A server component that *calls* one gets "Attempted to call quoteLabel()
+  from the server but quoteLabel is on the client" — a 500 on the whole page, and
+  `tsc` cannot see it, so only loading the route finds it. The checkout page hit this
+  by importing `quoteLabel` through `checkout-form.tsx`'s re-export; the fix is to
+  import it from `storefront-copy.ts` (no `'use client'`) directly. Anything a server
+  component and a client component both call belongs in a plain module, and the client
+  one may re-export it for its own tests.
+- **A time rendered with `new Date()` during render is a hydration mismatch**, because
+  the server's clock and the browser's are seconds apart and React answers a mismatch
+  by throwing the tree away. The checkout quote is computed on the **server**, passed
+  down as `initialQuote`, and re-derived in an effect on mount (and every 30s after).
+- **`Intl.DateTimeFormat('en-US')` puts U+202F before AM/PM**, not a space — ICU 72,
+  Node 18.14+. It is invisible in a diff and breaks any string comparison, so
+  `quoteLabel` normalises it.
 - **`<style>{A}{B}</style>` is two text nodes, and it fails hydration.** The server
   flattens them into one run of HTML and the client expects two children, so the whole
   page re-renders with a message that says nothing about a stylesheet. Concatenate
