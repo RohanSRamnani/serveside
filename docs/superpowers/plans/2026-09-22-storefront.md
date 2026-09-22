@@ -126,6 +126,28 @@ blocked until this lands.
 
 ---
 
+### Task 3.5: The sticky rail that never stuck — `overflow-x: clip`
+
+Added 2026-09-22 after Task 3's fix round, by controller ruling. Found by driving
+the page, not by review: `src/app/globals.css:17-20` sets `overflow-x: hidden` on
+`html, body`, which makes `body` a scroll container and defeats `position: sticky`
+in every descendant — Task 2's category chip rail scrolls away with the page
+(`.ss-chips` measured at `top: -642px` at `scrollY 800`). The rule is app-wide
+(scaffold `7c1f73f`), so the change gets its own verification pass across every
+route rather than riding inside a storefront task.
+
+**Files:**
+- Modify: `src/app/globals.css` (one declaration, plus a comment stating WHY it is `clip`)
+- Test: none unit-testable — sticky is a runtime layout fact; the browser pass below is the verification and its measurements go in the report.
+
+**Interfaces:** none. `overflow-x: clip` replaces `hidden` on `html, body` — `clip` cuts horizontal overflow without creating a scroll container, so `position: sticky` works again.
+
+- [ ] **Step 1: Reproduce** — `/order/kashi` at 390×844, scroll ~800px, record `.ss-chips` `getBoundingClientRect().top` (negative = not stuck).
+- [ ] **Step 2: Fix; re-measure** — the rail's top holds at its sticky offset through the whole menu; the active chip still tracks; `document.documentElement.scrollWidth === clientWidth` at 390, 768 and 1280.
+- [ ] **Step 3: Verify every other route under `src/app/`** at 390 and 1280 (the kitchen feed and anything else the rule covers) — no new horizontal overflow, nothing that leaned on `hidden`. Full suite green; commit — `fix: overflow-x clip on html/body so position: sticky works — the chip rail now sticks`
+
+---
+
 ### Task 4: Checkout — contact, tip, consent, and the order POST
 
 **Files:**
