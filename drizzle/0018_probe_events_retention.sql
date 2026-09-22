@@ -1,0 +1,31 @@
+-- `printer_probe_events` gets a retention sweep, so app_user needs DELETE.
+--
+-- 0016 withheld it, on the argument that every row is evidence of an enumeration
+-- attempt and nothing prunes the table. That was the wrong call, and the reason is
+-- worth writing down rather than quietly reversing: **this is the one table an
+-- unauthenticated stranger can add rows to.** The MAC space a sweep walks is tens of
+-- millions, so "keeps everything, forever" meant the cleanup would eventually be a
+-- migration written during an incident, against a table nobody had thought about
+-- since — which is the worst possible moment to be deciding what is safe to delete.
+--
+-- It is now bounded in three ways, and this grant is the last of them:
+--
+--   1. One row per serial, upserted, so polls do not accumulate rows.
+--   2. **No new serials recorded at all while the window is already over the alerting
+--      threshold** (`recordProbe` in `src/domain/printer-probes.ts`). Past that point
+--      the alarm has already been earned and another row buys nothing. The cap refills
+--      as rows age out of the ten-minute window, so a sustained sweep costs about a
+--      threshold's worth of rows per window instead of one per guess.
+--   3. A 24-hour retention sweep on the printer-heartbeat cron, which needs this.
+--
+-- Twenty-four hours is long enough to look at the morning after an overnight sweep and
+-- long enough to hold a whole night of one, short enough that the table is a rolling
+-- window rather than a permanent list of every serial anyone ever guessed at us.
+--
+-- The alerting dedupe is untouched by the sweep: `alerted_at` gates on rows inside the
+-- ten-minute window, and nothing removed here is less than a day old.
+--
+-- Idempotent (a plain GRANT): Neon branches get reset, and every migration in this
+-- repo has to survive a replay.
+
+GRANT DELETE ON TABLE "printer_probe_events" TO app_user;

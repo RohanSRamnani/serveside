@@ -1,0 +1,1 @@
+CREATE INDEX "print_jobs_delivered_idx" ON "print_jobs" USING btree ("location_id","created_at") WHERE "print_jobs"."status" = 'delivered';

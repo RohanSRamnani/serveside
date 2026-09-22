@@ -1,0 +1,198 @@
+/**
+ * Money. Every value in this file is **integer cents** — there are no dollars in
+ * this codebase and no floats in any money column (`orders.ts` rule 1).
+ *
+ * The arithmetic lives here rather than inside `createOrder` for one reason: it is
+ * the part that has to be right. A totals bug is not a broken page, it is a charge
+ * that does not match the receipt, and the only cheap way to be sure of it is to
+ * test it without a database in the way.
+ */
+
+/**
+ * The unit every tax rate in this codebase is in: **parts per 100,000**. 8875 is
+ * 8.875%, which is New York City on prepared food.
+ *
+ * It was basis points until 2026-09-21, and the reason it is not is worth keeping:
+ * 8.875% is 887.5 basis points, so an integer bps rate cannot express the rate of the
+ * first city we launch in. Per 100,000 holds every US jurisdiction, all of which quote
+ * to at most three decimal places, and keeps the rate an integer — the only kind of
+ * number this file is willing to do arithmetic on.
+ */
+const PER_100K_WHOLE = 100_000
+
+/**
+ * Half **up**, never banker's rounding.
+ *
+ * Round-half-to-even is the better choice when you are summing thousands of
+ * independent roundings and care about the aggregate. We are doing the opposite:
+ * one rounding, on one receipt, that a diner compares against a card statement.
+ * 8.75% of $17.45 is 174.5 cents and the receipt must say $1.75, the same way
+ * every register in the country says it. Banker's would say $1.74 and the support
+ * ticket would be right.
+ *
+ * `Math.round` **is** half-up (ties go toward +∞) and it is specified to return the
+ * closest representable answer, which matters for exactly one input: the naive
+ * `Math.floor(value + 0.5)` answers 1 for 0.49999999999999994, because that sum
+ * rounds up to 1.0 in binary before the floor ever runs.
+ *
+ * Ties on a negative value go toward zero (`-0.5 → -0`), which is a real asymmetry
+ * and a non-issue here: nothing hands this function a negative number — the callers
+ * below reject one first, and a refund is a `payment_status`, never a negative total.
+ */
+export function roundHalfUp(value: number): number {
+  if (!Number.isFinite(value)) throw new Error(`roundHalfUp: not a finite number: ${value}`)
+  return Math.round(value)
+}
+
+/**
+ * Sales tax on a subtotal, at the location's rate.
+ *
+ * `subtotal * rate / 100000` is safe despite the float division: both operands are
+ * integers, so the numerator is exact, and the true quotient's only tie values are
+ * halves — which binary floating point represents exactly. Two quotients that are not
+ * equal differ by at least 1e-5 (the numerator moves in whole units), while the
+ * relative error of one IEEE-754 division is about 1e-16, so a quotient that is not a
+ * tie can never be rounded into one. The safe-integer guard below keeps that argument
+ * true by refusing the magnitudes where it would stop being.
+ *
+ * **That guard is ten times tighter than it was**, because the divisor grew: with the
+ * numerator capped at 2^53−1, a full 100% rate (100,000) bounds the subtotal at about
+ * 9.0e10 cents — $900 million on one order, against $9 billion under basis points.
+ * Both are far past every real order and past `orders.subtotal_cents`' own CHECK; the
+ * number is written down here so the next person to widen a rate knows what it costs.
+ *
+ * One flat rate per location, applied to the whole subtotal: `menu_items.taxCategory`
+ * exists but nothing reads it yet, and per-category tax is not in this plan.
+ */
+export function taxCentsFor(subtotalCents: number, taxRatePer100k: number): number {
+  assertWholeCents('subtotal', subtotalCents)
+  assertWholeCents('tax rate (per 100k)', taxRatePer100k)
+  assertNotNegative('subtotal', subtotalCents)
+  assertNotNegative('tax rate (per 100k)', taxRatePer100k)
+  const numerator = subtotalCents * taxRatePer100k
+  if (!Number.isSafeInteger(numerator)) {
+    throw new Error(`taxCentsFor: ${subtotalCents} × ${taxRatePer100k} exceeds exact integer arithmetic`)
+  }
+  return roundHalfUp(numerator / PER_100K_WHOLE)
+}
+
+/**
+ * What one of something costs: the dish plus every modifier chosen on it.
+ *
+ * Deltas may be negative — a size down is a legitimate modifier — but the unit may
+ * not be. `order_items.unit_price_cents >= 0` is a CHECK, and failing here lets the
+ * caller name the dish instead of surfacing a constraint violation from the driver.
+ */
+export function unitPriceCentsFor(basePriceCents: number, modifierDeltaCents: readonly number[]): number {
+  assertWholeCents('base price', basePriceCents)
+  assertNotNegative('base price', basePriceCents)
+  let unit = basePriceCents
+  for (const delta of modifierDeltaCents) {
+    assertWholeCents('modifier delta', delta)
+    unit += delta
+  }
+  assertNotNegative('unit price', unit)
+  return unit
+}
+
+/** One line of the order. Quantity is whole and positive — `order_items_qty_positive`. */
+export function lineTotalCentsFor(unitPriceCents: number, qty: number): number {
+  assertWholeCents('unit price', unitPriceCents)
+  assertNotNegative('unit price', unitPriceCents)
+  if (!Number.isInteger(qty) || qty < 1) {
+    throw new Error(`Line quantity must be a whole number of at least 1, got ${qty}`)
+  }
+  return unitPriceCents * qty
+}
+
+/** The five parts of an order's money, before the total is worked out. */
+export type TotalsParts = {
+  subtotalCents: number
+  taxCents: number
+  tipCents: number
+  deliveryFeeCents: number
+  /** Stored positive and **subtracted**. A discount is never a negative number. */
+  discountCents: number
+}
+
+/** The same five, plus the total they must add up to. */
+export type Totals = TotalsParts & { totalCents: number }
+
+/**
+ * Named explicitly rather than read off the object, because the caller hands
+ * `assertTotalsBalance` the whole order row — `Object.entries` over that would try
+ * to check a location id for being a whole number of cents.
+ */
+const PART_KEYS = ['subtotalCents', 'taxCents', 'tipCents', 'deliveryFeeCents', 'discountCents'] as const
+
+/** `subtotal + tax + tip + deliveryFee − discount`. The one definition of a total. */
+export function totalCentsFor(parts: TotalsParts): number {
+  assertPartsAreCents(parts)
+  const total = parts.subtotalCents + parts.taxCents + parts.tipCents + parts.deliveryFeeCents - parts.discountCents
+  assertNotNegative('total', total)
+  return total
+}
+
+/**
+ * The invariant, checked against the row that is about to be inserted.
+ *
+ * Not a validation — a customer can do nothing to fail this — and not a restatement
+ * of `totalCentsFor` either. The bug it traps is **assembly**: a total computed
+ * correctly and then paired with the wrong `tipCents` on the way into the INSERT,
+ * or a later task adding a fee to the total and forgetting the column. Run it on the
+ * literal values object, immediately before the write, so there is nothing left
+ * between the check and the row.
+ *
+ * Takes the whole row happily — it looks at the six money fields and ignores
+ * everything else.
+ */
+export function assertTotalsBalance(totals: Totals): void {
+  assertPartsAreCents(totals)
+  assertWholeCents('totalCents', totals.totalCents)
+  assertNotNegative('totalCents', totals.totalCents)
+  const expected = totals.subtotalCents + totals.taxCents + totals.tipCents
+    + totals.deliveryFeeCents - totals.discountCents
+  if (expected !== totals.totalCents) {
+    throw new Error(
+      `Order totals do not balance: ${totals.subtotalCents} + ${totals.taxCents} + ${totals.tipCents} `
+      + `+ ${totals.deliveryFeeCents} − ${totals.discountCents} = ${expected}, but total is ${totals.totalCents}`,
+    )
+  }
+}
+
+/**
+ * Cents as a string of dollars, for a printed ticket or an SMS — the one place
+ * dollars are allowed to exist, and still without a float in sight.
+ *
+ * `(cents / 100).toFixed(2)` is the obvious version and it is wrong in the way this
+ * file exists to prevent: it converts money to a binary fraction and rounds it back,
+ * so the arithmetic that produced an exact integer gets a second, lossy opinion on
+ * what it meant. Slicing the decimal string cannot round anything, because there is
+ * nothing to round — the value is already exact.
+ *
+ * No currency symbol: the ticket right-aligns these in a column, and a `$` that
+ * sometimes appears is a column that never lines up. Negatives print with a leading
+ * `-` (a discount is stored positive and printed negative).
+ */
+export function formatCents(cents: number): string {
+  assertWholeCents('cents', cents)
+  const digits = String(Math.abs(cents)).padStart(3, '0')
+  return `${cents < 0 ? '-' : ''}${digits.slice(0, -2)}.${digits.slice(-2)}`
+}
+
+function assertPartsAreCents(parts: TotalsParts): void {
+  for (const key of PART_KEYS) {
+    assertWholeCents(key, parts[key])
+    assertNotNegative(key, parts[key])
+  }
+}
+
+function assertWholeCents(label: string, value: number): void {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${label} must be a whole number of cents, got ${value}`)
+  }
+}
+
+function assertNotNegative(label: string, value: number): void {
+  if (value < 0) throw new Error(`${label} must not be negative, got ${value}`)
+}

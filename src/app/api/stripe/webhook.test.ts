@@ -1,0 +1,667 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { eq } from 'drizzle-orm'
+import { db } from '@/db/client'
+import { orders, orderEvents, webhookEvents } from '@/db/schema'
+import { withLocation } from '@/repo/scoped'
+import { seedLocationWithMenu, seedCardOrder, seedPaidOrder } from '@/test/seed'
+
+/**
+ * The webhook is the only thing in this codebase that takes money off a
+ * PENDING_PAYMENT order and hands it to a kitchen, and it runs on input we do not
+ * control the delivery of. Two facts drive every test here:
+ *
+ * 1. **Stripe will deliver the same event twice.** On a retry, on a timeout it never
+ *    saw our 200, on a dashboard replay. The idempotency insert is not a nicety; it
+ *    is the difference between one ticket and two, and between one `status_changed`
+ *    event and an audit trail that lies.
+ * 2. **Stripe retries on any 5xx, forever.** So a *legal* state — an order already
+ *    flipped, an order the customer cancelled — must come back 200. A 500 there is a
+ *    retry storm over something that will never change.
+ *
+ * The Stripe SDK is mocked whole: no network, and `constructEvent` is the seam that
+ * lets a test be a valid or an invalid signature without holding a signing secret.
+ */
+const { constructEvent, paymentIntentsCreate, sendOrderCreated, sendProvenanceRefused } = vi.hoisted(() => ({
+  constructEvent: vi.fn(),
+  paymentIntentsCreate: vi.fn(),
+  sendOrderCreated: vi.fn(),
+  sendProvenanceRefused: vi.fn(),
+}))
+
+vi.mock('stripe', () => ({
+  default: class {
+    webhooks = { constructEvent }
+    paymentIntents = { create: paymentIntentsCreate }
+  },
+}))
+
+vi.mock('@/inngest/client', () => ({ sendOrderCreated, sendProvenanceRefused }))
+
+const { POST } = await import('./webhook/route')
+
+/** How long after payment the kitchen promises the food — deliberately not the 20-minute default. */
+const PREP_TIME_MINUTES = 37
+/** The connected account every seeded restaurant here banks with. */
+const STRIPE_ACCOUNT = 'acct_test_kashi'
+/** What `seedCardOrder` / `seedPaidOrder` total to: (1800 + 50) × 2 + 324 tax + 500 tip. */
+const ORDER_TOTAL_CENTS = 4524
+
+let eventCounter = 0
+
+/** A restaurant that banks somewhere, which the provenance checks require. */
+function restaurant(over: Parameters<typeof seedLocationWithMenu>[0] = {}) {
+  return seedLocationWithMenu({
+    prepTimeMinutes: PREP_TIME_MINUTES, stripeAccountId: STRIPE_ACCOUNT, ...over,
+  })
+}
+
+/**
+ * A `payment_intent.succeeded` as Stripe delivers it, down to the fields we read.
+ *
+ * `account` is the connected account the event originated on — populated because the
+ * endpoint is a **Connect** webhook on the platform. It defaults to the seeded
+ * restaurant's, so a test only names it when provenance is what is under test.
+ */
+function succeededEvent(over: {
+  id?: string
+  type?: string
+  account?: string
+  paymentIntentId?: string
+  orderId?: string
+  locationId?: string
+  amount?: number
+}) {
+  return {
+    id: over.id ?? `evt_test_${Date.now()}_${eventCounter++}`,
+    type: over.type ?? 'payment_intent.succeeded',
+    account: over.account ?? STRIPE_ACCOUNT,
+    data: {
+      object: {
+        id: over.paymentIntentId ?? 'pi_test_1',
+        object: 'payment_intent',
+        amount: over.amount ?? ORDER_TOTAL_CENTS,
+        currency: 'usd',
+        status: 'succeeded',
+        metadata: { orderId: over.orderId ?? '', locationId: over.locationId ?? '' },
+      },
+    },
+  }
+}
+
+/** Posts a raw body with a signature header, exactly as Stripe does. */
+function deliver(event: unknown, signature = 't=1,v1=fake'): Promise<Response> {
+  const body = JSON.stringify(event)
+  // The real handler must read this with `req.text()`, never `req.json()`: the bytes
+  // Stripe signed are the bytes that have to be verified, and a parse-then-restringify
+  // round trip is not byte-identical.
+  return POST(new Request('https://serveside.test/api/stripe/webhook', {
+    method: 'POST',
+    headers: { 'stripe-signature': signature, 'content-type': 'application/json' },
+    body,
+  }))
+}
+
+async function readOrder(locationId: string, orderId: string) {
+  return withLocation(locationId, async (tx) => {
+    const [row] = await tx.select().from(orders).where(eq(orders.id, orderId))
+    return row
+  })
+}
+
+async function countEvents(locationId: string, orderId: string): Promise<number> {
+  return withLocation(locationId, async (tx) => {
+    const rows = await tx.select().from(orderEvents).where(eq(orderEvents.orderId, orderId))
+    return rows.length
+  })
+}
+
+async function eventTypes(locationId: string, orderId: string): Promise<string[]> {
+  return withLocation(locationId, async (tx) => {
+    const rows = await tx.select().from(orderEvents).where(eq(orderEvents.orderId, orderId))
+    return rows.map((r) => r.type)
+  })
+}
+
+/** `webhook_events` is platform-global, so this read needs no scope — and must find none. */
+async function claimRows(externalId: string) {
+  return db().select().from(webhookEvents).where(eq(webhookEvents.externalId, externalId))
+}
+
+
+/**
+ * An order in the state a completed flip leaves behind: NEW, PAID, holding its intent,
+ * with the `payment_succeeded` audit row the webhook writes alongside the flip.
+ *
+ * `flippedHoursAgo` back-dates that row, which is the only clock the re-fire window
+ * has — `order_events` is append-only (a trigger enforces it), so the age has to be
+ * written at insert time rather than updated afterwards. `null` leaves no audit row at
+ * all: an order flipped by something that is not this handler.
+ */
+async function alreadyFlipped(locationId: string, flippedHoursAgo: number | null) {
+  const { order } = await seedCardOrder(locationId)
+  await withLocation(locationId, async (tx) => {
+    await tx.update(orders)
+      .set({ status: 'NEW', paymentStatus: 'PAID', quotedReadyAt: new Date() })
+      .where(eq(orders.id, order.id))
+    if (flippedHoursAgo !== null) {
+      await tx.insert(orderEvents).values({
+        orderId: order.id,
+        type: 'payment_succeeded',
+        actor: 'stripe',
+        at: new Date(Date.now() - flippedHoursAgo * 3_600_000),
+      })
+    }
+  })
+  return order
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // The default for every test but the bad-signature one: the body parses and the
+  // signature is good, so `constructEvent` hands back what was posted.
+  constructEvent.mockImplementation((payload: string) => JSON.parse(payload))
+  // The real one answers with the ids Inngest accepted; the re-fire path logs them.
+  sendOrderCreated.mockResolvedValue(['01JEVENTID'])
+  sendProvenanceRefused.mockResolvedValue(['01JREFUSEDID'])
+})
+
+describe('POST /api/stripe/webhook', () => {
+  it('flips a PENDING_PAYMENT order to NEW + PAID, quotes a ready time, and records the move', async () => {
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    expect(order.quotedReadyAt).toBeNull()
+
+    const before = Date.now()
+    const event = succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    })
+    const res = await deliver(event)
+    const after = Date.now()
+
+    expect(res.status).toBe(200)
+
+    const flipped = await readOrder(loc.id, order.id)
+    expect(flipped.status).toBe('NEW')
+    // All three together, because they are one fact: the kitchen owns this order now.
+    // A flip that forgets `quotedReadyAt` leaves an order nobody ever promised a time
+    // for, which is the number the late-order alert and the customer screen both read.
+    expect(flipped.paymentStatus).toBe('PAID')
+    expect(flipped.quotedReadyAt).not.toBeNull()
+    const quoted = flipped.quotedReadyAt!.getTime()
+    expect(quoted).toBeGreaterThanOrEqual(before + PREP_TIME_MINUTES * 60_000)
+    expect(quoted).toBeLessThanOrEqual(after + PREP_TIME_MINUTES * 60_000)
+
+    // The machine wrote the move, so the audit trail can answer "when did this become
+    // the kitchen's problem, and who said so".
+    const types = await eventTypes(loc.id, order.id)
+    expect(types).toContain('status_changed')
+    const [statusEvent] = await withLocation(loc.id, (tx) =>
+      tx.select().from(orderEvents).where(eq(orderEvents.type, 'status_changed')))
+    expect(statusEvent.actor).toBe('stripe')
+    expect(statusEvent.payload).toMatchObject({ from: 'PENDING_PAYMENT', to: 'NEW' })
+
+    // And the fan-out is asked for exactly once, with both ids: Task 10's worker has
+    // no scope of its own and cannot look the location up from a hidden order row.
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(sendOrderCreated).toHaveBeenCalledWith(order.id, loc.id)
+
+    // The claim is on file, with the payload, for forensics.
+    const claims = await claimRows(event.id)
+    expect(claims).toHaveLength(1)
+    expect(claims[0].provider).toBe('stripe')
+  })
+
+  it('does nothing at all the second time the same event id arrives, and still answers 200', async () => {
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    const event = succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    })
+
+    const first = await deliver(event)
+    expect(first.status).toBe(200)
+    const afterFirst = await readOrder(loc.id, order.id)
+    const eventsAfterFirst = await countEvents(loc.id, order.id)
+
+    const second = await deliver(event)
+    // 200, not 409: from Stripe's side a duplicate that changes nothing IS success,
+    // and anything else puts the event back in the retry queue.
+    expect(second.status).toBe(200)
+    // Said out loud in the body, because "nothing changed" alone cannot distinguish
+    // the claim doing its job from the status check catching it downstream — and the
+    // claim is the one that has to work. The test below pins it properly.
+    expect(await second.json()).toMatchObject({ duplicate: true })
+
+    const afterSecond = await readOrder(loc.id, order.id)
+    // The whole row, not just the status: a second flip would also move
+    // `quotedReadyAt` forward by a full prep time and quietly re-promise the customer.
+    expect(afterSecond).toEqual(afterFirst)
+    expect(await countEvents(loc.id, order.id)).toBe(eventsAfterFirst)
+    // One ticket, one SMS. This is the assertion the whole table exists for.
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(await claimRows(event.id)).toHaveLength(1)
+  })
+
+  it('drops an event id already claimed, even when the order is still sitting there flippable', async () => {
+    // The test that makes the claim load-bearing rather than incidental.
+    //
+    // In the double-delivery case above, the second delivery is *also* stopped by the
+    // order no longer being PENDING_PAYMENT — so deleting the idempotency check
+    // entirely would not change the outcome, and the test would still pass. Here the
+    // order is untouched and would flip if the handler ran, so the only thing that can
+    // stop it is the claim.
+    //
+    // Not a contrivance, either: this is the shape of a redelivery whose 200 was lost
+    // in transit, or one another instance has already taken.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    const event = succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    })
+    await db().insert(webhookEvents).values({
+      provider: 'stripe', externalId: event.id, payload: { note: 'claimed by another instance' },
+    })
+
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ duplicate: true })
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(untouched.quotedReadyAt).toBeNull()
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+    // And the first claim's payload is left alone — a duplicate never overwrites the
+    // record of the delivery that actually ran.
+    const [claim] = await claimRows(event.id)
+    expect(claim.payload).toEqual({ note: 'claimed by another instance' })
+  })
+
+  it('refuses a bad signature with 400, before it has written anything', async () => {
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    constructEvent.mockImplementation(() => {
+      throw new Error('No signatures found matching the expected signature for payload')
+    })
+
+    const event = succeededEvent({ orderId: order.id, locationId: loc.id })
+    const res = await deliver(event, 't=1,v1=forged')
+    expect(res.status).toBe(400)
+
+    // Order untouched, and — the ordering that matters — no claim row either. If the
+    // idempotency insert ran before the signature check, anyone who could reach the
+    // URL could burn an event id and make us drop the real delivery of it.
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(await claimRows(event.id)).toHaveLength(0)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('refuses a request with no signature header at all', async () => {
+    const res = await POST(new Request('https://serveside.test/api/stripe/webhook', {
+      method: 'POST', body: '{}',
+    }))
+    expect(res.status).toBe(400)
+    expect(constructEvent).not.toHaveBeenCalled()
+  })
+
+  it('records an event type it does not handle and answers 200', async () => {
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    const event = succeededEvent({
+      type: 'payment_intent.payment_failed', orderId: order.id, locationId: loc.id,
+    })
+
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+    // Recorded anyway: the claim is what stops a re-delivery being re-examined, and
+    // the payload is the only record that Stripe told us anything at all.
+    expect(await claimRows(event.id)).toHaveLength(1)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('treats an order already past PENDING_PAYMENT as success, not a 500', async () => {
+    // Stripe retries 5xx forever. An order that is already NEW — flipped by an earlier
+    // delivery under a different event id, or by a human — is a legal state, so the
+    // only thing a 500 would buy is a retry storm against a row nothing will change.
+    //
+    // And **not** a re-fire either: this order holds no PaymentIntent of its own, so
+    // nothing here proves the flip was ours. A pay-at-pickup order is NEW and paid the
+    // same way, and re-announcing one on the strength of a stranger's succeeded intent
+    // would put a ticket on a kitchen's printer for an order it has already served.
+    const loc = await restaurant()
+    const { order } = await seedPaidOrder(loc.id)
+    expect(order.stripePaymentIntentId).toBeNull()
+    const eventsBefore = await countEvents(loc.id, order.id)
+
+    const res = await deliver(succeededEvent({ orderId: order.id, locationId: loc.id }))
+    expect(res.status).toBe(200)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched).toEqual(order)
+    expect(await countEvents(loc.id, order.id)).toBe(eventsBefore)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('re-fires the fan-out for an order it already flipped for this very intent', async () => {
+    // **The lost-fan-out window, closed.** The fan-out runs after the flip commits, so
+    // a process that dies in between — or a 500 out of this handler — leaves an order
+    // that is paid, NEW, and that no kitchen has ever heard of. Every later delivery
+    // used to find a legal state and stop, so nothing ever told them.
+    //
+    // Now a delivery that matches our own flip exactly (NEW, PAID, and holding *this*
+    // intent) re-announces it. Safe only because the fan-out is idempotent per order:
+    // `sendOrderCreated` keys the Inngest event on the order id, and the print leg
+    // dedupes in the database, so a re-fire cannot become a second ticket.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    const intentId = order.stripePaymentIntentId!
+
+    // Flip it first, under its own event id, and forget that this ever happened.
+    const first = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: intentId,
+    }))
+    expect(first.status).toBe(200)
+    const flipped = await readOrder(loc.id, order.id)
+    const eventsAfterFlip = await countEvents(loc.id, order.id)
+    sendOrderCreated.mockClear()
+
+    // A different event id, so the claim does not stop it — Stripe sending a second
+    // `payment_intent.succeeded`, or the same payment replayed from the dashboard.
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: intentId,
+    }))
+    expect(res.status).toBe(200)
+
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(sendOrderCreated).toHaveBeenCalledWith(order.id, loc.id)
+
+    // And nothing was re-written: no second flip, no second `quotedReadyAt`, no second
+    // audit row. The re-fire announces, it does not re-do.
+    expect(await readOrder(loc.id, order.id)).toEqual(flipped)
+    expect(await countEvents(loc.id, order.id)).toBe(eventsAfterFlip)
+  })
+
+  it('does not re-fire for an order that is NEW and holds this intent but has been refunded', async () => {
+    // **The conjunct that stops a refund being re-served.** A refunded order is still
+    // NEW and still holds the intent that paid for it, so every other check in the
+    // re-fire branch passes — `paymentStatus` is the only thing standing between a
+    // refunded order and a ticket going back on a kitchen printer.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 1)
+    await withLocation(loc.id, (tx) =>
+      tx.update(orders).set({ paymentStatus: 'REFUNDED' }).where(eq(orders.id, order.id)))
+    sendOrderCreated.mockClear()
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('still re-fires hours after the flip, while the dedupe window is open', async () => {
+    // The positive control for the pair below: same seeding, same delivery, and the
+    // only difference between re-firing and not is how old the flip is.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 2)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+    expect(sendOrderCreated).toHaveBeenCalledWith(order.id, loc.id)
+  })
+
+  it('does not re-fire once the flip is older than the fan-out dedupe window', async () => {
+    // Inngest deduplicates an event id for 24 hours; Stripe retries a 5xx for three
+    // days, and in a printer-only shop an order sits at NEW indefinitely. So a day-three
+    // retry would find NEW + PAID + the same intent and — without this bound — re-run
+    // the fan-out for real and text the owner about an order they served yesterday.
+    // The print leg would still refuse a second ticket; the SMS leg has no such guard.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 30)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('does not re-fire a flip that left no audit row, because it was not ours', async () => {
+    // The re-fire reads the flip's own `payment_succeeded` event for its age, and the
+    // absence of one is a provenance signal rather than a missing timestamp: this
+    // handler always writes that row, so an order that is NEW and paid without one was
+    // put there by something else — a migration, a repair script, a future admin action.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, null)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('does not re-fire for a paid order that is past NEW', async () => {
+    // The conjunct that stops the re-fire becoming a nuisance. An order the kitchen
+    // has already accepted, completed or cancelled still holds the intent and is still
+    // PAID — so without the `status === 'NEW'` check, every late delivery about a
+    // finished order would put its ticket back on a printer.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    const intentId = order.stripePaymentIntentId!
+    expect((await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: intentId,
+    }))).status).toBe(200)
+    // Where a staff cancellation leaves it: paid, holding the intent, and terminal.
+    await withLocation(loc.id, (tx) =>
+      tx.update(orders).set({ status: 'CANCELED', canceledAt: new Date() }).where(eq(orders.id, order.id)))
+    sendOrderCreated.mockClear()
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: intentId,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+    expect((await readOrder(loc.id, order.id)).status).toBe('CANCELED')
+  })
+
+  it('will not flip an order that is not in the location the event names', async () => {
+    // The scope comes from `metadata.locationId`, and RLS is what enforces it: opened
+    // against the wrong location, the order is simply not there. A cross-tenant flip
+    // has to read as "no such order", never as a 500 and never as a write.
+    const locA = await restaurant()
+    const locB = await restaurant()
+    const { order } = await seedCardOrder(locA.id)
+
+    const res = await deliver(succeededEvent({ orderId: order.id, locationId: locB.id }))
+    expect(res.status).toBe(200)
+
+    const untouched = await readOrder(locA.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('will not flip an order with money that originated on another connected account', async () => {
+    // The attack this closes. A signed event proves Stripe sent it, not whose money it
+    // is — and every restaurant on this platform has a connected account and can mint
+    // a PaymentIntent with any metadata it likes. Without the account check, a
+    // competitor could pay 50¢ on their own account, name a victim's ids in the
+    // metadata, and have us mark the victim's order PAID and send it to the kitchen.
+    //
+    // The order here has no intent id of its own, which is the heal path — the one
+    // place the intent-mismatch check cannot help.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id, null)
+    expect(order.stripePaymentIntentId).toBeNull()
+
+    const event = succeededEvent({
+      orderId: order.id,
+      locationId: loc.id,
+      account: 'acct_test_the_competitor',
+      amount: ORDER_TOTAL_CENTS,
+    })
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+    // Recorded, so the attempt is on file — and refused.
+    expect(await claimRows(event.id)).toHaveLength(1)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(untouched.stripePaymentIntentId).toBeNull()
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+
+    // **And somebody is told.** This is an attempted theft, not a data-quality
+    // wobble: a `console.error` on a serverless function is a line in a log nobody
+    // reads until they are already looking for it. The event is keyed on the Stripe
+    // delivery so the three days of retries behind it ring one phone, not hundreds.
+    expect(sendProvenanceRefused).toHaveBeenCalledTimes(1)
+    expect(sendProvenanceRefused).toHaveBeenCalledWith(
+      { orderId: order.id, locationId: loc.id, reason: 'account_mismatch' },
+      event.id,
+    )
+  })
+
+  it('will not flip an order for less money than it is owed', async () => {
+    // The other half of provenance: right account, wrong amount. An intent for 50¢
+    // against a $45.24 order is not a payment, and "mark it paid and feed them" is the
+    // wrong answer even when the money genuinely came from this restaurant's account.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    const event = succeededEvent({
+      orderId: order.id,
+      locationId: loc.id,
+      paymentIntentId: order.stripePaymentIntentId!,
+      amount: 50,
+    })
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+
+    expect(sendProvenanceRefused).toHaveBeenCalledTimes(1)
+    expect(sendProvenanceRefused).toHaveBeenCalledWith(
+      { orderId: order.id, locationId: loc.id, reason: 'amount_mismatch' },
+      event.id,
+    )
+  })
+
+  it('says nothing about provenance when the money is the order\'s own', async () => {
+    // The control. An alarm that fires on every ordinary payment is an alarm nobody
+    // reads by the second service.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+
+    expect(sendProvenanceRefused).not.toHaveBeenCalled()
+  })
+
+  it('answers a retryable 5xx — not 400 — when the signing secret is missing', async () => {
+    // The failure mode this prevents is silent and total. `env()` throws on a blank
+    // var; read inside the signature try, that throw comes back 400 `invalid_signature`
+    // — so one unset env var on a deploy answers every genuine payment with "you are a
+    // forger", flips nothing, and leaves a log that says only "forged request". A 5xx
+    // is retryable, so the orders flip once the config is fixed.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    vi.stubEnv('STRIPE_WEBHOOK_SECRET', '')
+
+    try {
+      const event = succeededEvent({
+        orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+      })
+      const res = await deliver(event)
+      expect(res.status).toBeGreaterThanOrEqual(500)
+      expect((await res.json()).error).toBe('webhook_misconfigured')
+      // Nothing claimed: the event is untouched and Stripe's retry gets a clean run
+      // the moment the secret is set.
+      expect(await claimRows(event.id)).toHaveLength(0)
+      expect(constructEvent).not.toHaveBeenCalled()
+
+      const untouched = await readOrder(loc.id, order.id)
+      expect(untouched.status).toBe('PENDING_PAYMENT')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('will not mark an order paid against an intent that is not the one it holds', async () => {
+    // The order already named its PaymentIntent at checkout. An event about a
+    // different one is either our bug or someone else's payment, and "mark it paid
+    // and feed them" is the wrong guess either way — so it fails closed and loudly.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: 'pi_test_someone_elses',
+    }))
+    expect(res.status).toBe(200)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('answers 200 for a succeeded intent whose metadata does not name an order', async () => {
+    // Nothing here is retryable — a malformed event is malformed on every delivery —
+    // so it is claimed, recorded and dropped rather than made into a retry storm.
+    const event = succeededEvent({ orderId: 'not-a-uuid', locationId: 'also-not-a-uuid' })
+    const res = await deliver(event)
+    expect(res.status).toBe(200)
+    expect(await claimRows(event.id)).toHaveLength(1)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('releases its claim when the fan-out fails, and the retry re-fires it', async () => {
+    // The cost of claiming *before* handling: a handler that dies has already taken
+    // the id, and the retry would read as "already processed" and be dropped. So the
+    // claim is released on the way out of an unexpected failure.
+    //
+    // And this is the exact shape of the lost fan-out: the flip is committed, the
+    // announcement is not. The retry has to finish the job — a 200 that changed
+    // nothing would leave a paid order no kitchen has heard of.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    sendOrderCreated.mockRejectedValueOnce(new Error('inngest is down'))
+
+    const event = succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    })
+    const res = await deliver(event)
+    expect(res.status).toBe(500)
+    expect(await claimRows(event.id)).toHaveLength(0)
+    expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+
+    // The flip itself committed — it is its own transaction, and the money really did
+    // move. Stripe's retry therefore lands on an order that is already NEW.
+    const flipped = await readOrder(loc.id, order.id)
+    expect(flipped.status).toBe('NEW')
+    const eventsAfterFailure = await countEvents(loc.id, order.id)
+
+    const retry = await deliver(event)
+    expect(retry.status).toBe(200)
+    // Nothing re-written…
+    expect(await readOrder(loc.id, order.id)).toEqual(flipped)
+    expect(await countEvents(loc.id, order.id)).toBe(eventsAfterFailure)
+    // …and the kitchen finally told. This is the assertion the whole re-fire branch
+    // exists for: before it, this retry was a silent no-op and the order was lost.
+    expect(sendOrderCreated).toHaveBeenCalledTimes(2)
+    expect(sendOrderCreated).toHaveBeenLastCalledWith(order.id, loc.id)
+  })
+})
