@@ -21,6 +21,8 @@ Everything in Plan 1's Global Constraints still binds (money = integer cents; RL
 - **No customer accounts, no saved cards** (v1 scope). Guest checkout: name + phone (+ optional email).
 - **Data accuracy** (house rule): Kashi's 92 items come from their published menu/ordering data verbatim; nothing invented. Unsourced modifier structure must be flagged `NEEDS_KASHI_CONFIRMATION` in the seed, greppable.
 - **The storefront and the feed must not regress each other**: full suite green after every task; the spine's 462 tests are the floor.
+- **Public routing key is `locations.storefront_slug`, platform-unique** (ruling added 2026-09-22 after Task 1: the org-scoped `locations.slug` is ambiguous across tenants on a public route, and Kashi's location slug is `livingston` while the customer URL must read `kashi`). `slug` stays the org-scoped internal key used by the authed feed/86/pause routes; `storefront_slug` is what `/order/[slug]` and the storefront API resolve. Multi-location reads `kashi-livingston`.
+- **The snapshot payload carries everything a dish card renders** — name, description, photoUrl, tags, price, is86d, and modifier groups with effective limits (extended 2026-09-22 after Task 1; browse may not fall back to live tables to fill gaps).
 
 ## External accounts (Rohan's side — from the followups doc, restated)
 
@@ -212,7 +214,7 @@ sentry.*.config.ts
 **Interfaces:**
 - Own Vercel project `serveside` (NEVER inside client-sites — spec boundary), importing github.com/RohanSRamnani/serveside, main = production. Env per the followups doc's launch gates. Neon prod branch created + migrated + `db:app-user` (the runbook scripts each step; the boot guard enforces the role).
 - Inngest cloud app registered against the deployed `/api/inngest`; Stripe CONNECT webhook pointed at the deployed `/api/stripe/webhook`; Clerk production instance.
-- **This task is checklist + runbook + the parts doable from CLI (vercel project can be created/linked via `npx vercel link/deploy` if authed); every step needing Rohan's dashboards is written as HIS checklist item, not skipped silently.** The task is DONE when a preview deployment serves `/order/kashi` from the prod-candidate database and the runbook's remaining items are explicitly listed.
+- **This task is checklist + runbook + the parts doable from CLI (vercel project can be created/linked via `npx vercel link/deploy` if authed); every step needing Rohan's dashboards is written as HIS checklist item, not skipped silently.** The task is DONE when a preview deployment serves `/order/kashi` (Kashi's `storefront_slug`, per Global Constraints) from the prod-candidate database and the runbook's remaining items are explicitly listed.
 
 - [ ] **Step 1: Write the runbook from the followups doc; execute the CLI-able parts; verify the preview deployment end-to-end (browse renders, status page loads).**
 - [ ] **Step 2: Commit** — `feat: deploy runbook + Vercel project, preview serving the storefront`
