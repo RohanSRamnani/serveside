@@ -84,12 +84,14 @@ export function soldOut(item: SnapshotItem): boolean {
   return item.modifierGroups.some((group) => group.minSelect > 0 && pickable(group) === 0)
 }
 
+/** How many of this group's options are ticked. */
+function chosenIn(group: SnapshotModifierGroup, selected: readonly string[]): number {
+  return group.options.filter((option) => selected.includes(option.id)).length
+}
+
 /** Groups still owed an answer, in the order they are pinned. */
 function unmet(item: SnapshotItem, selected: readonly string[]): SnapshotModifierGroup[] {
-  return item.modifierGroups.filter((group) => {
-    const chosen = group.options.filter((option) => selected.includes(option.id)).length
-    return chosen < group.minSelect
-  })
+  return item.modifierGroups.filter((group) => chosenIn(group, selected) < group.minSelect)
 }
 
 /**
@@ -103,17 +105,26 @@ function unmet(item: SnapshotItem, selected: readonly string[]): SnapshotModifie
  *
  * Only the first unanswered group is named. Two instructions at once is a customer
  * reading a form; one is a customer tapping a button.
+ *
+ * **The group's name is worn as a label, never slotted into a sentence.** The first
+ * version of this said `Choose a ${name}`, which is English only when the name is a
+ * bare noun — "Choose a Spice Level" reads, but the names restaurants actually write
+ * are imperative phrases, and that shape produced "Choose an Add Rice", "Choose a
+ * Select a Side" and "Choose a Choose Spice Level". We do not control the wording:
+ * Kashi's group names come verbatim from their published ordering data, and this is
+ * the primary button on the dish sheet. Name first, instruction after, no article,
+ * and every shape reads.
+ *
+ * The count is what is **still owed**, not the group's total, because after one pick
+ * of two "choose 2" reads as though the pick did not register.
  */
 export function addBlockedReason(item: SnapshotItem, selected: readonly string[]): string | null {
   if (soldOut(item)) return 'Sold out today'
   const [first] = unmet(item, selected)
   if (!first) return null
-  return `Choose ${article(first.name)} ${first.name}`
-}
-
-/** "a Spice Level", "an Add a side" — the article the group's own name takes. */
-function article(name: string): string {
-  return /^[aeiou]/i.test(name) ? 'an' : 'a'
+  const chosen = chosenIn(first, selected)
+  const owed = first.minSelect - chosen
+  return `${first.name} — choose ${owed}${chosen > 0 ? ' more' : ''}`
 }
 
 /**
@@ -631,7 +642,7 @@ export function DishSheetView({
 
         <div className="ss-sheet-body">
           {item.modifierGroups.map((group) => {
-            const chosen = group.options.filter((option) => selected.includes(option.id)).length
+            const chosen = chosenIn(group, selected)
             const atCap = group.maxSelect > 1 && chosen >= group.maxSelect
             return (
               <fieldset key={group.id} className="ss-group">

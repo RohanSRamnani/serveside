@@ -266,7 +266,7 @@ describe('the dish sheet', () => {
   it('blocks Add until a mandatory group has been answered, and says which one', () => {
     const markup = sheet()
     expect(markup).toMatch(/<button[^>]*data-add="1"[^>]*disabled/)
-    expect(markup).toContain('Choose a Spice Level')
+    expect(markup).toContain('Spice Level — choose 1')
   })
 
   it('lets the dish be added once the choice is made, priced with the delta on it', () => {
@@ -274,7 +274,7 @@ describe('the dish sheet', () => {
     expect(markup).not.toMatch(/<button[^>]*data-add="1"[^>]*disabled/)
     // 1800 + 50.
     expect(markup).toContain('Add — $18.50')
-    expect(markup).not.toContain('Choose a Spice Level')
+    expect(markup).not.toContain('Spice Level — choose 1')
   })
 
   it('multiplies the whole line, modifiers included, by the quantity', () => {
@@ -356,14 +356,43 @@ describe('the decisions a sheet makes', () => {
     // item that opted out of a normally-mandatory group. `required` is display intent.
     const optedOut: SnapshotModifierGroup = { ...SPICE, minSelect: 0, required: true }
     expect(addBlockedReason(item({ modifierGroups: [optedOut] }), [])).toBeNull()
-    expect(addBlockedReason(item({ modifierGroups: [SPICE] }), [])).toBe('Choose a Spice Level')
+    expect(addBlockedReason(item({ modifierGroups: [SPICE] }), [])).toBe('Spice Level — choose 1')
     expect(addBlockedReason(item({ modifierGroups: [SPICE] }), ['opt-mild'])).toBeNull()
   })
 
   it('names the first unanswered group, so a customer is told one thing to do', () => {
     const twoMandatory = item({ modifierGroups: [SPICE, { ...SIDES, minSelect: 1 }] })
-    expect(addBlockedReason(twoMandatory, [])).toBe('Choose a Spice Level')
-    expect(addBlockedReason(twoMandatory, ['opt-hot'])).toBe('Choose an Add a side')
+    expect(addBlockedReason(twoMandatory, [])).toBe('Spice Level — choose 1')
+    expect(addBlockedReason(twoMandatory, ['opt-hot'])).toBe('Add a side — choose 1')
+  })
+
+  it('wears the group’s name as a label, so every shape a restaurant writes reads as English', () => {
+    // We do not write these names — Kashi's come verbatim from their published
+    // ordering data — and this string is the primary button on the dish sheet. An
+    // earlier version slotted the name into a sentence (`Choose a ${name}`), which
+    // reads only for a bare noun: the imperative names below produced "Choose an Add
+    // Rice", "Choose a Select a Side" and "Choose a Choose Spice Level".
+    const blocked = (name: string, minSelect = 1) => addBlockedReason(
+      item({ modifierGroups: [{ ...SPICE, name, minSelect }] }),
+      [],
+    )
+    expect(blocked('Spice Level')).toBe('Spice Level — choose 1')
+    expect(blocked('Add Rice')).toBe('Add Rice — choose 1')
+    expect(blocked('Select a Side')).toBe('Select a Side — choose 1')
+    expect(blocked('Choose Spice Level')).toBe('Choose Spice Level — choose 1')
+    // No article is ever prepended, whatever letter the name starts with.
+    for (const name of ['Spice Level', 'Add Rice', 'Select a Side', 'Extras']) {
+      expect(blocked(name), name).not.toMatch(/\bChoose an? [A-Z]/)
+    }
+  })
+
+  it('counts what is still owed, not the group’s total', () => {
+    // A group that takes two, with one already picked. "choose 2" there reads as
+    // though the first pick did not register.
+    const pickTwo = item({ modifierGroups: [{ ...SIDES, name: 'Toppings', minSelect: 2 }] })
+    expect(addBlockedReason(pickTwo, [])).toBe('Toppings — choose 2')
+    expect(addBlockedReason(pickTwo, ['opt-naan'])).toBe('Toppings — choose 1 more')
+    expect(addBlockedReason(pickTwo, ['opt-naan', 'opt-raita'])).toBeNull()
   })
 
   it('adds every chosen delta to the base price, including a negative one', () => {
