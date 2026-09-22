@@ -73,6 +73,26 @@ sentry.*.config.ts
 
 ---
 
+### Task 1.5: Spine interface work — fuller snapshot payload + the public routing key
+
+Added 2026-09-22 after Task 1's review. These touch Plan-1 spine files, so they
+get their own gate rather than riding inside the browse page's task. Task 2 is
+blocked until this lands.
+
+**Files:**
+- Modify: `src/db/schema/snapshots.ts` (payload types), `src/domain/snapshot.ts` (builder), `src/db/schema/tenancy.ts` (+ migration), `src/domain/storefront.ts` + `src/app/api/storefront/[location]/route.ts` (re-key + taxRatePer100k)
+- Test: the existing snapshot, storefront and route test files
+
+**Interfaces:**
+- `SnapshotItem` grows `description: string | null`, `photoUrl: string | null`, `tags: string[]` — `buildMenuSnapshot` populates them from the live rows it already reads. Existing snapshot rows predate the fields: they are IMMUTABLE, so they must not be rewritten — readers treat the fields as optional-absent and the seed's rebuild produces complete ones. State that rule where the type is declared.
+- `locations.storefront_slug` — text, NOT NULL, **platform-unique**, the public routing key (`slug` stays the org-scoped internal key the authed routes use). Migration backfills existing rows (Kashi's → `kashi`, others → their `slug` where that is already globally unique, else `<org-slug>-<slug>`). `storefrontView`/the route resolve on it; keep Task 1's ambiguous-slug refusal branch as defense-in-depth even though uniqueness makes it unreachable.
+- `StorefrontView.location` gains `taxRatePer100k` (Task 3's cart needs it for display-only totals).
+
+- [ ] **Step 1: Failing tests** — a rebuilt snapshot carries description/photoUrl/tags verbatim from the live rows (including a null photoUrl and a multi-tag dish); an OLD snapshot row still reads without throwing; two locations in different orgs cannot both take `storefront_slug` 'kashi' (unique violation); the route resolves by `storefront_slug` and 404s on an org-scoped `slug` that is not a storefront slug; the view carries `taxRatePer100k`.
+- [ ] **Step 2: Implement; migrate both branches; full suite green (476 floor); commit** — `feat: dish-card fields in the snapshot payload, platform-unique storefront slugs`
+
+---
+
 ### Task 2: Menu browse page
 
 **Files:**
