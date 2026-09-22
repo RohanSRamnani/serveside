@@ -70,6 +70,23 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   answers its ordinary miss, which is correct. The view also publishes
   `taxRatePer100k` — display-only, so a cart can show a tax line before there is an
   order to ask about; what is charged is still recomputed by `POST /api/orders`.
+  The slug lookup itself is `resolveStorefrontSlug` (same file), **shared** by the
+  route and the page so the clamp and the two-match refusal cannot drift.
+- **`/order/[location]` is the customer's menu, and it is the storefront's front
+  door.** `src/app/order/[location]/page.tsx` is a server component that calls
+  `storefrontView` **directly** — never its own `/api/storefront` — and reads it plus
+  `todayServiceWindows` on **one** `withLocation`, so the menu, "are you open" and
+  today's hours are one instant of the database. Every miss (unknown slug, the
+  internal `locations.slug`, no pinned menu) is the same `notFound()`, the route's
+  no-oracle doctrine. It is **rendered per request** and deliberately carries no
+  `revalidate` — see Gotchas. `browse.tsx` is the client: sticky category chips whose
+  active chip tracks scroll, dish cards with photo-or-typographic-plate, tags as
+  pills, 86'd dishes shown and unaddable, and an in-page dish sheet that enforces the
+  pinned `minSelect`/`maxSelect` as a courtesy (the server re-enforces them).
+  `cart-provider.tsx` holds the cart in React context, persisted to `localStorage`
+  **keyed by the public slug** (one origin serves every storefront) and shape-checked
+  on the way back in. Every figure either page shows comes from `src/lib/money.ts`;
+  the cart's totals are display-only.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
@@ -266,11 +283,14 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **`src/proxy.ts` (Next 16's `middleware.ts`) authorizes nothing.** It attaches the
   Clerk session so `auth()` can read it, and that is all; `createRouteMatcher` is
   deprecated in `@clerk/nextjs` 7 precisely because path matching drifts from routing
-  and fails open. Its `matcher` **excludes** `/api/stripe/`, `/api/printers/`,
-  `/api/inngest`, `/api/storefront/` and `POST /api/orders` — those are authenticated
-  by a signature, a MAC, a signing key and nothing at all, and `clerkMiddleware()`
-  throws on a missing publishable key, so left in, one blank env var stops a kitchen
-  printing and takes the public menu off the street. The matcher
+  and fails open. Its `matcher` **excludes** `/order/`, `/api/stripe/`,
+  `/api/printers/`, `/api/inngest`, `/api/storefront/` and `POST /api/orders` — those
+  are authenticated by a signature, a MAC, a signing key and nothing at all, and
+  `clerkMiddleware()` throws on a missing publishable key, so left in, one blank env
+  var stops a kitchen printing and takes the public menu off the street. `/order/` is
+  the one a customer sees: it was inside the matcher until the page existed, and the
+  symptom was the whole storefront answering 500 with a message about `npx clerk
+  init`. There are no customer accounts, so there is no session to attach. The matcher
   must be **one string literal**: Next extracts it by static analysis, and a
   concatenation is silently dropped, which looks exactly like the exclusions not working.
 - **The feed's `since` is a floor, not a cursor.** `GET /api/feed?location=&since=`
@@ -387,6 +407,23 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `@types/node` stays on `^22` (Node 22, and vitest 5 peer-requires it). The Next
   template's `^20` fails the install.
 - `next dev` rewrites the marker block in `AGENTS.md`. Commit the change, don't fight it.
+- **`export const revalidate` is a no-op on any page that reads the database**, and
+  the build output says so (`ƒ`, and the response is `no-cache, no-store`). The Neon
+  HTTP driver reads through `fetch`, an uncached `fetch` has made a route dynamic
+  since Next 15, and a dynamic route ignores its segment's revalidate. So a page is
+  always fresh — and gets no CDN staleness to survive a database blip with. Caching a
+  DB-backed page means `unstable_cache` or a CDN header, not a segment config.
+- **Never `scrollIntoView` an element inside a `position: sticky` bar.** It aims at
+  the element's *static* layout position, not where it is painted while stuck, so the
+  page smooth-scrolls itself back to wherever that bar statically sits — the
+  storefront's chip rail threw a customer back to the top of the menu every time the
+  active chip changed. Scroll the rail's own `scrollLeft` instead (`browse.tsx`).
+- **A `useEffect` that writes state read by an earlier effect on the same commit
+  writes the pre-read value.** The cart's `localStorage` save ran on mount, saw a
+  `loaded` ref the read effect had just set, and wrote the first render's empty cart
+  over the stored one — so every reload came back empty. The fix is to pair the data
+  with the key it was read for *in state*, so "not read yet" and "read, and empty"
+  are different renders rather than the same ref (`cart-provider.tsx`).
 - **Two drivers, and the choice is not stylistic.** `db()` is neon-http: stateless,
   no session, no transactions (`db().transaction()` throws), so it can never carry
   the RLS scope — it is for the three tables that are not location-scoped

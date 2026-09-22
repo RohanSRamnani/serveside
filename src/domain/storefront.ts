@@ -120,6 +120,68 @@ export class NoMenuError extends Error {
 }
 
 /**
+ * What a public storefront slug is allowed to look like, checked **before** the
+ * value reaches a query or a log line.
+ *
+ * Deliberately a shape clamp rather than a validation of any particular slug:
+ * `locations.storefront_slug` is `text`, and this only has to guarantee that what
+ * goes further is a short, boring token. Without it a megabyte of URL path is a
+ * megabyte in the log on every request, on surfaces that have nothing in front of
+ * them, and a newline in a slug lets a stranger write their own lines into our logs.
+ */
+const STOREFRONT_SLUG = /^[A-Za-z0-9_-]{1,64}$/
+
+/**
+ * Public storefront slug → location id, for a caller with no org to resolve it
+ * inside. `null` is every kind of miss.
+ *
+ * **Shared by the public API route and the browse page on purpose.** It is the one
+ * slug-first lookup in the codebase, and the stake in getting it wrong is not
+ * cosmetic — a customer browsing one restaurant's menu at another's URL places an
+ * order that sends real food to the wrong kitchen and real money to the wrong Stripe
+ * account. Two copies of that rule is one copy that can drift.
+ *
+ * **It resolves `locations.storefront_slug`, and never `locations.slug`.** The two
+ * are different keys for different callers: `slug` is org-scoped and internal, and
+ * every authed path resolves the Clerk org first and the slug inside it
+ * (`src/lib/authz.ts`), which is what makes two restaurants both calling a location
+ * `main` harmless. A customer has no org, so `slug` cannot support this lookup: it is
+ * ambiguous by design. Handed an internal slug this finds nothing, which is correct.
+ *
+ * **The two-match refusal is kept although `locations_storefront_slug_unique` makes
+ * it unreachable.** It is defence in depth and cheap: a future migration could drop
+ * the constraint and a restore could arrive without it, and picking one of two would
+ * be a coin toss between tenants. A dark page gets a phone call within the hour; a
+ * wrong menu might never get one. `limit(2)` rather than `limit(1)` because the
+ * second row is the whole question.
+ *
+ * `locations` carries no RLS — there is nothing to scope to until we know which
+ * location this is — so the stateless driver reads it. Everything after this point
+ * is ordinary `withLocation` code.
+ */
+export async function resolveStorefrontSlug(slug: string): Promise<string | null> {
+  // Clamped first: everything below either queries with this value or logs it.
+  if (!STOREFRONT_SLUG.test(slug)) return null
+
+  const rows = await db()
+    .select({ id: locations.id })
+    .from(locations)
+    .where(eq(locations.storefrontSlug, slug))
+    .limit(2)
+
+  if (rows.length === 0) return null
+  if (rows.length > 1) {
+    console.error(
+      '[storefront] storefront slug', slug, 'names more than one location;',
+      'refusing to guess. locations_storefront_slug_unique should have made this',
+      'impossible — check that the constraint is still on the table.',
+    )
+    return null
+  }
+  return rows[0].id
+}
+
+/**
  * One read of a storefront, scoped to one location.
  *
  * Takes a location **id**, not a slug: resolving a slug is the caller's job, and on

@@ -1,10 +1,16 @@
-import { and, eq, gt, lte } from 'drizzle-orm'
+import { and, asc, eq, gt, lte } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { businessHours, holidayClosures, locations, orderPauses } from '@/db/schema'
 import { withLocation, type ScopedTx } from '@/repo/scoped'
 
 export type ClosedReason = 'closed_hours' | 'holiday' | 'paused'
 export type OpenState = { open: boolean; reason?: ClosedReason }
+
+/**
+ * One row of the weekly grid, as wall-clock strings (`HH:MM:SS`) in the location's
+ * own timezone — never an instant. `closeTime` may legitimately be `24:00:00`.
+ */
+export type ServiceWindow = { openTime: string; closeTime: string }
 
 /** `Intl` weekday short names → `business_hours.dow` (0 = Sunday). */
 const DOW_BY_WEEKDAY: Record<string, number> = {
@@ -45,6 +51,51 @@ export async function isOpenAt(locationId: string, at: Date, tx?: ScopedTx): Pro
   const local = localWallClock(at, location.timezone)
   if (!tx) return withLocation(locationId, (scoped) => readState(scoped, locationId, at, local))
   return readState(tx, locationId, at, local)
+}
+
+/**
+ * The hours posted for the day it currently is **at the restaurant** — what a
+ * customer reads off a door, and the storefront header's one honest answer to
+ * "well, when are you open then?".
+ *
+ * Several rows is the normal case, not the exception: split service is two rows and
+ * `business_hours` is deliberately not unique on `(location_id, dow)`. They come back
+ * in opening order so lunch is printed before dinner.
+ *
+ * Deliberately **not** folded into `isOpenAt`. That answers a yes/no question the
+ * order path gates on, and it must stay the cheapest read in the codebase — three
+ * `limit(1)`s — whereas this is copy for one page and is wanted even when the answer
+ * is "closed". It also cannot be derived from `OpenState`: a paused or holiday-closed
+ * restaurant still has hours posted for today, which is exactly what makes "try again
+ * in an hour" and "come back tomorrow" different sentences.
+ *
+ * A row that says 17:00–24:00 belongs to today; the 00:00–02:00 half of the same
+ * shift is tomorrow's row, and is today's first window. That is the no-midnight-wrap
+ * convention, not a quirk to correct for here.
+ */
+export async function todayServiceWindows(
+  locationId: string,
+  at: Date,
+  tx?: ScopedTx,
+): Promise<ServiceWindow[]> {
+  const location = await db().query.locations.findFirst({
+    where: eq(locations.id, locationId),
+    columns: { timezone: true },
+  })
+  if (!location) throw new Error(`Unknown location ${locationId}`)
+
+  const { dow } = localWallClock(at, location.timezone)
+  const read = (scoped: ScopedTx) => scoped
+    .select({ openTime: businessHours.openTime, closeTime: businessHours.closeTime })
+    .from(businessHours)
+    // The `location_id` predicate is written out for the reason `storefrontView`
+    // gives: this is a read a browser renders, and it must not depend on a policy
+    // being live.
+    .where(and(eq(businessHours.locationId, locationId), eq(businessHours.dow, dow)))
+    .orderBy(asc(businessHours.openTime))
+
+  if (!tx) return withLocation(locationId, read)
+  return read(tx)
 }
 
 /**

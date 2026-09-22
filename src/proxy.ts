@@ -32,12 +32,19 @@ export default clerkMiddleware()
  * CloudPRNT printer by the MAC burnt into it, Inngest by its signing key, and public
  * checkout and the public menu by nothing at all — none of them has a session, and
  * none of them should stop working because a Clerk key is blank, expired or rotated.
- * `api/storefront/` is the last of those and the most visible: it is what a customer
- * standing outside the restaurant loads, so a Clerk problem must not be able to take
- * a menu off the street. Left in, they all break:
- * `clerkMiddleware()` throws on a missing publishable key before a request reaches a
- * route, so one unset env var would silently stop a kitchen printing and stop paid
- * orders reaching it.
+ * Left in, they all break: `clerkMiddleware()` throws on a missing publishable key
+ * before a request reaches a route, so one unset env var would silently stop a
+ * kitchen printing and stop paid orders reaching it.
+ *
+ * **`order/` is the most visible of them and the reason this list grew** (Task 2): it
+ * is the customer's menu, the thing a QR code on a table and a Google listing's
+ * "Order Online" button both point at. There is nobody to attach a session *to* —
+ * there are no customer accounts — so running it through Clerk buys a public page an
+ * auth round trip, a `Set-Cookie` that argues with the page's own 30-second cache,
+ * and a hard dependency on a key it never reads. It was inside the matcher until the
+ * page existed to notice, and the symptom was the whole storefront answering 500 with
+ * a message about `npx clerk init`. `api/storefront/` is the same surface for the
+ * voice agent and anything else off-page.
  *
  * Everything else is included rather than allow-listed, so a new authed route — Task
  * 13's `/api/menu/86` and `/api/pause` — is covered the day it lands. That direction
@@ -54,5 +61,5 @@ export default clerkMiddleware()
  * all. That failure looks exactly like the exclusions not working.
  */
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|api/stripe/|api/printers/|api/inngest|api/storefront/|api/orders$).*)'],
+  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|order/|api/stripe/|api/printers/|api/inngest|api/storefront/|api/orders$).*)'],
 }
