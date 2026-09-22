@@ -14,7 +14,7 @@
 -- their location slug is `livingston` (their street, which is how their staff say
 -- which shop) and the customer URL has to read `/order/kashi`.
 --
--- Five statements, and the order is the whole point: **a NOT NULL column is never
+-- Seven statements, and the order is the whole point: **a NOT NULL column is never
 -- left unfilled mid-flight.** Added nullable, backfilled, checked, and only then
 -- constrained — an `ADD COLUMN ... NOT NULL` on a table with rows fails outright, and
 -- an `ADD CONSTRAINT UNIQUE` on a half-backfilled table fails with an error that says
