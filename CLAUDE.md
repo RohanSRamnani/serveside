@@ -85,8 +85,22 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   pinned `minSelect`/`maxSelect` as a courtesy (the server re-enforces them).
   `cart-provider.tsx` holds the cart in React context, persisted to `localStorage`
   **keyed by the public slug** (one origin serves every storefront) and shape-checked
-  on the way back in. Every figure either page shows comes from `src/lib/money.ts`;
-  the cart's totals are display-only.
+  on the way back in; `shouldPersist(store, slug)` is the one decision about whether a
+  write is safe, and it is tested. `cart-drawer.tsx` is the cart opened — lines with
+  steppers (at qty 1 the minus *removes*), subtotal/tax/**estimated total**, and the
+  Checkout button, which is enabled exactly when `view.open.open` is true and
+  otherwise disabled beside `closedNotice`'s own sentence, handed down rather than
+  rewritten. Its CSS ships beside it (`CART_CSS`) and is concatenated into
+  `browse.tsx`'s one `<style>` — see Gotchas.
+  Every figure either page shows comes from `src/lib/money.ts`; the cart's totals are
+  **display-only** and live in `src/lib/cart.ts` (`cartTotals`, `lineTotalCents`,
+  `cartSubtotalCents` — one subtotal, no money rule of its own, and **pre-tip**:
+  `POST /api/orders` recomputes the charge and adds the tip). The bounds an order is
+  built inside — `MAX_LINES_PER_ORDER`, `MAX_QTY_PER_LINE`, `MAX_TEXT_FIELD_LENGTH`,
+  plus the stepper's narrower `MAX_QTY_PER_STEPPER` — are `src/lib/order-limits.ts`,
+  imported by both `create-order.ts` and the cart. It has **no imports of its own** on
+  purpose: the browser needs those numbers and must not reach a server module for
+  them.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
@@ -413,6 +427,13 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   since Next 15, and a dynamic route ignores its segment's revalidate. So a page is
   always fresh — and gets no CDN staleness to survive a database blip with. Caching a
   DB-backed page means `unstable_cache` or a CDN header, not a segment config.
+- **`<style>{A}{B}</style>` is two text nodes, and it fails hydration.** The server
+  flattens them into one run of HTML and the client expects two children, so the whole
+  page re-renders with a message that says nothing about a stylesheet. Concatenate
+  first — `{A + B}` — which is how `browse.tsx` joins its own CSS to the drawer's.
+  While there: **no backticks inside those CSS strings.** They are template literals,
+  and a Markdown-style `code span` in a CSS comment ends the string. The failure is a
+  build error in the middle of the rules, which reads as a CSS problem and is not one.
 - **Never `scrollIntoView` an element inside a `position: sticky` bar.** It aims at
   the element's *static* layout position, not where it is painted while stuck, so the
   page smooth-scrolls itself back to wherever that bar statically sits — the

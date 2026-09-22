@@ -8,13 +8,17 @@ import { buildMenuSnapshot } from '@/domain/snapshot'
 import type { StorefrontView } from '@/domain/storefront'
 import { seedLocation, seedLocationWithMenu, seedBusinessHours } from '@/test/seed'
 import OrderPage from './[location]/page'
+import { cartSubtotalCents, cartTotals } from '@/lib/cart'
+import { formatCents } from '@/lib/money'
+import { MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
 import Browse, {
-  DishSheetView, NOTES_MAX, addBlockedReason, addLabel, anchorId, closedNotice,
+  DishSheetView, addBlockedReason, addLabel, anchorId, closedNotice,
   dishUnitPriceCents, formatPhone, formatServiceWindows, selectionHint, soldOut, tagPills,
   toggleOption,
 } from './[location]/browse'
+import { CartDrawerView } from './[location]/cart-drawer'
 import {
-  addToLines, cartSubtotalCents, parseStoredLines, removeAt, sameLine, setLineQty, storageKey,
+  addToLines, parseStoredLines, removeAt, sameLine, setLineQty, shouldPersist, storageKey,
   type CartLine,
 } from './[location]/cart-provider'
 
@@ -305,9 +309,12 @@ describe('the dish sheet', () => {
   })
 
   it('caps the note at exactly what the order path will accept', () => {
-    // 500 is `MAX_TEXT_FIELD_LENGTH` in `assertInputShape`. A textarea that let 600
-    // through would turn a customer's allergy note into a rejected order.
-    expect(NOTES_MAX).toBe(500)
+    // The textarea and `assertInputShape` now read the same constant out of
+    // `@/lib/order-limits`, so "exactly" is true by construction rather than by two
+    // files happening to agree. The literal is pinned here because the number
+    // reaching the markup is the thing a customer meets: a textarea that let 600
+    // through would turn their allergy note into a rejected order.
+    expect(MAX_TEXT_FIELD_LENGTH).toBe(500)
     expect(sheet()).toMatch(/<textarea[^>]*maxlength="500"/i)
   })
 
@@ -524,6 +531,8 @@ describe('the cart the dish sheet fills', () => {
   })
 
   it('adds the lines up with the same money helpers the server prices with', () => {
+    // `cartSubtotalCents` lives in `@/lib/cart` as of Task 3, so the bottom bar's
+    // number and the drawer's totals are one computation rather than two.
     expect(cartSubtotalCents([line({ qty: 2 }), line({ unitPriceCents: 500, qty: 1 })])).toBe(4200)
     expect(cartSubtotalCents([])).toBe(0)
   })
@@ -549,7 +558,131 @@ describe('the cart the dish sheet fills', () => {
     const lines = [line({ qty: 2, notes: 'extra crispy' })]
     expect(parseStoredLines(JSON.stringify({ v: 1, lines }))).toEqual(lines)
   })
+
+  it('never writes an empty cart it has not read yet over the stored one', () => {
+    // The regression this is here for: the save effect ran on mount, saw a `loaded`
+    // ref the read effect had just set, and wrote the first render's empty `lines`
+    // over the stored cart — so every reload came back empty. A ref cannot tell
+    // "not read yet" from "read, and genuinely empty"; pairing the lines with the
+    // slug they were read for can, and that decision is this function.
+    expect(shouldPersist({ slug: null, lines: [] }, 'kashi')).toBe(false)
+    expect(shouldPersist({ slug: 'kashi', lines: [line()] }, 'kashi')).toBe(true)
+  })
+
+  it('writes an emptied cart, because a cleared cart is a cart', () => {
+    // The other half of the same distinction, and the one a `loaded` ref got wrong
+    // in the opposite direction: removing the last line must reach storage, or a
+    // reload brings back the dinner the customer just deleted.
+    expect(shouldPersist({ slug: 'kashi', lines: [] }, 'kashi')).toBe(true)
+  })
+
+  it('does not write one restaurant’s cart under another’s key', () => {
+    // A slug the store was not read for is a store from the page before it. One
+    // origin serves every storefront, so writing it here would hand the customer
+    // another restaurant's dishes, priced from another restaurant's menu.
+    expect(shouldPersist({ slug: 'kashi', lines: [line()] }, 'marigold')).toBe(false)
+  })
 })
+
+describe('the cart drawer', () => {
+  function line(over: Partial<CartLine> = {}): CartLine {
+    return {
+      menuItemId: 'itm-butter-chicken',
+      name: 'Butter Chicken',
+      unitPriceCents: 2000,
+      qty: 1,
+      modifierOptionIds: ['opt-hot'],
+      modifierNames: ['Hot'],
+      modifierDeltaCents: 200,
+      ...over,
+    }
+  }
+
+  function drawer(over: Partial<Parameters<typeof CartDrawerView>[0]> = {}): string {
+    return renderToStaticMarkup(
+      <CartDrawerView
+        lines={[line({ qty: 2 })]}
+        taxRatePer100k={8875}
+        closedReason={null}
+        onQty={() => {}}
+        onRemove={() => {}}
+        onCheckout={() => {}}
+        onClose={() => {}}
+        {...over}
+      />,
+    )
+  }
+
+  it('shows every line, what was chosen on it, and what it comes to', () => {
+    const markup = drawer({
+      lines: [line({ qty: 2, modifierNames: ['Hot', 'Garlic naan'], notes: 'no cilantro' })],
+    })
+    expect(markup).toContain('Butter Chicken')
+    expect(markup).toContain('Hot')
+    expect(markup).toContain('Garlic naan')
+    expect(markup).toContain('no cilantro')
+    // 2 × $20.00. The line total, not the unit price: it is the number being
+    // committed to, the same way the Add button carries the line rather than the dish.
+    expect(markup).toContain('$40.00')
+  })
+
+  it('breaks the money out, and says the total is an estimate', () => {
+    // The labels are the whole reason a display-only total is honest. `cartTotals`
+    // is pre-tip and the server recomputes the charge, so a bare "Total" here would
+    // be a promise this page cannot keep.
+    const markup = drawer()
+    expect(markup).toContain('Subtotal')
+    expect(markup).toContain('$40.00')
+    expect(markup).toContain('Tax')
+    expect(markup).toContain('$3.55')
+    expect(markup).toContain('$43.55')
+    expect(markup).toContain('estimated — confirmed at payment')
+  })
+
+  it('lets a customer check out when the restaurant is open', () => {
+    expect(checkoutButton(drawer())).not.toContain('disabled')
+  })
+
+  it('refuses checkout when the kitchen is shut, in the words the header already used', () => {
+    // The reason is `closedNotice`'s, handed down — not a second copy of the
+    // wording. Two sentences for the same fact drift, and the one that drifts is
+    // always the one nobody reads.
+    const reason = closedNotice({ open: false, reason: 'paused' }, LUNCH_AND_DINNER)
+    const markup = drawer({ closedReason: reason })
+    expect(checkoutButton(markup)).toContain('disabled')
+    expect(markup).toContain('Not taking orders right now')
+  })
+
+  it('turns the last line’s minus into a remove, so a stepper can empty a line', () => {
+    // At one, stepping down means "take it off the order" — `setLineQty` already
+    // removes at zero, and a disabled minus would leave no way out of a line but a
+    // second control nobody looks for.
+    expect(drawer({ lines: [line({ qty: 1 })] })).toContain('Remove Butter Chicken')
+    expect(drawer({ lines: [line({ qty: 2 })] })).toContain('One fewer Butter Chicken')
+  })
+
+  it('says the cart is empty rather than showing $0.00 three times', () => {
+    const markup = drawer({ lines: [] })
+    expect(markup).toMatch(/nothing in your order/i)
+    expect(markup).not.toContain('estimated — confirmed at payment')
+  })
+
+  it('prices the drawer with the same helpers as everything else', () => {
+    // Not a second arithmetic path: whatever `cartTotals` says is what is rendered.
+    const lines = [line({ qty: 2 }), line({ unitPriceCents: 450, qty: 3 })]
+    const totals = cartTotals(lines, 8875)
+    const markup = drawer({ lines })
+    expect(markup).toContain(`$${formatCents(totals.totalCents)}`)
+    expect(markup).toContain(`$${formatCents(totals.taxCents)}`)
+  })
+})
+
+/** The Checkout button's own tag, so "disabled" is read off it and not off the drawer. */
+function checkoutButton(markup: string): string {
+  const match = /<button[^>]*data-checkout="1"[^>]*>/.exec(markup)
+  if (!match) throw new Error('no checkout button in the drawer')
+  return match[0]
+}
 
 describe('/order/[location]', () => {
   function render(slug: string): Promise<string> {

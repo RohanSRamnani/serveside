@@ -1,11 +1,14 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { cartSubtotalCents } from '@/lib/cart'
 import { formatCents, lineTotalCentsFor, unitPriceCentsFor } from '@/lib/money'
+import { MAX_QTY_PER_STEPPER, MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
 import type { SnapshotCategory, SnapshotItem, SnapshotModifierGroup } from '@/db/schema'
 import type { ServiceWindow, OpenState } from '@/domain/hours'
 import type { StorefrontView } from '@/domain/storefront'
-import { CartProvider, cartCount, cartSubtotalCents, useCart, type CartLine } from './cart-provider'
+import { CART_CSS, CartDrawer } from './cart-drawer'
+import { CartProvider, cartCount, useCart, type CartLine } from './cart-provider'
 
 /**
  * A restaurant's menu, on a phone, in the hand of someone who is hungry now.
@@ -42,19 +45,12 @@ import { CartProvider, cartCount, cartSubtotalCents, useCart, type CartLine } fr
  * this page comes out of `@/lib/money`.
  */
 
-/** The same cap `assertInputShape` puts on a line note. A textarea that let 600 through would lose the order. */
-export const NOTES_MAX = 500
+// The note cap and the stepper cap come from `@/lib/order-limits` — the same
+// constants `assertInputShape` and the cart read, so a textarea cannot let through
+// 600 characters the order path will refuse.
 
 /** Tall enough for the sticky chip rail, so an anchored section lands below it rather than under it. */
 const CHIP_OFFSET_PX = 96
-
-/**
- * What one tap-tap-tap of the stepper may reach. Deliberately lower than the order
- * path's 999-per-line: a stepper is for "make it three", and a customer who wants a
- * hundred samosas is a phone call, not a thumb. The cart still accepts what the
- * server does, so nothing here narrows what an order may contain.
- */
-const SHEET_MAX_QTY = 99
 
 // ---------------------------------------------------------------------------
 // The decisions, pulled out of the components so they can be tested without a
@@ -299,14 +295,36 @@ function Menu({ view, todayHours }: BrowseProps) {
   const { location, open, categories } = view
   const cart = useCart()
   const [openDish, setOpenDish] = useState<SnapshotItem | null>(null)
+  const [cartOpen, setCartOpen] = useState(false)
   const active = useActiveCategory(categories)
   const railRef = useActiveChipInView(active)
+  /**
+   * **One sentence, two places.** The header prints it and the drawer's Checkout
+   * button is disabled with it. `closedNotice` is the only thing that knows that a
+   * pause, a holiday and the weekly grid are three different next moves for the
+   * customer, and a second copy of that wording in the drawer would be the copy that
+   * drifts.
+   */
   const notice = closedNotice(open, todayHours)
 
   const add = useCallback((line: CartLine) => {
     cart.addLine(line)
     setOpenDish(null)
   }, [cart])
+
+  /**
+   * **Task 4 owns checkout; this is the seam it plugs into.**
+   *
+   * Deliberately a no-op rather than a `router.push` to a route that does not exist
+   * yet: a button that navigates to a 404 is worse than one that does nothing, and
+   * the contact/tip/consent step plus `POST /api/orders` is a task, not a href. The
+   * button itself is real — it is enabled exactly when the restaurant is open, which
+   * is the decision this task owns.
+   */
+  const checkout = useCallback(() => {
+    // TODO(plan-2/task-4): open the checkout step (contact, tip, consent) and POST
+    // the cart to /api/orders, which recomputes the money and returns the order.
+  }, [])
 
   return (
     <div className="ss" data-slug={location.slug}>
@@ -317,7 +335,13 @@ function Menu({ view, todayHours }: BrowseProps) {
         a single file to read — the class names and the rules they mean cannot drift
         into two places.
       */}
-      <style>{CSS}</style>
+      {/*
+        `CSS + CART_CSS`, concatenated into **one** child on purpose. Written as
+        `{CSS}{CART_CSS}` it is two text nodes, which the server flattens into one
+        run of HTML and the client then fails to hydrate — a whole-page mismatch
+        whose message says nothing about a stylesheet.
+      */}
+      <style>{CSS + CART_CSS}</style>
 
       <header className="ss-head">
         <div className="ss-head-top">
@@ -376,19 +400,37 @@ function Menu({ view, todayHours }: BrowseProps) {
       </main>
 
       {/*
-        The cart, as much of it as this task owns: what is in it and what it comes
-        to. Task 3 turns this bar into the drawer's handle and puts tax, the
-        estimated total and the checkout button behind it — deliberately not
-        invented here, because "estimated" and "confirmed at payment" are the labels
-        that make a display-only total honest.
+        The cart's handle. It carries the **subtotal**, not the estimated total: a
+        tax-inclusive figure needs the word "estimated" beside it to be honest, and
+        that label belongs in the drawer where there is room for the sentence. The
+        bar states what the dishes come to and opens the place that explains the rest.
+
+        It disappears at zero lines, so the drawer cannot be opened onto an empty
+        cart from here — but it can be emptied *while* open, and the drawer says so.
       */}
       {cart.lines.length > 0 ? (
-        <div className="ss-bar" role="status" aria-live="polite">
-          <span className="ss-bar-count">
+        <button
+          type="button"
+          className="ss-bar"
+          aria-haspopup="dialog"
+          aria-expanded={cartOpen}
+          onClick={() => setCartOpen(true)}
+        >
+          <span className="ss-bar-count" aria-live="polite">
             {cartCount(cart.lines)} {cartCount(cart.lines) === 1 ? 'item' : 'items'}
           </span>
+          <span className="ss-bar-cta">View order</span>
           <span className="ss-bar-money">${formatCents(cartSubtotalCents(cart.lines))}</span>
-        </div>
+        </button>
+      ) : null}
+
+      {cartOpen ? (
+        <CartDrawer
+          taxRatePer100k={location.taxRatePer100k}
+          closedReason={notice}
+          onCheckout={checkout}
+          onClose={() => setCartOpen(false)}
+        />
       ) : null}
 
       {openDish ? (
@@ -575,7 +617,7 @@ function DishSheet({ item, onAdd, onClose }: {
       qty={qty}
       notes={notes}
       onToggle={(group, optionId) => setSelected((prev) => toggleOption(group, prev, optionId))}
-      onQty={(next) => setQty(Math.max(1, Math.min(SHEET_MAX_QTY, next)))}
+      onQty={(next) => setQty(Math.max(1, Math.min(MAX_QTY_PER_STEPPER, next)))}
       onNotes={setNotes}
       onAdd={add}
       onClose={onClose}
@@ -679,13 +721,13 @@ export function DishSheetView({
             <span className="ss-note-label">Anything we should know?</span>
             <textarea
               className="ss-note-input"
-              maxLength={NOTES_MAX}
+              maxLength={MAX_TEXT_FIELD_LENGTH}
               value={notes}
               onChange={(event) => onNotes(event.target.value)}
               placeholder="No cilantro, extra napkins…"
               rows={2}
             />
-            <span className="ss-note-count">{notes.length}/{NOTES_MAX}</span>
+            <span className="ss-note-count">{notes.length}/{MAX_TEXT_FIELD_LENGTH}</span>
           </label>
         </div>
 
@@ -963,14 +1005,29 @@ const CSS = `
 .ss-hit:disabled .ss-add-dot { display: none; }
 .ss-hit:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 16px; }
 
+/*
+  A real <button> as of Task 3, not a div with a click handler: it opens a dialog,
+  so it has to be reachable by keyboard and announce itself as a control. The
+  font/border reset is what keeps it the same bar it was — a UA button otherwise
+  shrinks the type and changes the height, and the height of this bar is part of the
+  food-above-the-fold budget the page is measured on.
+*/
 .ss-bar {
   position: fixed; inset-inline: 0; bottom: 0; z-index: 40;
   display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  width: 100%; border: 0; text-align: left; cursor: pointer;
   padding: 14px 18px calc(14px + env(safe-area-inset-bottom));
   background: var(--ink); color: var(--paper);
-  font-size: 15px; font-weight: 650;
+  font: inherit; font-size: 15px; font-weight: 650;
 }
 .ss-bar-money { font-variant-numeric: tabular-nums; }
+/* The affordance. Without it the bar states a number and looks like a status line,
+   which is exactly what it was before there was anywhere for it to go. */
+.ss-bar-cta {
+  font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  opacity: 0.85;
+}
+.ss-bar:focus-visible { outline: 2px solid var(--paper); outline-offset: -4px; }
 
 .ss-sheet-wrap { position: fixed; inset: 0; z-index: 50; }
 .ss-scrim { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(23,18,15,0.5); }

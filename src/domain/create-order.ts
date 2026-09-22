@@ -11,6 +11,7 @@ import type { OrderStatus } from './order-status'
 import {
   taxCentsFor, unitPriceCentsFor, lineTotalCentsFor, totalCentsFor, assertTotalsBalance, type Totals,
 } from '@/lib/money'
+import { MAX_LINES_PER_ORDER, MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
 import { makeShortCode } from '@/lib/short-code'
 
 /**
@@ -201,25 +202,13 @@ const PICKUP_DELIVERY_FEE_CENTS = 0
 /** Discounts land with promotions; the column exists and is always 0 for now. */
 const NO_DISCOUNT_CENTS = 0
 
-/**
- * Sanity bounds, not business rules — nobody is turning away a real order at these
- * numbers. They are here because both are arithmetic and resource limits:
- * `unitPrice × qty` leaves exact integer range long before `qty` stops being a legal
- * integer, and `insertOrder` writes one statement per line inside the transaction,
- * so a ten-thousand-line request would hold it open while it ran. Bounded here, both
- * come back as a named rejection instead of a 500 or a stalled connection.
- */
-const MAX_LINES_PER_ORDER = 100
-const MAX_QTY_PER_LINE = 999
-/**
- * Length cap for the two optional free-text fields the client controls —
- * `contact.email` and a line's `notes`. Not a business rule, same shape of guard
- * as the two bounds above: nobody's email or special-instruction text is
- * legitimately this long, so it is here to turn a wildly oversized string into a
- * named rejection. No existing length cap elsewhere in this file to stay
- * consistent with, so 500 is a generous, arbitrary bound.
- */
-const MAX_TEXT_FIELD_LENGTH = 500
+// The three sanity bounds `assertInputShape` enforces — MAX_LINES_PER_ORDER,
+// MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH — live in `@/lib/order-limits`, with the
+// argument for each number. They were module-private here and restated in the cart,
+// which is the client's only way to stop a customer building an order this function
+// would refuse; nothing kept the copies equal. That module has no imports of its own
+// precisely so the browser can read the numbers without dragging the database in
+// behind them.
 
 export async function createOrder(input: CreateOrderInput): Promise<CreateOrderResult> {
   assertInputShape(input)

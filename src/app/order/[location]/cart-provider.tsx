@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { lineTotalCentsFor } from '@/lib/money'
+import { MAX_LINES_PER_ORDER, MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
 
 /**
  * The cart, which lives entirely in this browser tab and is worth nothing.
@@ -57,14 +57,16 @@ export type Cart = {
   clear: () => void
 }
 
-/**
- * The same bounds `assertInputShape` enforces on the way in, restated here because
- * this is where a customer meets them: a cart that lets someone build an order the
- * server will refuse is a cart that wastes their time at the last step.
- */
-const MAX_QTY_PER_LINE = 999
-const MAX_LINES = 100
-const MAX_NOTES = 500
+// The bounds this file clamps to are `assertInputShape`'s own constants, imported
+// rather than restated, because this is where a customer meets them: a cart that
+// lets someone build an order the server will refuse wastes their time at the last
+// step, and a cart tighter than the server is a dish nobody can order for a reason
+// no page explains. See `@/lib/order-limits`.
+//
+// Its money is `@/lib/cart` — cartSubtotalCents, lineTotalCents, cartTotals, all of
+// them `@/lib/money` underneath. The subtotal lived here while the bottom bar was its
+// only caller; the drawer needs the same number, and one subtotal two surfaces share
+// cannot drift the way two that agree today can.
 
 // ---------------------------------------------------------------------------
 // The decisions, pure, so they can be tested without a browser.
@@ -95,7 +97,7 @@ export function addToLines(lines: readonly CartLine[], line: CartLine): CartLine
     // Past the cap the order path refuses the whole order, so the last dish is
     // dropped rather than the cart becoming unorderable. A hundred lines is not a
     // real cart; this is a guard, not a feature.
-    if (lines.length >= MAX_LINES) return [...lines]
+    if (lines.length >= MAX_LINES_PER_ORDER) return [...lines]
     return [...lines, { ...line, qty: clampQty(line.qty) }]
   }
   return lines.map((existing, at) => (at === ix
@@ -117,17 +119,6 @@ export function setLineQty(lines: readonly CartLine[], ix: number, qty: number):
 export function removeAt(lines: readonly CartLine[], ix: number): CartLine[] {
   if (ix < 0 || ix >= lines.length) return [...lines]
   return lines.filter((_, at) => at !== ix)
-}
-
-/**
- * What the lines come to before tax — **display only**, and computed with the same
- * `lineTotalCentsFor` the server prices with rather than a second `×` in this file.
- *
- * Task 3 puts tax and the estimated total beside it (`src/lib/cart.ts`); this is the
- * one number the menu's own bottom bar needs.
- */
-export function cartSubtotalCents(lines: readonly CartLine[]): number {
-  return lines.reduce((sum, line) => sum + lineTotalCentsFor(line.unitPriceCents, line.qty), 0)
 }
 
 /** How many dishes are in the cart, counting quantities — the number on the bar. */
@@ -168,7 +159,7 @@ export function parseStoredLines(raw: string | null): CartLine[] {
   if (!isRecord(parsed)) return []
   if (parsed.v !== STORED_VERSION) return []
   const lines = parsed.lines
-  if (!Array.isArray(lines) || lines.length > MAX_LINES) return []
+  if (!Array.isArray(lines) || lines.length > MAX_LINES_PER_ORDER) return []
   const checked: CartLine[] = []
   for (const line of lines) {
     const valid = asCartLine(line)
@@ -194,7 +185,7 @@ function asCartLine(value: unknown): CartLine | null {
   if (!Number.isInteger(qty) || (qty as number) < 1 || (qty as number) > MAX_QTY_PER_LINE) return null
   if (!isStringArray(modifierOptionIds) || !isStringArray(modifierNames)) return null
   if (!Number.isSafeInteger(modifierDeltaCents)) return null
-  if (notes !== undefined && (typeof notes !== 'string' || notes.length > MAX_NOTES)) return null
+  if (notes !== undefined && (typeof notes !== 'string' || notes.length > MAX_TEXT_FIELD_LENGTH)) return null
   const line: CartLine = {
     menuItemId,
     name,
@@ -220,6 +211,38 @@ function clampQty(qty: number): number {
   return Math.max(1, Math.min(MAX_QTY_PER_LINE, Math.floor(qty)))
 }
 
+/**
+ * The stored cart in hand — lines, **and the slug they were read for**.
+ *
+ * The slug is the half that matters. It is what makes "not read yet" and "read, and
+ * genuinely empty" two different values rather than the same one; see
+ * {@link shouldPersist}.
+ */
+export type CartStore = { slug: string | null; lines: CartLine[] }
+
+/**
+ * May this store be written back under this slug?
+ *
+ * **The fix for a real bug, lifted out of the effect so it can be tested without a
+ * browser.** The provider's save effect and its read effect run on the same commit,
+ * and with a `loaded` *ref* set inside the read the save saw the flag already true,
+ * wrote the first render's empty `lines` over the stored cart, and every reload came
+ * back empty. A ref cannot tell "not read yet" from "read, and empty" — both are one
+ * boolean at one instant. Pairing the lines with the slug they belong to can, because
+ * the two are different *values*, and the comparison is this function.
+ *
+ * Three cases, and each one is a different mistake avoided:
+ * - `slug: null` — nothing has been read. Writing now erases the stored cart.
+ * - a different slug — this is the store from the storefront before it. One origin
+ *   serves every restaurant, so writing it here files one restaurant's dishes under
+ *   another's key.
+ * - the same slug, no lines — a cart the customer emptied. This one **must** be
+ *   written, or removing the last dish does not survive a reload.
+ */
+export function shouldPersist(store: CartStore, slug: string): boolean {
+  return store.slug === slug
+}
+
 // ---------------------------------------------------------------------------
 
 const CartContext = createContext<Cart | null>(null)
@@ -239,17 +262,12 @@ export function CartProvider({ slug, children }: { slug: string; children: React
    * screen that has to feel instant.
    *
    * **The slug is in the state rather than in a ref, and that is the fix for a bug
-   * this had.** With a `loaded` ref set inside the read effect, the *write* effect
-   * ran on the same commit, saw the flag already true, and wrote the first render's
-   * empty `lines` — erasing the stored cart a moment before the read's `setLines`
-   * landed. Every reload came back to an empty cart. Pairing the lines with the slug
-   * they belong to means the write effect can tell "not read yet" from "read, and
-   * genuinely empty" by comparing values it renders with, which a ref cannot do.
+   * this had** — `shouldPersist` above carries the whole argument and the test.
    */
-  const [store, setStore] = useState<{ slug: string | null; lines: CartLine[] }>(
-    { slug: null, lines: [] },
-  )
-  const hydrated = store.slug === slug
+  const [store, setStore] = useState<CartStore>({ slug: null, lines: [] })
+  // One question, asked once: is what is in `store` this storefront's cart? Both the
+  // lines that render and the write-back turn on it — see `shouldPersist`.
+  const hydrated = shouldPersist(store, slug)
   const lines = hydrated ? store.lines : []
 
   useEffect(() => {
