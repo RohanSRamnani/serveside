@@ -17,7 +17,11 @@ html {
 html,
 body {
   max-width: 100vw;
-  overflow-x: hidden;
+  /* `clip`, not `hidden`: `hidden` makes this box a scroll container, which becomes
+     the nearest scrolling ancestor for every `position: sticky` descendant (e.g. the
+     storefront's `.ss-chips` rail) and defeats sticking app-wide. `clip` still cuts
+     horizontal overflow without creating a scroll container. */
+  overflow-x: clip;
 }
 
 body {
