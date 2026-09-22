@@ -9,6 +9,7 @@ import type { ServiceWindow, OpenState } from '@/domain/hours'
 import type { StorefrontView } from '@/domain/storefront'
 import { CART_CSS, CartDrawer } from './cart-drawer'
 import { CartProvider, cartCount, useCart, type CartLine } from './cart-provider'
+import { useDismissablePanel } from './use-dismissable-panel'
 
 /**
  * A restaurant's menu, on a phone, in the hand of someone who is hungry now.
@@ -326,6 +327,30 @@ function Menu({ view, todayHours }: BrowseProps) {
     // the cart to /api/orders, which recomputes the money and returns the order.
   }, [])
 
+  /**
+   * Stable, because `useDismissablePanel` keys its effect on the identity of the
+   * `onClose` it is given. Inline arrows are a new function every render, so the
+   * Escape listener and the scroll lock would be torn down and rebuilt on every
+   * keystroke in the note field. The lock survives that — releasing and re-acquiring
+   * is balanced — but it is pointless work on the device least able to spare it.
+   */
+  const closeDish = useCallback(() => setOpenDish(null), [])
+  const closeCart = useCallback(() => setCartOpen(false), [])
+
+  /**
+   * **Any panel makes the menu behind it `inert`**, which is what turns the panels'
+   * `aria-modal="true"` from a claim into a fact: nothing behind the scrim can be
+   * tabbed to, read by a screen reader or clicked.
+   *
+   * Without it, and with no focus trap, a keyboard user could Tab from inside the
+   * cart drawer onto a dish card behind it and open the dish sheet *underneath* the
+   * drawer — `.ss-sheet-wrap` is z-index 50 against the drawer's 60, so the sheet
+   * would be up and invisible. That is also the only way two panels are open at
+   * once, which is the case the counted scroll lock exists for; both ends of that
+   * bug are closed rather than one.
+   */
+  const panelOpen = cartOpen || openDish !== null
+
   return (
     <div className="ss" data-slug={location.slug}>
       {/*
@@ -343,98 +368,106 @@ function Menu({ view, todayHours }: BrowseProps) {
       */}
       <style>{CSS + CART_CSS}</style>
 
-      <header className="ss-head">
-        <div className="ss-head-top">
-          <h1 className="ss-name">{location.name}</h1>
-          <span className="ss-status" data-open={open.open ? 'true' : 'false'}>
-            {open.open ? 'Open now' : 'Closed now'}
-          </span>
-        </div>
-        <p className="ss-meta">
-          Pickup · ready in about {location.prepTimeMinutes} min
-          {/* The hours are in the notice when there is one; twice is a wasted line
-              on the screen where lines are what the food is competing for. */}
-          {notice ? null : ` · ${formatServiceWindows(todayHours)}`}
-        </p>
-        <p className="ss-meta ss-quiet">
-          {location.address} ·{' '}
-          <a className="ss-tel" href={`tel:${location.phoneE164}`}>{formatPhone(location.phoneE164)}</a>
-        </p>
-        {notice ? <p className="ss-notice">{notice}</p> : null}
-      </header>
-
-      <nav className="ss-chips" aria-label="Menu sections">
-        <div className="ss-rail" ref={railRef}>
-          {categories.map((category) => (
-            <a
-              key={category.id}
-              className="ss-chip"
-              href={`#${anchorId(category.id)}`}
-              data-chip={category.id}
-              // `page` rather than `true`: the chip is not the current *location*,
-              // it is the section of this page you are looking at.
-              aria-current={active === category.id ? 'page' : undefined}
-            >
-              {category.name}
-            </a>
-          ))}
-        </div>
-      </nav>
-
-      <main className="ss-main">
-        {categories.map((category) => (
-          <section
-            key={category.id}
-            id={anchorId(category.id)}
-            className="ss-section"
-            data-cat={category.id}
-          >
-            <h2 className="ss-cat">{category.name}</h2>
-            <div className="ss-grid">
-              {category.items.map((item) => (
-                <DishCard key={item.id} item={item} onOpen={() => setOpenDish(item)} />
-              ))}
-            </div>
-          </section>
-        ))}
-      </main>
-
       {/*
-        The cart's handle. It carries the **subtotal**, not the estimated total: a
-        tax-inclusive figure needs the word "estimated" beside it to be honest, and
-        that label belongs in the drawer where there is room for the sentence. The
-        bar states what the dishes come to and opens the place that explains the rest.
-
-        It disappears at zero lines, so the drawer cannot be opened onto an empty
-        cart from here — but it can be emptied *while* open, and the drawer says so.
+        The menu itself, wrapped so a panel has something to make `inert` — see
+        `panelOpen` above. A plain div with no styling of its own: it must not create
+        a scroll container, a transform or a containment context, any of which would
+        silently stop the sticky chip rail from sticking.
       */}
-      {cart.lines.length > 0 ? (
-        <button
-          type="button"
-          className="ss-bar"
-          aria-haspopup="dialog"
-          aria-expanded={cartOpen}
-          onClick={() => setCartOpen(true)}
-        >
-          <span className="ss-bar-count" aria-live="polite">
-            {cartCount(cart.lines)} {cartCount(cart.lines) === 1 ? 'item' : 'items'}
-          </span>
-          <span className="ss-bar-cta">View order</span>
-          <span className="ss-bar-money">${formatCents(cartSubtotalCents(cart.lines))}</span>
-        </button>
-      ) : null}
+      <div className="ss-page" inert={panelOpen}>
+        <header className="ss-head">
+          <div className="ss-head-top">
+            <h1 className="ss-name">{location.name}</h1>
+            <span className="ss-status" data-open={open.open ? 'true' : 'false'}>
+              {open.open ? 'Open now' : 'Closed now'}
+            </span>
+          </div>
+          <p className="ss-meta">
+            Pickup · ready in about {location.prepTimeMinutes} min
+            {/* The hours are in the notice when there is one; twice is a wasted line
+                on the screen where lines are what the food is competing for. */}
+            {notice ? null : ` · ${formatServiceWindows(todayHours)}`}
+          </p>
+          <p className="ss-meta ss-quiet">
+            {location.address} ·{' '}
+            <a className="ss-tel" href={`tel:${location.phoneE164}`}>{formatPhone(location.phoneE164)}</a>
+          </p>
+          {notice ? <p className="ss-notice">{notice}</p> : null}
+        </header>
+
+        <nav className="ss-chips" aria-label="Menu sections">
+          <div className="ss-rail" ref={railRef}>
+            {categories.map((category) => (
+              <a
+                key={category.id}
+                className="ss-chip"
+                href={`#${anchorId(category.id)}`}
+                data-chip={category.id}
+                // `page` rather than `true`: the chip is not the current *location*,
+                // it is the section of this page you are looking at.
+                aria-current={active === category.id ? 'page' : undefined}
+              >
+                {category.name}
+              </a>
+            ))}
+          </div>
+        </nav>
+
+        <main className="ss-main">
+          {categories.map((category) => (
+            <section
+              key={category.id}
+              id={anchorId(category.id)}
+              className="ss-section"
+              data-cat={category.id}
+            >
+              <h2 className="ss-cat">{category.name}</h2>
+              <div className="ss-grid">
+                {category.items.map((item) => (
+                  <DishCard key={item.id} item={item} onOpen={() => setOpenDish(item)} />
+                ))}
+              </div>
+            </section>
+          ))}
+        </main>
+
+        {/*
+          The cart's handle. It carries the **subtotal**, not the estimated total: a
+          tax-inclusive figure needs the word "estimated" beside it to be honest, and
+          that label belongs in the drawer where there is room for the sentence. The
+          bar states what the dishes come to and opens the place that explains the rest.
+
+          It disappears at zero lines, so the drawer cannot be opened onto an empty
+          cart from here — but it can be emptied *while* open, and the drawer says so.
+        */}
+        {cart.lines.length > 0 ? (
+          <button
+            type="button"
+            className="ss-bar"
+            aria-haspopup="dialog"
+            aria-expanded={cartOpen}
+            onClick={() => setCartOpen(true)}
+          >
+            <span className="ss-bar-count" aria-live="polite">
+              {cartCount(cart.lines)} {cartCount(cart.lines) === 1 ? 'item' : 'items'}
+            </span>
+            <span className="ss-bar-cta">View order</span>
+            <span className="ss-bar-money">${formatCents(cartSubtotalCents(cart.lines))}</span>
+          </button>
+        ) : null}
+      </div>
 
       {cartOpen ? (
         <CartDrawer
           taxRatePer100k={location.taxRatePer100k}
           closedReason={notice}
           onCheckout={checkout}
-          onClose={() => setCartOpen(false)}
+          onClose={closeCart}
         />
       ) : null}
 
       {openDish ? (
-        <DishSheet item={openDish} onAdd={add} onClose={() => setOpenDish(null)} />
+        <DishSheet item={openDish} onAdd={add} onClose={closeDish} />
       ) : null}
     </div>
   )
@@ -578,20 +611,9 @@ function DishSheet({ item, onAdd, onClose }: {
   const [qty, setQty] = useState(1)
   const [notes, setNotes] = useState('')
 
-  // Escape closes it, and the page behind it stops scrolling while it is up — a
-  // bottom sheet whose backdrop scrolls is the commonest way a phone loses a modal.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    const previous = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    return () => {
-      window.removeEventListener('keydown', onKey)
-      document.body.style.overflow = previous
-    }
-  }, [onClose])
+  // Escape, and the scroll lock it shares with the cart drawer — one counted lock,
+  // not a save/restore pair per panel. See `use-dismissable-panel.ts`.
+  useDismissablePanel(onClose)
 
   const add = () => {
     const options = chosenOptions(item, selected)

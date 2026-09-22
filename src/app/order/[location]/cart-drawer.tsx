@@ -5,6 +5,7 @@ import { cartTotals, lineTotalCents } from '@/lib/cart'
 import { formatCents } from '@/lib/money'
 import { MAX_QTY_PER_STEPPER } from '@/lib/order-limits'
 import { cartCount, useCart, type CartLine } from './cart-provider'
+import { useDismissablePanel } from './use-dismissable-panel'
 
 /**
  * The cart, opened.
@@ -61,21 +62,10 @@ export type CartDrawerProps = {
 export function CartDrawer({ taxRatePer100k, closedReason, onCheckout, onClose }: CartDrawerProps) {
   const cart = useCart()
 
-  // Escape closes it and the menu behind it stops scrolling while it is up — the
-  // dish sheet's behaviour, because a customer meets both as the same kind of panel
-  // and a backdrop that scrolls is the commonest way a phone loses a modal.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    const previous = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    return () => {
-      window.removeEventListener('keydown', onKey)
-      document.body.style.overflow = previous
-    }
-  }, [onClose])
+  // Escape, and the scroll lock the dish sheet shares — a customer meets both as the
+  // same kind of panel, and the lock has to be counted rather than copied. See
+  // `use-dismissable-panel.ts`.
+  useDismissablePanel(onClose)
 
   return (
     <CartDrawerView

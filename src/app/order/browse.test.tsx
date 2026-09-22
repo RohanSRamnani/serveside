@@ -151,6 +151,18 @@ describe('the menu a phone is handed', () => {
     expect(at(markup, `#${anchorId('cat-breads')}`)).toBeLessThan(at(markup, 'Chilli Gobi'))
   })
 
+  it('wraps the menu so a panel has something to make inert, and leaves it alone otherwise', () => {
+    // The wrapper is what makes the panels' `aria-modal="true"` true: with a panel
+    // open it is `inert`, so nothing behind the scrim can be tabbed to. With none
+    // open the attribute must be **absent** — `inert` is boolean, so `inert="false"`
+    // would make the whole menu unusable on first paint. This is the assertion that
+    // would catch that, and it is not hypothetical: React only started omitting
+    // `inert={false}` in 19.
+    const markup = browse()
+    expect(markup).toContain('class="ss-page"')
+    expect(markup).not.toMatch(/inert/i)
+  })
+
   it('gives every chip an anchor that lands on its own section', () => {
     const markup = browse()
     for (const id of ['cat-starters', 'cat-mains', 'cat-breads']) {

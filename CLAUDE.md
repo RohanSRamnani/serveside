@@ -91,7 +91,13 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   Checkout button, which is enabled exactly when `view.open.open` is true and
   otherwise disabled beside `closedNotice`'s own sentence, handed down rather than
   rewritten. Its CSS ships beside it (`CART_CSS`) and is concatenated into
-  `browse.tsx`'s one `<style>` — see Gotchas.
+  `browse.tsx`'s one `<style>` — see Gotchas. **Both panels share
+  `useDismissablePanel`** (Escape + the scroll lock), and the lock is
+  **reference-counted** (`panel-lock.ts`, pure and tested): a save/restore pair per
+  panel leaves the menu permanently unscrollable when two are open and the first
+  closes first. The menu itself lives in a `.ss-page` wrapper that is `inert`
+  whenever either panel is open, which is what makes their `aria-modal` true; there
+  is still no focus *cycle*, so Tab off a panel's last control reaches browser chrome.
   Every figure either page shows comes from `src/lib/money.ts`; the cart's totals are
   **display-only** and live in `src/lib/cart.ts` (`cartTotals`, `lineTotalCents`,
   `cartSubtotalCents` — one subtotal, no money rule of its own, and **pre-tip**:
