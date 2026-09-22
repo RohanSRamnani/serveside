@@ -40,6 +40,14 @@ was deleted after merge per process — this file is the surviving record.
   drift in the Two Drivers gotcha.
 - **`!= null` for `contact.email` / line `notes`** in `assertInputShape`
   (explicit JSON null currently 422s; `?? null` convention elsewhere).
+- **SMS dev guard (HAZARD, found 2026-09-22 in Plan 2 Task 4):** `src/lib/sms.ts`
+  sends whenever `TWILIO_*` are set, and `.env.local` sets them — so any order
+  placed against a local `npm run dev` runs the fan-out and texts the
+  restaurant's REAL owner number. Nothing in the pipe knows it is a dev
+  machine. Add `SMS_DRY_RUN` (log the message, return a fake sid) and make the
+  sender refuse to send unless `VERCEL_ENV === 'production'` or the flag is
+  explicitly off; the seed should also carry a test owner number for the dev
+  branch. Until then: never place a browser order locally.
 - Measurement pass on the perf pile: `isOpenAt` round trips, checkout ~8
   in-tx round trips, heartbeat per-poll row update, O(locations) cron scans
   (the second SECURITY DEFINER, argued by name in `rls.test.ts`, is the
