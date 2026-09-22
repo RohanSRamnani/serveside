@@ -39,6 +39,21 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   repricing, retiring an item) must rebuild the snapshot **in the same transaction as
   the change**, or the pinned price evidence goes stale while orders keep charging live
   prices.
+- **Browse reads the pinned snapshot, never the live menu tables.** `storefrontView`
+  (`src/domain/storefront.ts`) serves the location's newest `menu_snapshots` row and
+  passes its categories through verbatim — 86'd items **included and marked**, because
+  hiding them makes the menu look thinner than the restaurant is and makes browse
+  disagree with the row `createOrder` prices against. **Read-only**: no snapshot is
+  `NoMenuError`, never a build, because `GET /api/storefront/[location]` is public and
+  unauthenticated and a stranger must not be able to write a row — or mint priced menu
+  evidence nobody approved — by asking. Its `s-maxage=30, stale-while-revalidate=300`
+  is what makes browsing survive a database blip; misses are `no-store`. Every miss —
+  unknown slug, junk slug, a restaurant with no pinned menu, a slug two orgs share — is
+  the **same empty 404**, or the route is a way to enumerate the platform. It is the
+  **one slug-first lookup** in the codebase (a customer has no org to resolve inside),
+  so two matches is a refusal rather than a coin toss: one restaurant's menu at
+  another's URL sends real food to the wrong kitchen. **Storefront slugs must therefore
+  be unique platform-wide** — `locations_org_slug_unique` does not give that.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the
@@ -236,9 +251,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   Clerk session so `auth()` can read it, and that is all; `createRouteMatcher` is
   deprecated in `@clerk/nextjs` 7 precisely because path matching drifts from routing
   and fails open. Its `matcher` **excludes** `/api/stripe/`, `/api/printers/`,
-  `/api/inngest` and `POST /api/orders` — those are authenticated by a signature, a
-  MAC, a signing key and nothing, and `clerkMiddleware()` throws on a missing
-  publishable key, so left in, one blank env var stops a kitchen printing. The matcher
+  `/api/inngest`, `/api/storefront/` and `POST /api/orders` — those are authenticated
+  by a signature, a MAC, a signing key and nothing at all, and `clerkMiddleware()`
+  throws on a missing publishable key, so left in, one blank env var stops a kitchen
+  printing and takes the public menu off the street. The matcher
   must be **one string literal**: Next extracts it by static analysis, and a
   concatenation is silently dropped, which looks exactly like the exclusions not working.
 - **The feed's `since` is a floor, not a cursor.** `GET /api/feed?location=&since=`

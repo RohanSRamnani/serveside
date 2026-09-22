@@ -30,8 +30,11 @@ export default clerkMiddleware()
  *
  * The exclusions are the point. A Stripe webhook is authenticated by a signature, a
  * CloudPRNT printer by the MAC burnt into it, Inngest by its signing key, and public
- * checkout by nothing at all — none of them has a session, and none of them should
- * stop working because a Clerk key is blank, expired or rotated. Left in, they do:
+ * checkout and the public menu by nothing at all — none of them has a session, and
+ * none of them should stop working because a Clerk key is blank, expired or rotated.
+ * `api/storefront/` is the last of those and the most visible: it is what a customer
+ * standing outside the restaurant loads, so a Clerk problem must not be able to take
+ * a menu off the street. Left in, they all break:
  * `clerkMiddleware()` throws on a missing publishable key before a request reaches a
  * route, so one unset env var would silently stop a kitchen printing and stop paid
  * orders reaching it.
@@ -51,5 +54,5 @@ export default clerkMiddleware()
  * all. That failure looks exactly like the exclusions not working.
  */
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|api/stripe/|api/printers/|api/inngest|api/orders$).*)'],
+  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|api/stripe/|api/printers/|api/inngest|api/storefront/|api/orders$).*)'],
 }
