@@ -73,7 +73,12 @@ async function readActiveMenu(tx: ScopedTx, locationId: string): Promise<MenuSna
           items: {
             // is86d is carried into the payload; isActive means "off the menu", so it is not.
             where: eq(menuItems.isActive, true),
-            columns: { id: true, name: true, basePriceCents: true, is86d: true },
+            columns: {
+              id: true, name: true, basePriceCents: true, is86d: true,
+              // What a dish card draws. Pinned, not looked up at render time: browse
+              // reads this payload and nothing else — see `src/domain/storefront.ts`.
+              description: true, photoUrl: true, tags: true,
+            },
             orderBy: [asc(menuItems.sort), asc(menuItems.name), asc(menuItems.id)],
             with: {
               modifierGroupLinks: {
@@ -117,6 +122,14 @@ async function readActiveMenu(tx: ScopedTx, locationId: string): Promise<MenuSna
         name: item.name,
         basePriceCents: item.basePriceCents,
         is86d: item.is86d,
+        // Copied verbatim, `null` and all: a dish with no photo is a dish the card
+        // draws a typographic plate for, and it has to be able to tell.
+        description: item.description,
+        photoUrl: item.photoUrl,
+        // `?? []`, so a *pinned* row's `tags` is always an array. The live column is
+        // nullable; the only absent `tags` in this table are the rows that predate
+        // the field, which nothing may rewrite. See `SnapshotItem`.
+        tags: item.tags ?? [],
         modifierGroups: item.modifierGroupLinks.map((link): SnapshotModifierGroup => ({
           id: link.group.id,
           name: link.group.name,

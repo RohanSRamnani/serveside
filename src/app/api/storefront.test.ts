@@ -51,17 +51,22 @@ describe('GET /api/storefront/[location]', () => {
   it('serves the pinned menu, open state and location to anyone who asks', async () => {
     const loc = await storefront()
 
-    const res = await get(loc.slug)
+    const res = await get(loc.storefrontSlug)
     expect(res.status).toBe(200)
 
     const body = await res.json()
     expect(body.location).toEqual({
       name: loc.name,
-      slug: loc.slug,
+      // The public key, echoed back: what `/order/[slug]` resolves, not the
+      // org-scoped `locations.slug` the authed routes use.
+      slug: loc.storefrontSlug,
       timezone: loc.timezone,
       phoneE164: loc.phoneE164,
       address: loc.address,
       prepTimeMinutes: loc.prepTimeMinutes,
+      // Display-only, for the cart's tax line. The authoritative number comes back
+      // from `POST /api/orders`, which recomputes it on the location row.
+      taxRatePer100k: loc.taxRatePer100k,
     })
     expect(body.open).toEqual({ open: true })
     expect(body.snapshotVersion).toBeGreaterThan(0)
@@ -69,9 +74,21 @@ describe('GET /api/storefront/[location]', () => {
       .toEqual(['Butter Chicken', 'Lamb Rogan Josh'])
   })
 
+  it('resolves the public key only, never the internal one', async () => {
+    // Two keys, and only one of them is public. `locations.slug` is org-scoped: it
+    // is what `requireLocationAccess` resolves *inside* a Clerk org, and it is
+    // ambiguous across tenants by design. A customer has no org, so the public route
+    // resolves `storefront_slug` and nothing else — handed the internal slug it must
+    // answer the ordinary miss, not the restaurant's menu.
+    const loc = await storefront()
+
+    expect((await get(loc.storefrontSlug)).status).toBe(200)
+    await expectAnonymousMiss(await get(loc.slug), 'internal org-scoped slug')
+  })
+
   it('lets the edge keep serving the menu while the origin is unwell', async () => {
     const loc = await storefront()
-    const cacheControl = (await get(loc.slug)).headers.get('cache-control') ?? ''
+    const cacheControl = (await get(loc.storefrontSlug)).headers.get('cache-control') ?? ''
     // Thirty seconds fresh, then five minutes of "serve the old one and go and look" —
     // which is the whole of browse surviving a database blip.
     expect(cacheControl).toContain('s-maxage=30')
@@ -82,13 +99,13 @@ describe('GET /api/storefront/[location]', () => {
     const real = await storefront()
 
     // Nobody's slug.
-    await expectAnonymousMiss(await get(`${real.slug}-not-a-restaurant`), 'unknown slug')
+    await expectAnonymousMiss(await get(`${real.storefrontSlug}-not-a-restaurant`), 'unknown slug')
 
     // A real restaurant that has not pinned a menu yet. Byte-identical to the above
     // on purpose: "no such restaurant" and "that one is not ready" are the same answer.
     const unpinned = await seedLocationWithMenu()
     await seedBusinessHours(unpinned.id)
-    await expectAnonymousMiss(await get(unpinned.slug), 'no snapshot')
+    await expectAnonymousMiss(await get(unpinned.storefrontSlug), 'no snapshot')
 
     // Shapes that are not slugs at all, clamped before anything is queried or logged.
     for (const junk of ['../../etc/passwd', "' or 1=1 --", 'a'.repeat(300), '', 'x\ny']) {
@@ -96,18 +113,31 @@ describe('GET /api/storefront/[location]', () => {
     }
   })
 
-  it('refuses a slug two restaurants share rather than guessing between them', async () => {
-    // `locations.slug` is unique **per org**, not globally (`locations_org_slug_unique`),
-    // so a public slug-first lookup can match two tenants. Serving either one would put
-    // one restaurant's menu at another's URL, and an order placed from it would send
-    // real food to the wrong kitchen. A dark page gets a phone call; a wrong menu does not.
+  it('cannot be put in the position of guessing between two restaurants', async () => {
+    // Task 1 shipped a refusal branch for a slug two tenants share, because
+    // `locations.slug` is unique **per org** only and serving either one would put a
+    // restaurant's menu at another's URL — an order from it sends real food to the
+    // wrong kitchen. Task 1.5 moved the route onto `storefront_slug`, which is unique
+    // **platform-wide**, so the ambiguity is now refused a layer lower down: the
+    // database will not store it. The branch stays in the route as defence in depth
+    // (a constraint can be dropped by a future migration; the ruling should outlive
+    // it), and what is asserted here is the guarantee that makes it unreachable.
     const shared = `shared-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const first = await storefront()
     const second = await storefront()
-    await db().update(locations).set({ slug: shared }).where(eq(locations.id, first.id))
-    await db().update(locations).set({ slug: shared }).where(eq(locations.id, second.id))
+    await db().update(locations).set({ storefrontSlug: shared }).where(eq(locations.id, first.id))
 
-    await expectAnonymousMiss(await get(shared), 'ambiguous slug')
+    const err = await db().update(locations).set({ storefrontSlug: shared })
+      .where(eq(locations.id, second.id))
+      .then(() => null, (e: unknown) => e)
+    expect(err, 'a second location must not be able to take a live storefront slug').not.toBeNull()
+
+    // And the refused write changed nothing: the slug still names exactly one
+    // restaurant, and the other one still answers at its own key.
+    const body = await (await get(shared)).json()
+    expect(body.location.name).toBe(first.name)
+    expect(body.location.slug).toBe(shared)
+    expect((await get(second.storefrontSlug)).status).toBe(200)
   })
 
   it('serves one restaurant its own menu and never the one next door', async () => {
@@ -118,7 +148,7 @@ describe('GET /api/storefront/[location]', () => {
       .set({ name: 'Next Door Curry' }).where(eq(menuItems.id, theirs.items[0].id)))
     await buildMenuSnapshot(theirs.id)
 
-    const body = await (await get(mine.slug)).json()
+    const body = await (await get(mine.storefrontSlug)).json()
     const names = body.categories.flatMap((c: { items: { name: string }[] }) => c.items).map((i: { name: string }) => i.name)
     expect(names).not.toContain('Next Door Curry')
   })
@@ -131,7 +161,7 @@ describe('GET /api/storefront/[location]', () => {
     const loc = await seedLocationWithMenu()
     await seedBusinessHours(loc.id)
 
-    await expectAnonymousMiss(await get(loc.slug), 'no snapshot')
+    await expectAnonymousMiss(await get(loc.storefrontSlug), 'no snapshot')
     const pinned = await withLocation(loc.id, (tx) => tx.select().from(menuSnapshots)
       .where(eq(menuSnapshots.locationId, loc.id)))
     expect(pinned).toHaveLength(0)

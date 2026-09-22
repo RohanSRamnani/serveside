@@ -32,11 +32,37 @@ export type SnapshotModifierGroup = {
   options: SnapshotModifierOption[]
 }
 
+/**
+ * One dish, as the customer's phone draws it.
+ *
+ * **The payload carries everything a dish card renders**, because browse reads the
+ * snapshot and may not fall back to the live menu tables to fill gaps (see
+ * `src/domain/storefront.ts`): a menu that half-renders from a snapshot and half from
+ * `menu_items` would have two sources of truth for what a restaurant sells.
+ *
+ * **`description`, `photoUrl` and `tags` are optional, and the `?` is load-bearing.**
+ * `menu_snapshots` rows are **immutable** — insert-only, pinned by orders and voice
+ * calls as the evidence a price was quoted from — so the rows written before
+ * 2026-09-22 will never grow these fields, and nothing may rewrite them to add them.
+ * Declared required, the compiler would promise every reader a value those rows do
+ * not have and `item.tags.map(…)` would throw on a six-month-old snapshot. So every
+ * reader handles absence (`item.tags ?? []`), and the compiler is what makes it.
+ *
+ * A *new* row always has all three: `buildMenuSnapshot` writes `null` for empty copy
+ * and `[]` for no tags rather than omitting the key, so absence means exactly one
+ * thing — "pinned before the dish card had fields to pin".
+ */
 export type SnapshotItem = {
   id: string
   name: string
   basePriceCents: number
   is86d: boolean
+  /** The restaurant's own copy. `null` is "no description"; absent is a pre-2026-09-22 row. */
+  description?: string | null
+  /** `null` is "no photo", and the card draws its typographic plate instead. */
+  photoUrl?: string | null
+  /** Normalised to an array on write — the live column is nullable, this is not. */
+  tags?: string[]
   modifierGroups: SnapshotModifierGroup[]
 }
 

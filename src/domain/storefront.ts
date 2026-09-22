@@ -33,9 +33,10 @@ import { isOpenAt, type OpenState } from './hours'
  * The restaurant, as a customer needs it and no further.
  *
  * Deliberately a projection of the `locations` row rather than the row itself. It is
- * a public payload: `stripeAccountId`, the tax rate, `orgId` and the rest are either
- * nobody's business or not a customer's, and a `select *` here would put whatever
- * column lands on that table next onto the open internet by default.
+ * a public payload: `stripeAccountId`, `orgId` and the rest are either nobody's
+ * business or not a customer's, and a `select *` here would put whatever column lands
+ * on that table next onto the open internet by default. Every field below is here
+ * because a customer's screen would be wrong without it.
  *
  * `timezone` earns its place because every time the storefront renders — today's
  * hours, the pickup quote — is the **restaurant's** wall clock, never the phone's
@@ -44,11 +45,34 @@ import { isOpenAt, type OpenState } from './hours'
  */
 export type StorefrontLocation = {
   name: string
+  /**
+   * **`locations.storefront_slug`, not `locations.slug`.** The public routing key —
+   * platform-unique, what `/order/[slug]` and this view's own route resolve, and
+   * therefore the only slug a link built from this payload may use. `locations.slug`
+   * is the org-scoped internal key the authed feed/86/pause routes resolve inside a
+   * Clerk org, and it is deliberately not published here: it is ambiguous across
+   * tenants, so a URL built from it is a coin toss.
+   */
   slug: string
   timezone: string
   phoneE164: string
   address: string
   prepTimeMinutes: number
+  /**
+   * The sales tax rate, parts per 100,000 — **published on purpose, and only so the
+   * cart can show a tax line before there is an order to ask about.**
+   *
+   * It was excluded from this projection until 2026-09-22 on the grounds that a tax
+   * rate is not a customer's business. It is: it is printed on their receipt, it is
+   * public law, and without it the cart either hides the tax until checkout (which is
+   * the incumbents' trick) or invents it. What stays true is that the number the
+   * customer is *charged* is never computed from this: client-side totals are
+   * display-only and `POST /api/orders` recomputes tax on the location row inside the
+   * transaction that writes the order (`taxCentsFor`, half-up). A stale CDN copy of
+   * this rate can therefore make a cart's preview off by a cent; it cannot make a
+   * charge wrong.
+   */
+  taxRatePer100k: number
 }
 
 export type StorefrontView = {
@@ -111,16 +135,22 @@ export class NoMenuError extends Error {
 export async function storefrontView(locationId: string, tx?: ScopedTx): Promise<StorefrontView> {
   // `locations` is the tenancy root and carries no RLS, so the stateless driver reads
   // it — the same read, for the same reason, as the one inside `isOpenAt`.
-  const location = await db().query.locations.findFirst({
+  const row = await db().query.locations.findFirst({
     where: eq(locations.id, locationId),
     columns: {
-      name: true, slug: true, timezone: true, phoneE164: true, address: true, prepTimeMinutes: true,
+      name: true, storefrontSlug: true, timezone: true, phoneE164: true, address: true,
+      prepTimeMinutes: true, taxRatePer100k: true,
     },
   })
   // A caller asking about a location that does not exist has a bug; answering "no
   // menu" would hide it behind a plausible-looking refusal. The public route never
   // gets here — it resolves the slug first, and an unresolved slug is a 404.
-  if (!location) throw new Error(`Unknown location ${locationId}`)
+  if (!row) throw new Error(`Unknown location ${locationId}`)
+
+  // Named `slug` in the payload and read from `storefront_slug`: the customer-facing
+  // view has exactly one slug, and it is the public one. See `StorefrontLocation.slug`.
+  const { storefrontSlug, ...rest } = row
+  const location: StorefrontLocation = { ...rest, slug: storefrontSlug }
 
   if (!tx) return withLocation(locationId, (scoped) => read(locationId, location, scoped))
   return read(locationId, location, tx)

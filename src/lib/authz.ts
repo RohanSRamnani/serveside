@@ -96,6 +96,10 @@ export async function requireLocationAccess(locationSlug: string | null | undefi
       orgId: locations.orgId,
       name: locations.name,
       slug: locations.slug,
+      // Carried because callers get the whole `Location` row, **not** resolved on:
+      // the WHERE below stays `org → slug`. `storefront_slug` is the public routing
+      // key (`src/db/schema/tenancy.ts`); a staff URL is org-scoped and stays that way.
+      storefrontSlug: locations.storefrontSlug,
       address: locations.address,
       timezone: locations.timezone,
       phoneE164: locations.phoneE164,

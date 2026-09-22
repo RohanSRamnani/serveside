@@ -16,6 +16,28 @@ export const locations = pgTable('locations', {
   orgId: uuid('org_id').notNull().references(() => organizations.id),
   name: text('name').notNull(),
   slug: text('slug').notNull(),
+  /**
+   * **The public routing key, and it is platform-unique** — `/order/<storefront_slug>`
+   * and `GET /api/storefront/<storefront_slug>`.
+   *
+   * A second slug rather than a stricter `slug`, because the two keys answer two
+   * different questions and only one of them is asked by a stranger:
+   *
+   * - `slug` is **internal and org-scoped**. Everything behind the login resolves the
+   *   Clerk org first and the slug inside it (`requireLocationAccess`), so two
+   *   restaurants may both call a location `main` — and taking that away would push
+   *   `kashi-main` into every staff URL for nothing.
+   * - `storefront_slug` is **public**. A customer has no org to resolve inside, so
+   *   this is the one slug-first lookup in the codebase and it cannot be allowed to
+   *   match two rows: one restaurant's menu at another's URL sends real food to the
+   *   wrong kitchen and real money to the wrong Stripe account. The uniqueness is the
+   *   guarantee; the route's refusal branch is only the belt.
+   *
+   * It is also what lets the customer-facing URL read the way the restaurant's name
+   * does: Kashi's location slug is `livingston` (their street) and their storefront
+   * slug is `kashi`. A second Kashi location would read `kashi-livingston`.
+   */
+  storefrontSlug: text('storefront_slug').notNull(),
   address: text('address').notNull(),
   timezone: text('timezone').notNull(),
   phoneE164: text('phone_e164').notNull(),
@@ -52,6 +74,13 @@ export const locations = pgTable('locations', {
    * restaurant's orders a tablet shows — would be up to the planner.
    */
   unique('locations_org_slug_unique').on(t.orgId, t.slug),
+  /**
+   * **Platform-wide, unlike the one above**, and that asymmetry is the whole reason
+   * the column exists. See `storefrontSlug` for why a public key cannot be scoped to
+   * an org, and `drizzle/0020_locations_storefront_slug.sql` for how the existing
+   * rows were given one.
+   */
+  unique('locations_storefront_slug_unique').on(t.storefrontSlug),
 ])
 
 export const memberships = pgTable('memberships', {

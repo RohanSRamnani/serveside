@@ -38,7 +38,14 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   per order — so anything that changes what may be ordered or what it costs (86'ing,
   repricing, retiring an item) must rebuild the snapshot **in the same transaction as
   the change**, or the pinned price evidence goes stale while orders keep charging live
-  prices.
+  prices. **The payload carries everything a dish card renders** — name, description,
+  photoUrl, tags, price, is86d, and the modifier limits the item actually enforces —
+  because browse may not fall back to the live tables to fill a gap. `description`,
+  `photoUrl` and `tags` are therefore typed **optional**, and the `?` is load-bearing
+  rather than lazy: rows pinned before 2026-09-22 predate the fields and may never be
+  rewritten, so a reader handles absence (`item.tags ?? []`) and the compiler is what
+  makes it. A row written since always has all three (`null` for empty copy, `[]` for
+  no tags), so absence means exactly one thing.
 - **Browse reads the pinned snapshot, never the live menu tables.** `storefrontView`
   (`src/domain/storefront.ts`) serves the location's newest `menu_snapshots` row and
   passes its categories through verbatim — 86'd items **included and marked**, because
@@ -52,8 +59,17 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   the **same empty 404**, or the route is a way to enumerate the platform. It is the
   **one slug-first lookup** in the codebase (a customer has no org to resolve inside),
   so two matches is a refusal rather than a coin toss: one restaurant's menu at
-  another's URL sends real food to the wrong kitchen. **Storefront slugs must therefore
-  be unique platform-wide** — `locations_org_slug_unique` does not give that.
+  another's URL sends real food to the wrong kitchen. It resolves
+  **`locations.storefront_slug`**, unique platform-wide
+  (`locations_storefront_slug_unique`, migration 0020), and it is a second column
+  because `slug` cannot be one: `slug` is org-scoped and stays the internal key the
+  authed feed/86/pause routes resolve inside a Clerk org, and Kashi's is `livingston`
+  while the customer URL has to read `/order/kashi`. A second Kashi shop reads
+  `kashi-livingston`. The constraint makes the two-match refusal unreachable; it stays
+  in the route as defence in depth. Handed an internal slug the route finds nothing and
+  answers its ordinary miss, which is correct. The view also publishes
+  `taxRatePer100k` — display-only, so a cart can show a tax line before there is an
+  order to ask about; what is charged is still recomputed by `POST /api/orders`.
 - **`createOrder` (`src/domain/create-order.ts`) is the order write path, and it trusts
   the client for nothing but ids and quantities.** Prices, deltas, 86 flags and the
   effective modifier limits (`minOverride ?? group.minSelect`) are read live inside the

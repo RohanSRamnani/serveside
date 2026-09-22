@@ -96,6 +96,7 @@ type KashiSeed = {
   location: {
     name: string
     slug: string
+    storefrontSlug: string
     address: string
     timezone: string
     phoneE164: string
@@ -111,8 +112,17 @@ export const KASHI: KashiSeed = {
   org: { name: 'Kashi', slug: 'kashi' },
   location: {
     name: 'Kashi — Downtown Brooklyn',
-    /** Unique per org, so the URL can stay short. */
+    /** Internal, unique per org: their street, which is how the staff say which shop. */
     slug: 'livingston',
+    /**
+     * The customer-facing key — `/order/kashi`, unique platform-wide. The restaurant's
+     * name, not their street: it goes on a QR code and in a Google Business "Order
+     * Online" link, and `/order/livingston` would read like somebody else's shop.
+     *
+     * This gap is why `storefront_slug` exists as its own column. A second Kashi
+     * location would read `kashi-livingston`.
+     */
+    storefrontSlug: 'kashi',
     address: '286 Livingston St, Brooklyn, NY 11217',
     timezone: 'America/New_York',
     /** 917-909-0243 on their site; E.164 is the only shape `sendSms` accepts. */
@@ -328,6 +338,7 @@ export async function seedKashi(db: SeedDb, opts: { hours?: HoursGrid } = {}): P
       // Everything mutable, so the seed stays the source of truth for these fields.
       set: {
         name: KASHI.location.name,
+        storefrontSlug: KASHI.location.storefrontSlug,
         address: KASHI.location.address,
         timezone: KASHI.location.timezone,
         phoneE164: KASHI.location.phoneE164,

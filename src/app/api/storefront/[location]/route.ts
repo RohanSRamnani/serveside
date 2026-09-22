@@ -20,8 +20,8 @@ import { storefrontView, NoMenuError } from '@/domain/storefront'
  *    `requireLocationAccess`'s single 403 and the CloudPRNT route's bodiless 404.
  *    The *reason* is logged, where it is useful to us and invisible to them.
  * 2. **The slug is clamped before it is queried or logged** — the pattern the
- *    CloudPRNT route sets for the same reason. `locations.slug` is `text`, so
- *    without a clamp a megabyte of path would be a megabyte in the log on every
+ *    CloudPRNT route sets for the same reason. `locations.storefront_slug` is `text`,
+ *    so without a clamp a megabyte of path would be a megabyte in the log on every
  *    request, on an endpoint with nothing in front of it, and newlines in a slug
  *    would let a stranger write their own lines into our logs.
  * 3. **It reads; it never writes.** No snapshot is built here — see `NoMenuError` in
@@ -86,20 +86,26 @@ export async function GET(
 }
 
 /**
- * Slug → location id, for a caller with no org to resolve it inside.
+ * Storefront slug → location id, for a caller with no org to resolve it inside.
  *
- * **This is the one slug-first lookup in the codebase, and the ambiguity it creates
- * is refused rather than resolved.** `locations.slug` is unique per *org*
- * (`locations_org_slug_unique`), not globally — two restaurants may both call a
- * location `main` — and every authed path avoids the problem by resolving the org
- * first (`src/lib/authz.ts`). A public customer has no org, so the collision is real
- * here and nowhere else.
+ * **It resolves `locations.storefront_slug`, and never `locations.slug`.** The two are
+ * different keys for different callers: `slug` is org-scoped and internal — every
+ * authed path resolves the Clerk org first and the slug inside it
+ * (`src/lib/authz.ts`), which is what makes two restaurants both calling a location
+ * `main` harmless. A public customer has no org, so a slug-first lookup is the one
+ * thing this route has to do and `slug` cannot support it: it is ambiguous by design.
+ * `storefront_slug` is unique platform-wide (`locations_storefront_slug_unique`),
+ * which is what makes the lookup a single row. Handed an internal slug, this finds
+ * nothing and the route answers its ordinary miss — correct, not a bug.
  *
- * Picking one would be a coin toss between tenants, and the stake is not cosmetic: a
- * customer would browse one restaurant's menu at another's URL and place an order
- * that sends real food to the wrong kitchen and real money to the wrong account. So
- * two matches is a miss, loudly logged. A dark page gets a phone call within the
- * hour; a wrong menu might never get one.
+ * **The two-match refusal below is kept although the constraint now makes it
+ * unreachable.** It is defence in depth, and cheap: a future migration could drop the
+ * constraint, a restore could arrive without it, and the ruling should outlive either.
+ * Picking one of two would be a coin toss between tenants, and the stake is not
+ * cosmetic — a customer would browse one restaurant's menu at another's URL and place
+ * an order that sends real food to the wrong kitchen and real money to the wrong
+ * Stripe account. So two matches is a miss, loudly logged. A dark page gets a phone
+ * call within the hour; a wrong menu might never get one.
  *
  * `limit(2)` rather than `limit(1)`: the second row is the whole question.
  *
@@ -111,14 +117,15 @@ async function resolveSlug(slug: string): Promise<string | null> {
   const rows = await db()
     .select({ id: locations.id })
     .from(locations)
-    .where(eq(locations.slug, slug))
+    .where(eq(locations.storefrontSlug, slug))
     .limit(2)
 
   if (rows.length === 0) return null
   if (rows.length > 1) {
     console.error(
-      '[GET /api/storefront] slug', slug, 'names more than one location; refusing to guess.',
-      'Storefront slugs must be unique across the platform — rename one, or give it its own domain.',
+      '[GET /api/storefront] storefront slug', slug, 'names more than one location;',
+      'refusing to guess. locations_storefront_slug_unique should have made this',
+      'impossible — check that the constraint is still on the table.',
     )
     return null
   }

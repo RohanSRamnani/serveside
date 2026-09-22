@@ -34,6 +34,14 @@ export async function seedLocation(overrides: LocationOverrides = {}): Promise<L
     orgId: org.id,
     name: 'Main',
     slug: unique('main'),
+    /**
+     * The public routing key, and **unique platform-wide** rather than per org
+     * (`locations_storefront_slug_unique`) — so it has to be collision-proof the way
+     * a printer serial is, not the way `slug` is. Deliberately a different token from
+     * `slug`: a test that passes because the two happened to match would hide the
+     * public route resolving the wrong column.
+     */
+    storefrontSlug: unique('store'),
     address: 'x',
     timezone: 'America/New_York',
     phoneE164: '+15550000002',

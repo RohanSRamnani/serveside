@@ -83,6 +83,45 @@ describe('buildMenuSnapshot', () => {
     expect(rogan.modifierGroups[0].minSelect).toBe(0)
   })
 
+  it('pins everything a dish card renders — description, photo and tags', async () => {
+    // Browse reads the snapshot and may not fall back to the live tables to fill
+    // gaps, so anything the customer's phone draws has to be *in* the payload.
+    // Three cases in one build, because each one is a different way to get it wrong:
+    // a dish with copy and no photo, a dish with neither, and a dish with a photo
+    // and several tags whose order is the kitchen's, not the database's.
+    const loc = await seedLocationWithMenu()
+    await withLocation(loc.id, (tx) => tx.insert(menuItems).values({
+      categoryId: loc.category.id,
+      name: 'Paneer Tikka',
+      description: 'Charred paneer, mint chutney.',
+      basePriceCents: 1600,
+      photoUrl: '/photos/paneer-tikka.jpg',
+      tags: ['vegetarian', 'gluten-free', 'spicy'],
+      sort: 3,
+    }))
+
+    const snap = await buildMenuSnapshot(loc.id)
+    const [butterChicken, rogan, tikka] = (await readSnapshot(loc.id, snap.id)).categories[0].items
+
+    // Copy, verbatim. A description retyped by hand at render time is a second source
+    // of truth for what a restaurant says it sells.
+    expect(butterChicken.description).toBe('Tomato, cream, fenugreek.')
+    // No photo is `null`, not an empty string and not a missing key: the card has a
+    // typographic plate for exactly this dish, and it has to be able to tell.
+    expect(butterChicken.photoUrl).toBeNull()
+    // The live column is nullable; the payload normalises to an array, so every
+    // reader of a *new* row can map over it without a guard.
+    expect(butterChicken.tags).toEqual([])
+
+    expect(rogan.description).toBeNull()
+    expect(rogan.photoUrl).toBeNull()
+
+    expect(tikka.photoUrl).toBe('/photos/paneer-tikka.jpg')
+    // Order as entered — tags are a row of pills and 'vegetarian' leading is a choice.
+    expect(tikka.tags).toEqual(['vegetarian', 'gluten-free', 'spicy'])
+    expect(tikka.description).toBe('Charred paneer, mint chutney.')
+  })
+
   it('versions per location, not globally', async () => {
     const a = await seedLocationWithMenu()
     const b = await seedLocationWithMenu()

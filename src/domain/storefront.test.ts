@@ -99,18 +99,62 @@ describe('storefrontView', () => {
     expect(view.categories[0].items.find((item) => item.name === 'Butter Chicken')!.basePriceCents).toBe(2000)
   })
 
+  it('still serves a snapshot pinned before the dish card had fields to pin', async () => {
+    // **`menu_snapshots` is insert-only**, so the rows that predate `description`,
+    // `photoUrl` and `tags` will never grow them: rewriting a row is forbidden — it
+    // is the evidence an order was priced against. Every reader therefore has to
+    // tolerate the fields being absent, and this is the test that holds it that way.
+    // A legacy payload is written here by hand because that is the only way one can
+    // exist: `buildMenuSnapshot` has populated them since 2026-09-22.
+    const loc = await seedLocationWithMenu()
+    await seedBusinessHours(loc.id)
+    const legacy: MenuSnapshotPayload = {
+      menuId: loc.menu.id,
+      categories: [{
+        id: loc.category.id,
+        name: 'Mains',
+        items: [{
+          id: loc.items[0].id,
+          name: 'Butter Chicken',
+          basePriceCents: 1800,
+          is86d: false,
+          modifierGroups: [],
+        }],
+      }],
+    }
+    await withLocation(loc.id, (tx) => tx.insert(menuSnapshots)
+      .values({ locationId: loc.id, version: 1, payload: legacy }))
+
+    // Reads, rather than throwing or filling the gaps from the live tables.
+    const view = await storefrontView(loc.id)
+    const [item] = view.categories[0].items
+    expect(item.name).toBe('Butter Chicken')
+    expect(item.basePriceCents).toBe(1800)
+    // Absent, not null: nothing invented a value for a row nobody may rewrite.
+    expect(item.description).toBeUndefined()
+    expect(item.photoUrl).toBeUndefined()
+    expect(item.tags).toBeUndefined()
+  })
+
   it('carries the location a customer needs, and the open state with its reason', async () => {
     const loc = await storefront()
 
     const open = await storefrontView(loc.id)
     expect(open.location).toEqual({
       name: loc.name,
-      slug: loc.slug,
+      // **The public routing key, not the internal one.** `slug` here is
+      // `locations.storefront_slug` — platform-unique, and what `/order/[slug]`
+      // resolves. `locations.slug` stays org-scoped and stays behind the login.
+      slug: loc.storefrontSlug,
       timezone: loc.timezone,
       phoneE164: loc.phoneE164,
       address: loc.address,
       prepTimeMinutes: loc.prepTimeMinutes,
+      // The cart renders a tax line before there is an order to ask about, so the
+      // rate travels with the menu. Display-only: `POST /api/orders` recomputes it.
+      taxRatePer100k: loc.taxRatePer100k,
     })
+    expect(open.location.slug).not.toBe(loc.slug)
     expect(open.open).toEqual({ open: true })
 
     // "We're slammed" and "we're shut on Mondays" are two different sentences to a

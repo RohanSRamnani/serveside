@@ -88,8 +88,8 @@ blocked until this lands.
 - `locations.storefront_slug` — text, NOT NULL, **platform-unique**, the public routing key (`slug` stays the org-scoped internal key the authed routes use). Migration backfills existing rows (Kashi's → `kashi`, others → their `slug` where that is already globally unique, else `<org-slug>-<slug>`). `storefrontView`/the route resolve on it; keep Task 1's ambiguous-slug refusal branch as defense-in-depth even though uniqueness makes it unreachable.
 - `StorefrontView.location` gains `taxRatePer100k` (Task 3's cart needs it for display-only totals).
 
-- [ ] **Step 1: Failing tests** — a rebuilt snapshot carries description/photoUrl/tags verbatim from the live rows (including a null photoUrl and a multi-tag dish); an OLD snapshot row still reads without throwing; two locations in different orgs cannot both take `storefront_slug` 'kashi' (unique violation); the route resolves by `storefront_slug` and 404s on an org-scoped `slug` that is not a storefront slug; the view carries `taxRatePer100k`.
-- [ ] **Step 2: Implement; migrate both branches; full suite green (476 floor); commit** — `feat: dish-card fields in the snapshot payload, platform-unique storefront slugs`
+- [x] **Step 1: Failing tests** — a rebuilt snapshot carries description/photoUrl/tags verbatim from the live rows (including a null photoUrl and a multi-tag dish); an OLD snapshot row still reads without throwing; two locations in different orgs cannot both take `storefront_slug` 'kashi' (unique violation); the route resolves by `storefront_slug` and 404s on an org-scoped `slug` that is not a storefront slug; the view carries `taxRatePer100k`.
+- [x] **Step 2: Implement; migrate both branches; full suite green (476 floor); commit** — `feat: dish-card fields in the snapshot payload, platform-unique storefront slugs`
 
 ---
 
