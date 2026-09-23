@@ -112,6 +112,7 @@ moment of use rather than at boot, so an unset key fails the one feature that ne
 | `MIGRATION_DATABASE_URL` | `drizzle.config.ts`, `scripts/seed-kashi.ts` | migrations and seeding — the owner |
 | `STRIPE_SECRET_KEY` | `src/lib/stripe.ts` | card orders. The **platform** key, never a connected account's |
 | `STRIPE_WEBHOOK_SECRET` | `src/app/api/stripe/webhook/route.ts` | card orders. Must be a **Connect** endpoint's |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | `src/lib/stripe-browser.ts`, `.../checkout/checkout-form.tsx` | the Payment Element. The **platform** publishable key; blank hides the Card option. Inlined at **build** time |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_E164` | `src/lib/sms.ts` | the owner's order SMS and every alert |
 | `FEED_URL` | `src/inngest/order-created.ts` | the link in that SMS |
 | `OPS_ALERT_E164` | `src/inngest/{stale-order-alert,printer-heartbeat,provenance-refused}.ts` | our escalation number, in E.164 |
@@ -120,8 +121,12 @@ moment of use rather than at boot, so an unset key fails the one feature that ne
 | `ENV_FILE` | `drizzle.config.ts`, `scripts/*` | which env file a script loads. drizzle-kit defaults to `.env.test`, the seed and proof to `.env.local` |
 | `APP_USER_PASSWORD` | `scripts/create-app-user.mjs` | optional; one is generated otherwise |
 
-A pay-at-pickup-only deployment can leave both Stripe keys blank: `stripe()` is lazy and
-nothing reads them until a card order is placed.
+A pay-at-pickup-only deployment can leave all three Stripe keys blank: `stripe()` is lazy
+and nothing reads the secret ones until a card order is placed, and a blank publishable
+key simply hides the Card option at checkout. The publishable one is **inlined into the
+browser bundle at build time**, so setting it after a deploy changes nothing until the
+next build — and a restaurant with no `locations.stripe_account_id` takes no cards
+whatever the keys say.
 
 ## Tenancy, in one rule
 

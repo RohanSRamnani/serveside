@@ -31,8 +31,8 @@ function get(slug: string): Promise<Response> {
 }
 
 /** A restaurant a customer could actually open: menu, hours, and a pinned snapshot. */
-async function storefront(): Promise<SeededMenu> {
-  const loc = await seedLocationWithMenu()
+async function storefront(over: Parameters<typeof seedLocationWithMenu>[0] = {}): Promise<SeededMenu> {
+  const loc = await seedLocationWithMenu(over)
   await seedBusinessHours(loc.id)
   await buildMenuSnapshot(loc.id)
   return loc
@@ -49,7 +49,7 @@ async function expectAnonymousMiss(res: Response, why: string): Promise<void> {
 
 describe('GET /api/storefront/[location]', () => {
   it('serves the pinned menu, open state and location to anyone who asks', async () => {
-    const loc = await storefront()
+    const loc = await storefront({ stripeAccountId: 'acct_test_public' })
 
     const res = await get(loc.storefrontSlug)
     expect(res.status).toBe(200)
@@ -67,6 +67,13 @@ describe('GET /api/storefront/[location]', () => {
       // Display-only, for the cart's tax line. The authoritative number comes back
       // from `POST /api/orders`, which recomputes it on the location row.
       taxRatePer100k: loc.taxRatePer100k,
+      // **On an unauthenticated route on purpose.** A connected account id is an
+      // identifier, not a credential: it is in the `Stripe-Account` header of every
+      // Stripe.js call the customer's browser makes, so a direct charge cannot be
+      // confirmed without it being on the wire. Holding one lets nobody charge, read
+      // or move anything — the client secret authorises the confirm, and the webhook
+      // checks `event.account` against this same column before flipping an order.
+      stripeAccountId: 'acct_test_public',
     })
     expect(body.open).toEqual({ open: true })
     expect(body.snapshotVersion).toBeGreaterThan(0)

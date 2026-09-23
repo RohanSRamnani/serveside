@@ -179,8 +179,8 @@ route rather than riding inside a storefront task.
 - A location with no `stripeAccountId`: card option HIDDEN at checkout (pay-at-pickup only), matching the server's named rejection.
 - Env: `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` (blank-safe: card option hidden when absent).
 
-- [ ] **Step 1: Failing tests** — memoization (one loadStripe per account); card option hidden when no account id / no publishable key; confirm-failure keeps the cart intact and surfaces the message.
-- [ ] **Step 2: Implement; green; commit** — `feat: Payment Element on the connected account, card-optional checkout`
+- [x] **Step 1: Failing tests** — memoization (one loadStripe per account); card option hidden when no account id / no publishable key; confirm-failure keeps the cart intact and surfaces the message.
+- [x] **Step 2: Implement; green; commit** — `feat: Payment Element on the connected account, card-optional checkout`
 
 ---
 

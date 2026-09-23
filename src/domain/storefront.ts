@@ -33,10 +33,10 @@ import { isOpenAt, type OpenState } from './hours'
  * The restaurant, as a customer needs it and no further.
  *
  * Deliberately a projection of the `locations` row rather than the row itself. It is
- * a public payload: `stripeAccountId`, `orgId` and the rest are either nobody's
- * business or not a customer's, and a `select *` here would put whatever column lands
- * on that table next onto the open internet by default. Every field below is here
- * because a customer's screen would be wrong without it.
+ * a public payload: `orgId`, the internal `slug` and the rest are not a customer's
+ * business, and a `select *` here would put whatever column lands on that table next
+ * onto the open internet by default. Every field below is here because a customer's
+ * screen would be wrong without it.
  *
  * `timezone` earns its place because every time the storefront renders — today's
  * hours, the pickup quote — is the **restaurant's** wall clock, never the phone's
@@ -73,6 +73,26 @@ export type StorefrontLocation = {
    * charge wrong.
    */
   taxRatePer100k: number
+  /**
+   * The restaurant's connected Stripe account — **public by construction**, and null
+   * for a restaurant that has not finished onboarding.
+   *
+   * It was excluded from this projection until 2026-09-22 as "nobody's business",
+   * which was wrong in the same way `taxRatePer100k` was wrong: this id is in the
+   * `Stripe-Account` header of *every* Stripe.js call the customer's browser makes.
+   * A direct charge lives on the restaurant's account, so the browser cannot confirm
+   * the payment without naming the account it is on — the id is on the wire either
+   * way, and hiding it here would only mean fetching it from somewhere else.
+   *
+   * It is an **identifier, not a credential**: holding one lets nobody charge, read
+   * or move anything. What authorises a confirm is the client secret of an intent we
+   * created, and what proves an incoming event is a Connect webhook whose
+   * `event.account` matches this column (see the webhook route).
+   *
+   * Published so the storefront can decide whether the card option exists at all,
+   * one screen before the server's `StripeAccountMissingError` would have to say so.
+   */
+  stripeAccountId: string | null
 }
 
 export type StorefrontView = {
@@ -201,7 +221,7 @@ export async function storefrontView(locationId: string, tx?: ScopedTx): Promise
     where: eq(locations.id, locationId),
     columns: {
       name: true, storefrontSlug: true, timezone: true, phoneE164: true, address: true,
-      prepTimeMinutes: true, taxRatePer100k: true,
+      prepTimeMinutes: true, taxRatePer100k: true, stripeAccountId: true,
     },
   })
   // A caller asking about a location that does not exist has a bug; answering "no

@@ -1,20 +1,14 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CartLine } from './[location]/cart-provider'
 import type { StorefrontLocation } from '@/domain/storefront'
 import { MAX_TIP_CENTS } from '@/lib/order-limits'
-import {
-  CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentStep, TIP_PERCENTS,
-  UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, consentDisclosure,
-  customTipCents, normalizePhone, orderBodyFrom, quoteLabel, statusHref,
-  submitFailureMessage, tipCentsFor, tipPresetCents,
-  type CheckoutFormState,
-} from './[location]/checkout/checkout-form'
 
 /**
  * The last screen between a hungry person and their dinner, and the one place this
- * product collects anything it can be held to: a phone number, a tip, and an SMS
- * marketing opt-in with legal weight.
+ * product collects anything it can be held to: a phone number, a tip, an SMS
+ * marketing opt-in with legal weight — and, since Task 5, a card.
  *
  * Split the way `browse.test.tsx` is split, for the same reason — there is no jsdom
  * in this suite, so every decision worth making is an ordinary function and is tested
@@ -23,7 +17,42 @@ import {
  * POST, its four failure branches and the navigation afterwards need a browser, and
  * the order route's own DB-backed tests are what prove the body this file builds is
  * one the server accepts.
+ *
+ * **Stripe is mocked at both seams**, and neither mock is incidental:
+ *
+ * - `@stripe/react-stripe-js` — `<Elements>` is a context provider and `useStripe` /
+ *   `useElements` read that context, so the real ones cannot be rendered to a string.
+ *   The stand-in renders its children and publishes the `clientSecret` it was handed
+ *   as an attribute, which is the one thing about it worth asserting.
+ * - `@/lib/stripe-browser` — so a render never reaches `loadStripe`, and so the
+ *   "there is no Stripe here" branch can be driven on demand.
  */
+
+const { stripeBrowser } = vi.hoisted(() => ({
+  stripeBrowser: vi.fn((): unknown => Promise.resolve({})),
+}))
+vi.mock('@/lib/stripe-browser', () => ({ stripeBrowser }))
+
+const { useStripe, useElements } = vi.hoisted(() => ({
+  useStripe: vi.fn((): unknown => ({})),
+  useElements: vi.fn((): unknown => ({})),
+}))
+vi.mock('@stripe/react-stripe-js', () => ({
+  Elements: ({ children, options }: { children: ReactNode; options: { clientSecret?: string } }) => (
+    <div data-elements="1" data-client-secret={options.clientSecret}>{children}</div>
+  ),
+  PaymentElement: () => <div data-payment-element="1" />,
+  useStripe,
+  useElements,
+}))
+
+import {
+  CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentPaneView, PaymentStep, TIP_PERCENTS,
+  UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, confirmOutcome,
+  consentDisclosure, customTipCents, normalizePhone, orderBodyFrom, quoteLabel,
+  returnUrlFor, statusHref, submitFailureMessage, tipCentsFor, tipPresetCents,
+  type CheckoutFormState,
+} from './[location]/checkout/checkout-form'
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -37,7 +66,13 @@ const KASHI: StorefrontLocation = {
   address: '123 Livingston Ave, Livingston NJ',
   prepTimeMinutes: 20,
   taxRatePer100k: 8875,
+  // Whose account the charge is created on. It travels to the browser because every
+  // Stripe.js call the browser makes carries it — see `StorefrontLocation`.
+  stripeAccountId: 'acct_test_kashi',
 }
+
+/** A fake secret in the shape Stripe hands back. Never a real one, in any run. */
+const CLIENT_SECRET = 'pi_test_123_secret_abc'
 
 /** 1800 + 50 = 1850 a unit, two of them: a 3700 subtotal, the same one the API tests use. */
 const LINES: CartLine[] = [{
@@ -373,17 +408,109 @@ describe('submitFailureMessage', () => {
 // ---------------------------------------------------------------------------
 
 describe('cardPaymentAvailable', () => {
+  it('needs BOTH halves of the direct charge, and there are four ways to ask', () => {
+    // The two are one fact, not two. The platform's publishable key says *we* can
+    // talk to Stripe; the connected account id says *whose money* this is — and a
+    // client secret minted on the restaurant's account cannot be confirmed without
+    // it. Either one missing is a restaurant that takes cash at the counter today.
+    expect(cardPaymentAvailable('pk_test_abc123', 'acct_123')).toBe(true)
+    expect(cardPaymentAvailable('pk_test_abc123', null)).toBe(false)
+    expect(cardPaymentAvailable(undefined, 'acct_123')).toBe(false)
+    expect(cardPaymentAvailable(undefined, null)).toBe(false)
+  })
+
   it('is false for every shape of a key that is not set', () => {
     // Blank-safe rather than truthy-safe: an unset Vercel env var arrives as `''`,
     // not as undefined, and a Payment Element mounted with a blank key throws at
     // runtime on the one screen that must not break.
-    expect(cardPaymentAvailable(undefined)).toBe(false)
-    expect(cardPaymentAvailable('')).toBe(false)
-    expect(cardPaymentAvailable('   ')).toBe(false)
+    expect(cardPaymentAvailable(undefined, 'acct_123')).toBe(false)
+    expect(cardPaymentAvailable('', 'acct_123')).toBe(false)
+    expect(cardPaymentAvailable('   ', 'acct_123')).toBe(false)
   })
 
-  it('is true for a real publishable key', () => {
-    expect(cardPaymentAvailable('pk_test_abc123')).toBe(true)
+  it('is false for a restaurant that has not finished onboarding, key or no key', () => {
+    // `locations.stripe_account_id` is null on every restaurant we have just signed,
+    // and the server already refuses that order by name (`stripe_account_missing`,
+    // 503). Hiding the radio is the same ruling one screen earlier: a customer should
+    // not be able to choose a payment method that cannot work.
+    for (const account of [null, '', '   ']) {
+      expect(cardPaymentAvailable('pk_test_abc123', account), JSON.stringify(account)).toBe(false)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// What happens after `stripe.confirmPayment` comes back.
+// ---------------------------------------------------------------------------
+
+describe('confirmOutcome', () => {
+  it('sends a succeeded payment to the status page and empties the cart', () => {
+    // The cart's whole purpose is served the moment Stripe has the money — and a
+    // customer returning to the menu must not find the dishes they have just paid
+    // for still sitting in it.
+    expect(confirmOutcome({ paymentIntent: { status: 'succeeded' } }))
+      .toEqual({ kind: 'paid', clearCart: true })
+  })
+
+  it('treats `processing` as done too — the webhook is what marks an order paid', () => {
+    // Nothing is EVER marked paid in a browser. `processing` is a payment Stripe has
+    // accepted and not yet settled (an ACH debit, a delayed method); the order stays
+    // PENDING_PAYMENT until `payment_intent.succeeded` arrives at the webhook, and
+    // Task 6's status page says "confirming payment…" in the meantime. Keeping the
+    // customer on the checkout instead would be asking them to pay twice.
+    expect(confirmOutcome({ paymentIntent: { status: 'processing' } }))
+      .toEqual({ kind: 'paid', clearCart: true })
+  })
+
+  it('shows Stripe’s own words on a decline, and keeps the cart', () => {
+    // Stripe's message is written for the cardholder ("Your card was declined") and
+    // is the only thing on the screen they can act on. Ours would be a worse copy of
+    // it — and the cart has to survive, because the next thing they do is try another
+    // card on this very screen, against this very PaymentIntent.
+    expect(confirmOutcome({ error: { message: 'Your card was declined.' } }))
+      .toEqual({ kind: 'failed', clearCart: false, message: 'Your card was declined.' })
+  })
+
+  it('still says something when Stripe hands back an error with no message', () => {
+    // `StripeError.message` is optional in the type and absent for some network
+    // failures. A blank error box is a customer who cannot tell whether they paid.
+    for (const error of [{}, { message: '' }]) {
+      const outcome = confirmOutcome({ error })
+      expect(outcome.kind, JSON.stringify(error)).toBe('failed')
+      expect(outcome.kind === 'failed' && outcome.message).toMatch(/\w/)
+    }
+  })
+
+  it('never clears the cart for an intent that is not a payment yet', () => {
+    // `requires_payment_method` is what an intent falls back to after a failed
+    // confirm; `requires_action` is one that needs a step we did not complete. No
+    // money has moved in either, so this is a retry on the same intent — and a
+    // cleared cart there is a customer with nothing to retry with.
+    for (const status of ['requires_payment_method', 'requires_action', 'requires_confirmation', 'canceled']) {
+      const outcome = confirmOutcome({ paymentIntent: { status } })
+      expect(outcome.kind, status).toBe('failed')
+      expect(outcome.clearCart, status).toBe(false)
+    }
+  })
+
+  it('does not call a payment done on a result with neither an intent nor an error', () => {
+    // Unreachable by the SDK's own types, and the one wrong answer here is expensive:
+    // routing away and clearing the cart on a payment that may never have happened.
+    const outcome = confirmOutcome({})
+    expect(outcome.kind).toBe('failed')
+    expect(outcome.clearCart).toBe(false)
+  })
+})
+
+describe('returnUrlFor', () => {
+  it('is the status page, absolute, because Stripe refuses a relative return_url', () => {
+    // A redirect-based method leaves our origin entirely and comes back by URL, so
+    // there is no page to be relative to. Built from `statusHref`, never restated:
+    // Task 6 owns that page and the two ends must not be able to disagree.
+    expect(returnUrlFor('https://order.kashi.com', 'kashi', 'ord-123'))
+      .toBe(`https://order.kashi.com${statusHref('kashi', 'ord-123')}`)
+    expect(returnUrlFor('http://localhost:3007', 'kashi', 'ord-123'))
+      .toBe('http://localhost:3007/order/kashi/status/ord-123')
   })
 })
 
@@ -500,19 +627,90 @@ describe('CheckoutFormView', () => {
 })
 
 describe('PaymentStep', () => {
-  it('shows the short code and is honest that the card leg is not wired yet', () => {
-    // Task 5 replaces this with the Payment Element. Until it does, the order exists
-    // and is at PENDING_PAYMENT, so the screen must not imply it is paid for or that
-    // the kitchen has it — and it must show the code, which is the only handle the
-    // customer has on an order they cannot yet pay for.
-    const markup = renderToStaticMarkup(
-      <PaymentStep shortCode="K7M2" orderId="ord-1" location={KASHI} />,
+  function payment(over: Partial<Parameters<typeof PaymentStep>[0]> = {}): string {
+    return renderToStaticMarkup(
+      <PaymentStep
+        shortCode="K7M2"
+        orderId="ord-1"
+        location={KASHI}
+        clientSecret={CLIENT_SECRET}
+        onPaid={() => {}}
+        {...over}
+      />,
     )
+  }
+
+  it('mounts the Payment Element on the restaurant’s own account, with this order’s secret', () => {
+    const markup = payment()
+    // The client secret belongs to an intent on the connected account, so the
+    // Stripe.js instance has to be that account's — `stripeBrowser` is the only
+    // place that is decided, and this is the call that decides it.
+    expect(stripeBrowser).toHaveBeenCalledWith(KASHI.stripeAccountId)
+    expect(markup).toContain(`data-client-secret="${CLIENT_SECRET}"`)
+    expect(markup).toContain('data-payment-element="1"')
+  })
+
+  it('collects the card in Stripe’s own Element and never in a field of ours', () => {
+    // SAQ A, structurally: card data must not touch our DOM. An input of ours here
+    // would put this product in a different PCI bracket, so the absence is asserted
+    // rather than trusted.
+    const markup = payment()
+    expect(markup).not.toMatch(/<input[^>]*(card|cardnumber|cc-number|cvc|expiry)/i)
+  })
+
+  it('shows the short code, and is still not a success screen', () => {
+    // The order sits at PENDING_PAYMENT until the webhook says otherwise: nothing has
+    // been charged, no ticket has printed and the kitchen has not been told. The code
+    // is the only handle the customer has on it meanwhile.
+    const markup = payment()
     expect(markup).toContain('K7M2')
-    expect(markup).toMatch(/(isn’t|is not|can’t|cannot|not) .*(set up|take the card)/i)
-    // Above all not a success screen: nothing has been charged, no ticket has been
-    // printed, and the kitchen has not been told. "Thank you for your order" here is
-    // a lie a customer acts on by driving to the restaurant.
-    expect(markup).not.toMatch(/paid|thank you for your order|on its way|we’re cooking/i)
+    expect(markup).not.toMatch(/thank you for your order|on its way|we’re cooking|paid/i)
+  })
+
+  it('says plainly that it cannot take the card when Stripe.js cannot be built', () => {
+    // No publishable key at build time, or a restaurant with no connected account.
+    // The radio should have been hidden a screen earlier, so reaching here is a
+    // misconfiguration — and the answer is the phone number, never a dead form.
+    stripeBrowser.mockReturnValueOnce(null)
+    const markup = payment()
+    expect(markup).not.toContain('data-payment-element="1"')
+    expect(markup).toMatch(/(isn’t|is not|can’t|cannot) .*(set up|take the card)/i)
+    expect(markup).toContain('(973) 555-0123')
+    expect(markup).not.toMatch(/data-pay="1"/)
+  })
+})
+
+describe('PaymentPaneView', () => {
+  function pane(over: Partial<Parameters<typeof PaymentPaneView>[0]> = {}): string {
+    return renderToStaticMarkup(
+      <PaymentPaneView location={KASHI} ready busy={false} error={null} onPay={() => {}} {...over} />,
+    )
+  }
+
+  it('disables Pay until Stripe.js has actually loaded', () => {
+    // `useStripe()` is null until the script resolves. Tapping Pay in that window
+    // does nothing at all, which reads as a broken button on a slow connection.
+    expect(pane({ ready: false })).toMatch(/<button[^>]*data-pay="1"[^>]*disabled/)
+  })
+
+  it('disables Pay while a confirm is in flight, so nobody confirms twice', () => {
+    expect(pane({ busy: true })).toMatch(/<button[^>]*data-pay="1"[^>]*disabled/)
+  })
+
+  it('shows the decline inline, with the Element and the button still there to retry', () => {
+    // The retry is the same PaymentIntent on the same screen — never a second order,
+    // which would be a second dinner and a second charge. So nothing is torn down:
+    // the message lands beside a form the customer can use again.
+    const markup = pane({ error: 'Your card was declined.' })
+    expect(markup).toContain('Your card was declined.')
+    expect(markup).toContain('data-payment-element="1"')
+    expect(markup).toMatch(/<button[^>]*data-pay="1"/)
+    expect(markup).not.toMatch(/<button[^>]*data-pay="1"[^>]*disabled/)
+  })
+
+  it('names the restaurant as the merchant, which is what a direct charge means', () => {
+    // Their name is on the customer's statement, not ours — that is the whole point
+    // of the connected-account charge, and the one place a customer meets it is here.
+    expect(pane()).toContain('Kashi')
   })
 })

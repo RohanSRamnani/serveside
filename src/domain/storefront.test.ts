@@ -30,8 +30,8 @@ async function payloadOf(locationId: string, version: number): Promise<MenuSnaps
 }
 
 /** Open all week, one menu, one snapshot pinned — a restaurant ready to be browsed. */
-async function storefront(): Promise<SeededMenu> {
-  const loc = await seedLocationWithMenu()
+async function storefront(over: Parameters<typeof seedLocationWithMenu>[0] = {}): Promise<SeededMenu> {
+  const loc = await seedLocationWithMenu(over)
   await seedBusinessHours(loc.id)
   await buildMenuSnapshot(loc.id)
   return loc
@@ -137,7 +137,7 @@ describe('storefrontView', () => {
   })
 
   it('carries the location a customer needs, and the open state with its reason', async () => {
-    const loc = await storefront()
+    const loc = await storefront({ stripeAccountId: 'acct_test_view' })
 
     const open = await storefrontView(loc.id)
     expect(open.location).toEqual({
@@ -153,6 +153,10 @@ describe('storefrontView', () => {
       // The cart renders a tax line before there is an order to ask about, so the
       // rate travels with the menu. Display-only: `POST /api/orders` recomputes it.
       taxRatePer100k: loc.taxRatePer100k,
+      // The connected account, because the customer's own browser has to name it to
+      // confirm a direct charge — it is in the header of every Stripe.js call it
+      // makes. An identifier, not a credential; see `StorefrontLocation`.
+      stripeAccountId: 'acct_test_view',
     })
     expect(open.location.slug).not.toBe(loc.slug)
     expect(open.open).toEqual({ open: true })
@@ -163,6 +167,14 @@ describe('storefrontView', () => {
       locationId: loc.id, until: new Date(Date.now() + 30 * 60_000),
     }))
     expect((await storefrontView(loc.id)).open).toEqual({ open: false, reason: 'paused' })
+  })
+
+  it('publishes a null connected account for a restaurant still onboarding', async () => {
+    // Null is the normal state of a restaurant we have just signed, and it is what
+    // the checkout turns into "pay at pickup is the only option" — one screen before
+    // `POST /api/orders` would have to refuse the card with a 503.
+    const loc = await storefront()
+    expect((await storefrontView(loc.id)).location.stripeAccountId).toBeNull()
   })
 
   it('reports a restaurant that is simply shut, with its menu intact', async () => {

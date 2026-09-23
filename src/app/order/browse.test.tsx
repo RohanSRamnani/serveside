@@ -101,6 +101,9 @@ function view(over: Partial<StorefrontView> = {}): StorefrontView {
       address: '123 Livingston Ave, Livingston NJ',
       prepTimeMinutes: 20,
       taxRatePer100k: 8875,
+      // The menu itself has no use for it — the checkout does, and the view is one
+      // object. See `StorefrontLocation`: it is public by construction.
+      stripeAccountId: 'acct_test_kashi',
     },
     open: { open: true },
     snapshotVersion: 7,

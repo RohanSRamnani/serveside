@@ -70,6 +70,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   answers its ordinary miss, which is correct. The view also publishes
   `taxRatePer100k` — display-only, so a cart can show a tax line before there is an
   order to ask about; what is charged is still recomputed by `POST /api/orders`.
+  It also publishes **`stripeAccountId`** (nullable) — not a leak: a connected
+  account id is an identifier, not a credential, and it is in the `Stripe-Account`
+  header of every Stripe.js call the customer's browser makes, so a direct charge
+  cannot be confirmed without it being on the wire. The checkout reads it to decide
+  whether a Card option exists at all.
   The slug lookup itself is `resolveStorefrontSlug` (same file), **shared** by the
   route and the page so the clamp and the two-match refusal cannot drift.
 - **`/order/[location]` is the customer's menu, and it is the storefront's front
@@ -116,10 +121,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   the cart gets here. `checkout-form.tsx` is the client: contact, tip, the consent
   block, the payment mode, split into a stateful `CheckoutForm` and a controlled
   `CheckoutFormView` because there is no jsdom. **The Card option renders only when
-  `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is non-empty** (blank-safe — an unset Vercel var
-  arrives as `''`), so locally pay-at-pickup is the only mode; choosing Card parks on a
-  `PaymentStep` placeholder that is deliberately **not** a success screen and does
-  **not** clear the cart, because nothing has been paid. Pay-at-pickup clears the cart
+  `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is non-empty AND the location has a
+  `stripeAccountId`** (`cardPaymentAvailable`, blank-safe on both — an unset Vercel var
+  arrives as `''`), so locally pay-at-pickup is the only mode. Choosing Card posts the
+  order, which parks at PENDING_PAYMENT, and swaps the form for `PaymentStep`: Stripe's
+  Payment Element inside `<Elements>`, on the restaurant's own account. It is
+  deliberately **not** a success screen and does **not** clear the cart, because nothing
+  has been paid. `confirmOutcome` is the whole decision about a confirm result —
+  `succeeded`/`processing` clear the cart and route to the status page (nothing is ever
+  marked paid in a browser; the webhook does that), anything else shows Stripe's own
+  message and keeps both the cart and the **same PaymentIntent**, which is what the
+  retry re-confirms — never a second `POST /api/orders`, which would be a second order
+  and a second dinner. A redirect-based method never comes back through this component
+  at all (it returns to `return_url`), so **the cart is not cleared on that path** — the
+  status page is where that belongs. Pay-at-pickup clears the cart
   and pushes to the status page. A 422 keeps the cart **and** the form: losing both at
   that moment is what makes somebody phone the restaurant instead. Tip presets are
   0/10/15/20% **of the pre-tax subtotal**, `roundHalfUp`, and a custom tip is read out
@@ -203,6 +218,16 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   is unaffected. `createPaymentIntentFor` puts **both** `orderId` and `locationId` in
   the intent metadata: the webhook has no scope of its own and RLS hides the order
   from it without the second one.
+  **The browser half is the same mechanism.** `stripeBrowser(stripeAccountId)`
+  (`src/lib/stripe-browser.ts`) loads Stripe.js with the **platform publishable key**
+  plus `{ stripeAccount }`, memoized per account id, and returns null when either is
+  missing. A client secret minted on a connected account cannot be confirmed by a
+  platform-only Stripe.js — the symptom is a card that simply fails on a key and a
+  secret that are both perfectly valid. One origin serves every storefront, so the
+  memo key must be the account id, or one restaurant's payment confirms against
+  another's account. Card data never reaches our DOM or our server: it is typed into
+  Stripe's own `<PaymentElement/>` iframe (PCI SAQ A), and the checkout's markup test
+  asserts there is no card input of ours.
 - **The webhook's order of operations is the design: verify signature → claim the
   event → handle.** The claim is `INSERT INTO webhook_events ... ON CONFLICT DO
   NOTHING` on `external_id`; zero rows back means a duplicate delivery, answer 200 and
@@ -464,6 +489,14 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   loader rejects ESM syntax in a `.ts` config.
 - `@types/node` stays on `^22` (Node 22, and vitest 5 peer-requires it). The Next
   template's `^20` fails the install.
+- **`@stripe/stripe-js` + `@stripe/react-stripe-js`** are the storefront's card
+  dependencies (server-side `stripe` is separate and unrelated). Import
+  **`@stripe/stripe-js/pure`**, never the main entry: the main one injects Stripe's
+  script on the next microtask *just for being imported*, so every checkout visitor —
+  including the pay-at-pickup majority and restaurants with no Stripe at all — would
+  fetch it. Types come from the main entry via `import type`, which is erased.
+  Elements render in a cross-origin iframe and cannot see our CSS variables, so the
+  Element's colours are literal copies in `ELEMENT_APPEARANCE`; change both together.
 - `next dev` rewrites the marker block in `AGENTS.md`. Commit the change, don't fight it.
 - **`export const revalidate` is a no-op on any page that reads the database**, and
   the build output says so (`ƒ`, and the response is `no-cache, no-store`). The Neon

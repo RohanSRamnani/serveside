@@ -1,7 +1,10 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { Elements, PaymentElement, useElements, useStripe } from '@stripe/react-stripe-js'
+import type { Appearance, StripeElementsOptions } from '@stripe/stripe-js'
+import { stripeBrowser } from '@/lib/stripe-browser'
 import { cartSubtotalCents, cartTotals, lineTotalCents } from '@/lib/cart'
 import { formatCents, roundHalfUp, totalCentsFor } from '@/lib/money'
 import { MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS } from '@/lib/order-limits'
@@ -216,17 +219,116 @@ export const UNREADABLE_SUCCESS_MESSAGE =
   'Your order may have gone through. Please call the restaurant to check before ordering again.'
 
 /**
- * Is there a Stripe publishable key at all?
+ * Can this restaurant take a card on this deployment at all?
  *
- * **Blank-safe rather than truthy-safe**, which is Task 5's rule and matters here:
- * an unset Vercel environment variable arrives as `''`, not as `undefined`, and a
- * Payment Element mounted with a blank key throws at runtime — on the one screen that
- * must never break. With no key the Card option is not rendered at all, so pay at
- * pickup is simply the only way to order, which is exactly right for a restaurant
- * that has not finished Stripe onboarding.
+ * **Two halves of one fact, and both are required.** The platform's publishable key
+ * is how the browser talks to Stripe; the restaurant's connected account id is whose
+ * money it is. A direct charge's client secret belongs to an intent on *their*
+ * account, so Stripe.js has to be loaded naming that account — see `stripeBrowser`.
+ * Either half missing and there is nothing a card radio could do but fail.
+ *
+ * **Blank-safe rather than truthy-safe** on both: an unset Vercel environment
+ * variable arrives as `''`, not as `undefined`, and a Payment Element mounted with a
+ * blank key throws at runtime — on the one screen that must never break.
+ *
+ * With no card, pay at pickup is simply the only way to order, which is exactly right
+ * for a restaurant that has not finished Stripe onboarding. The server says the same
+ * thing one step later (`StripeAccountMissingError` → 503); hiding the radio is that
+ * ruling brought forward to where a customer can still act on it.
  */
-export function cardPaymentAvailable(publishableKey: string | undefined): boolean {
-  return typeof publishableKey === 'string' && publishableKey.trim() !== ''
+export function cardPaymentAvailable(
+  publishableKey: string | undefined,
+  stripeAccountId: string | null | undefined,
+): boolean {
+  return filled(publishableKey) && filled(stripeAccountId)
+}
+
+/** Present, and not a string of spaces. */
+function filled(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.trim() !== ''
+}
+
+/**
+ * What a customer is told when a payment did not complete and Stripe had no sentence
+ * of its own about it — an error with no `message`, or an intent that came back in a
+ * state that is not a payment.
+ *
+ * It invites a retry, and that is safe *because the retry is the same PaymentIntent*:
+ * confirming one twice cannot charge twice (Stripe refuses a second confirm on an
+ * intent that has already succeeded). The one thing that must never happen here is a
+ * second `POST /api/orders`, which would be a second order and a second dinner.
+ */
+export const PAYMENT_NOT_COMPLETED_MESSAGE =
+  'That payment didn’t go through. Tap Pay to try again, or use another card.'
+
+/** What they are told when `confirmPayment` did not come back at all. */
+export const PAYMENT_UNREACHABLE_MESSAGE =
+  'We couldn’t reach Stripe just then. Tap Pay to try again — it’s the same order, so you can’t be charged twice.'
+
+/**
+ * What to do with what `stripe.confirmPayment` handed back.
+ *
+ * **The decision, pulled out of the handler so it can be tested at all** — the same
+ * move as `submitFailureMessage`, and for the same reason: there is no jsdom here,
+ * and this is the branch where a wrong answer either strands a paid customer on a
+ * checkout or empties the cart of one who has paid nothing.
+ *
+ * - **`succeeded` and `processing` are both done.** Not "paid" — *nothing* is ever
+ *   marked paid in a browser. The order stays PENDING_PAYMENT until the Stripe
+ *   webhook flips it, and the status page says "confirming payment…" meanwhile.
+ *   `processing` is a payment Stripe has accepted and not yet settled; keeping the
+ *   customer on the checkout for it is asking them to pay a second time.
+ * - **An error is shown in Stripe's own words.** "Your card was declined." is written
+ *   for the cardholder and is the only thing on the screen they can act on; ours
+ *   would be a worse copy of it.
+ * - **Nothing else clears the cart.** `requires_payment_method` is where an intent
+ *   lands after a failed confirm, `requires_action` is one that needs a step we did
+ *   not finish: no money has moved, the customer is about to retry on this very
+ *   screen, and a cleared cart leaves them nothing to retry with.
+ *
+ * Typed structurally rather than against `PaymentIntentResult` so a test can state a
+ * status without conjuring a whole Stripe object; a real result satisfies it.
+ */
+export type ConfirmOutcome =
+  /** Stripe has the payment. Clear the cart, then go to the status page. */
+  | { kind: 'paid'; clearCart: true }
+  /** Nothing was taken. Show `message`; keep the cart AND the same PaymentIntent. */
+  | { kind: 'failed'; clearCart: false; message: string }
+
+export function confirmOutcome(result: {
+  error?: { message?: string } | null
+  paymentIntent?: { status: string } | null
+}): ConfirmOutcome {
+  if (result.error) {
+    const message = (result.error.message ?? '').trim()
+    return { kind: 'failed', clearCart: false, message: message || PAYMENT_NOT_COMPLETED_MESSAGE }
+  }
+  if (result.paymentIntent && PAID_INTENT_STATUSES.includes(result.paymentIntent.status)) {
+    return { kind: 'paid', clearCart: true }
+  }
+  // Includes the shape with neither field, which the SDK's types say cannot happen.
+  // The expensive wrong answer is the optimistic one, so the default is "not paid".
+  return { kind: 'failed', clearCart: false, message: PAYMENT_NOT_COMPLETED_MESSAGE }
+}
+
+/** The two PaymentIntent states that mean the customer is finished with us. */
+const PAID_INTENT_STATUSES = ['succeeded', 'processing']
+
+/**
+ * Stripe's `return_url` — where a **redirect-based** payment method sends the
+ * customer back to.
+ *
+ * **Absolute, because it has to be**: the customer leaves our origin entirely (a bank
+ * page, a wallet app), so there is nothing for a relative path to be relative to, and
+ * Stripe refuses one. Built from `statusHref` rather than restated, so this and
+ * Task 6's page cannot come to different conclusions about where that page lives.
+ *
+ * The origin is passed in rather than read here: `window` does not exist during the
+ * server render of this client component, and the call site is an event handler,
+ * which is the one place it certainly does.
+ */
+export function returnUrlFor(origin: string, slug: string, orderId: string): string {
+  return `${origin}${statusHref(slug, orderId)}`
 }
 
 /**
@@ -330,12 +432,18 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
   const [quote, setQuote] = useState(initialQuote)
 
   /**
-   * `process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is written out in full here and
-   * nowhere else: Next inlines that expression by **static text substitution** at
-   * build time, so a destructured or aliased read is simply `undefined` in the
-   * browser — which would hide the Card option on a correctly configured deployment.
+   * `process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is written out in full — Next
+   * inlines that expression by **static text substitution** at build time, so a
+   * destructured or aliased read is simply `undefined` in the browser, which would
+   * hide the Card option on a correctly configured deployment. (`stripeBrowser`
+   * writes it out in full for the same reason; those are the only two readers.)
+   *
+   * The second half is the restaurant's own: a connected account to charge on.
    */
-  const cardAvailable = cardPaymentAvailable(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY)
+  const cardAvailable = cardPaymentAvailable(
+    process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY,
+    location.stripeAccountId,
+  )
 
   /**
    * The quote, corrected on mount and kept honest while the form is open.
@@ -435,7 +543,25 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
   }, [busy, form, cart, locationId, location.slug, router])
 
   if (placed) {
-    return <PaymentStep shortCode={placed.shortCode} orderId={placed.orderId} location={location} />
+    return (
+      <PaymentStep
+        shortCode={placed.shortCode}
+        orderId={placed.orderId}
+        location={location}
+        clientSecret={placed.clientSecret}
+        /**
+         * **The only path that empties the cart on a card order**, and it runs after
+         * Stripe has the payment and never before: a declined card leaves the cart
+         * exactly as it was, because the next thing the customer does is try another
+         * one. Cleared here rather than inside `PaymentStep` so that the one rule
+         * about the cart on this page lives beside the other one.
+         */
+        onPaid={() => {
+          cart.clear()
+          router.push(statusHref(location.slug, placed.orderId))
+        }}
+      />
+    )
   }
 
   return (
@@ -763,43 +889,223 @@ function placeLabel(payment: CheckoutFormState['payment'], totalCents: number): 
 }
 
 /**
- * Where a card order lands until Task 5 mounts Stripe's Payment Element.
+ * Where a card order lands: Stripe's Payment Element, mounted **on the restaurant's
+ * connected account**, holding the client secret `POST /api/orders` came back with.
  *
- * **Deliberately not a success screen.** The order exists and sits at
- * PENDING_PAYMENT: nothing has been charged, no ticket has been printed and the
- * kitchen has not been told — `createOrder` parks card orders there precisely so that
- * none of that happens before the money lands. Saying "thank you for your order"
- * here would be a lie a customer acts on by driving to the restaurant.
+ * **Deliberately not a success screen**, and that has not changed. The order sits at
+ * PENDING_PAYMENT: nothing has been charged, no ticket has printed and the kitchen
+ * has not been told — `createOrder` parks card orders there precisely so that none of
+ * that happens before the money lands, and the flip to NEW belongs to the Stripe
+ * webhook alone. The short code is on screen because it is the only handle the
+ * customer has on the order meanwhile.
  *
- * It shows the short code because that is the only handle they have on an order they
- * cannot yet pay for, and it names the way out, which today is a phone call.
+ * **Card data never touches this DOM** (PCI SAQ A). `<PaymentElement/>` is Stripe's
+ * own iframe: the number, expiry and CVC are typed into Stripe's origin, and what
+ * comes back to us is a confirmation, never a PAN. That is the whole reason this
+ * screen is an Element and not a form of our own, and it is why the markup test
+ * asserts there is no card input here.
  *
- * TODO(plan-2/task-5): replace this with the Payment Element, mounted on the
- * restaurant's connected account with the `clientSecret` this component's caller is
- * already holding.
+ * A **null client** — no publishable key at build time, or a restaurant with no
+ * connected account — is a misconfiguration by the time anyone is here, because the
+ * Card radio is hidden for both (`cardPaymentAvailable`). It is answered with the
+ * honest screen rather than a dead form: the order exists, and the way to finish it
+ * is the restaurant's phone.
  */
-export function PaymentStep({ shortCode, orderId, location }: {
+export type PaymentStepProps = {
   shortCode: string
   orderId: string
   location: StorefrontLocation
-}) {
+  /** The secret of a PaymentIntent on `location.stripeAccountId`, and nowhere else. */
+  clientSecret: string
+  /** Stripe has the payment: the caller clears the cart and routes. */
+  onPaid: () => void
+}
+
+export function PaymentStep({ shortCode, orderId, location, clientSecret, onPaid }: PaymentStepProps) {
+  /**
+   * Memoized twice over on purpose. `stripeBrowser` keeps one client per connected
+   * account for the life of the page; this `useMemo` keeps *this render tree* handing
+   * `<Elements>` the same promise, because a new one remounts the Payment Element and
+   * throws away the card number the customer is halfway through typing.
+   */
+  const stripe = useMemo(() => stripeBrowser(location.stripeAccountId), [location.stripeAccountId])
+  const options = useMemo<StripeElementsOptions>(
+    () => ({ clientSecret, appearance: ELEMENT_APPEARANCE }),
+    [clientSecret],
+  )
+
   return (
     <div className="ss ss-co" data-slug={location.slug} data-order={orderId}>
       <style>{SHELL_CSS + CHECKOUT_CSS}</style>
       <div className="ss-co-step">
         <p className="ss-co-step-eyebrow">Order {shortCode}</p>
-        <h1 className="ss-co-step-title">Card payment isn’t set up here yet</h1>
-        <p className="ss-co-step-copy">
-          We’ve held your order under <strong>{shortCode}</strong>, but we can’t take
-          the card on this screen yet — so the kitchen hasn’t started it. Call{' '}
-          {location.name} on{' '}
-          <a href={`tel:${location.phoneE164}`}>{formatPhone(location.phoneE164)}</a>{' '}
-          to finish it, or go back and choose <strong>Pay at pickup</strong>.
-        </p>
-        <a className="ss-co-step-link" href={menuHref(location.slug)}>Back to the menu</a>
+        {stripe === null ? (
+          <>
+            <h1 className="ss-co-step-title">Card payment isn’t set up here yet</h1>
+            <p className="ss-co-step-copy">
+              We’ve held your order under <strong>{shortCode}</strong>, but we can’t take
+              the card on this screen — so the kitchen hasn’t started it. Call{' '}
+              {location.name} on{' '}
+              <a href={`tel:${location.phoneE164}`}>{formatPhone(location.phoneE164)}</a>{' '}
+              to finish it, or go back and choose <strong>Pay at pickup</strong>.
+            </p>
+            <a className="ss-co-step-link" href={menuHref(location.slug)}>Back to the menu</a>
+          </>
+        ) : (
+          <Elements stripe={stripe} options={options}>
+            <PaymentPane location={location} orderId={orderId} onPaid={onPaid} />
+          </Elements>
+        )}
       </div>
     </div>
   )
+}
+
+/**
+ * The confirm, and the state around it. Inside `<Elements>` because `useStripe` and
+ * `useElements` read that context — which is also why the markup below is a separate,
+ * fully-controlled `PaymentPaneView`, the same split as `CheckoutForm` and for the
+ * same reason: no jsdom, so what has to *appear* must be renderable from props.
+ */
+function PaymentPane({ location, orderId, onPaid }: {
+  location: StorefrontLocation
+  orderId: string
+  onPaid: () => void
+}) {
+  const stripe = useStripe()
+  const elements = useElements()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const pay = useCallback(async () => {
+    // Same belt-and-braces as the order submit: the button is disabled on `busy`, and
+    // this catches a double-fire the DOM let through. Confirming twice is not two
+    // charges (Stripe refuses the second), but it is two error messages and a
+    // customer who cannot tell what happened.
+    if (!stripe || !elements || busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      const outcome = confirmOutcome(await stripe.confirmPayment({
+        elements,
+        /**
+         * **`if_required`**, so a card is confirmed in place and only a method that
+         * genuinely needs a bank page redirects. `return_url` is where that redirect
+         * comes back to and must be absolute.
+         *
+         * A redirect method therefore finishes on the status page without this
+         * component ever running again — so `onPaid` does not fire and the cart is
+         * not cleared. That is a known seam handed to Task 6: the status page is the
+         * right place to empty a cart for an order that reached it, and it is the
+         * only place a redirect payment lands.
+         */
+        redirect: 'if_required',
+        confirmParams: { return_url: returnUrlFor(window.location.origin, location.slug, orderId) },
+      }))
+
+      if (outcome.kind === 'paid') {
+        // Not re-enabled: the caller is clearing the cart and navigating, and a live
+        // Pay button under a departing page is an invitation to confirm again.
+        onPaid()
+        return
+      }
+      setError(outcome.message)
+      setBusy(false)
+    } catch {
+      // `confirmPayment` resolves with an error for anything Stripe has an opinion
+      // about; a rejection is the network or a bug. The wording invites a retry
+      // because the retry is this same intent, which cannot be charged twice.
+      setError(PAYMENT_UNREACHABLE_MESSAGE)
+      setBusy(false)
+    }
+  }, [stripe, elements, busy, location.slug, orderId, onPaid])
+
+  return (
+    <PaymentPaneView
+      location={location}
+      ready={stripe !== null && elements !== null}
+      busy={busy}
+      error={error}
+      onPay={pay}
+    />
+  )
+}
+
+export type PaymentPaneViewProps = {
+  location: StorefrontLocation
+  /** Stripe.js and the Elements group are both mounted, so Pay can do something. */
+  ready: boolean
+  busy: boolean
+  error: string | null
+  onPay: () => void
+}
+
+export function PaymentPaneView({ location, ready, busy, error, onPay }: PaymentPaneViewProps) {
+  return (
+    <form
+      className="ss-co-pay-form"
+      onSubmit={(event) => {
+        // A real form, so a phone keyboard's Go key works — and prevented, because
+        // this confirms through Stripe.js rather than posting anything.
+        event.preventDefault()
+        onPay()
+      }}
+    >
+      {/*
+        The restaurant is named because of what a direct charge *is*: the charge is
+        created on their account, so their name is what appears on the statement. This
+        is the one screen where a customer meets that fact, and a statement line they
+        do not recognise is a chargeback.
+      */}
+      <h1 className="ss-co-step-title">Pay {location.name}</h1>
+      <p className="ss-co-step-copy">
+        Your card details go straight to Stripe — we never see them. The charge shows
+        up as {location.name}.
+      </p>
+
+      <div className="ss-co-element">
+        <PaymentElement />
+      </div>
+
+      {error ? <p className="ss-co-error" role="alert">{error}</p> : null}
+
+      <button type="submit" className="ss-co-submit" data-pay="1" disabled={!ready || busy}>
+        {busy ? 'Paying…' : 'Pay now'}
+      </button>
+      <p className="ss-co-tel">
+        Something wrong?{' '}
+        <a href={`tel:${location.phoneE164}`}>{formatPhone(location.phoneE164)}</a>
+      </p>
+    </form>
+  )
+}
+
+/**
+ * The Payment Element, in the storefront's own paper and ink.
+ *
+ * **The values are literals and cannot be the CSS variables** `SHELL_CSS` defines:
+ * the Element renders in an iframe on Stripe's origin, which can read neither our
+ * stylesheet nor our custom properties. They are copies of `--accent`, `--card`,
+ * `--ink` and the checkout input's radius, and the only way they stay in step is by
+ * somebody changing both — hence this note rather than a clever import.
+ *
+ * Deliberately modest: Stripe's default theme with our colours over it. The Element
+ * is the one piece of this page whose job is to look like a payment form people
+ * already trust.
+ */
+const ELEMENT_APPEARANCE: Appearance = {
+  theme: 'stripe',
+  variables: {
+    colorPrimary: '#a9271d',    // --accent
+    colorBackground: '#ffffff', // --card
+    colorText: '#17120f',       // --ink
+    colorTextSecondary: '#6a5f57', // --ink-soft
+    colorDanger: '#a9271d',
+    borderRadius: '11px',       // .ss-co-input
+    // 16px, for the reason .ss-co-input carries it: anything smaller and iOS zooms
+    // the page on focus and never zooms back out.
+    fontSizeBase: '16px',
+  },
 }
 
 /**
@@ -921,6 +1227,10 @@ export const CHECKOUT_CSS = `
   border-radius: 12px; background: var(--accent); color: var(--accent-ink);
   font-size: 15.5px; font-weight: 700; line-height: 22px;
 }
+/* The Payment Element draws its own fields inside an iframe; all this owns is the
+   space around it. Anything further belongs in ELEMENT_APPEARANCE, which is the only
+   styling that reaches across that boundary. */
+.ss-co-element { margin-top: 20px; }
 
 @media (min-width: 600px) {
   .ss-co-head, .ss-co-form { max-width: 34rem; margin-inline: auto; }
