@@ -55,11 +55,17 @@ export default clerkMiddleware()
  * `api/orders$` is anchored so public checkout (`POST /api/orders`) is excluded while
  * `POST /api/orders/<id>/transition`, which is a person tapping a tablet, is not.
  *
+ * `api/orders/[^/]+/status$` is Task 6's public status endpoint — a customer's own
+ * phone, polling every five seconds, with no session to attach. Anchored the same
+ * way `api/orders$` is, and for the same reason: `[^/]+` is the order id, and the
+ * `$` is what keeps this from also swallowing `POST /api/orders/<id>/transition`,
+ * which is a person on a tablet and must stay behind Clerk.
+ *
  * **One string literal, however long.** Next extracts `matcher` by static analysis at
  * build time; a concatenation or a constant it cannot fold is not an error — the
  * matcher is silently dropped and the proxy runs on *every* request, exclusions and
  * all. That failure looks exactly like the exclusions not working.
  */
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|order/|api/stripe/|api/printers/|api/inngest|api/storefront/|api/orders$).*)'],
+  matcher: ['/((?!_next/static|_next/image|favicon\\.ico|chime\\.wav|order/|api/stripe/|api/printers/|api/inngest|api/storefront/|api/orders$|api/orders/[^/]+/status$).*)'],
 }

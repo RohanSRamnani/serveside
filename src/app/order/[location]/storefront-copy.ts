@@ -60,6 +60,28 @@ export function formatPhone(e164: string): string {
 }
 
 /**
+ * "7:35 PM", on the restaurant's own clock. The shared half of `quoteLabel` and
+ * `readyAtLabel` below — one an estimate computed from now, the other a promise
+ * already pinned on the order — so the two cannot format the same kind of instant
+ * two different ways.
+ *
+ * The space before AM/PM is normalised. Since ICU 72 (Node 18.14+) `en-US` formats it
+ * with U+202F, a narrow no-break space — invisible in a diff, fatal to a string
+ * comparison, and the kind of thing that costs an afternoon.
+ */
+function wallClockTime(at: Date, timezone: string): string {
+  const time = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    // Stated rather than left to the locale: a default that ever flipped to 24-hour
+    // would silently change what every customer in the country is promised.
+    hour12: true,
+    timeZone: timezone,
+  }).format(at)
+  return time.replace(/[  ]/g, ' ')
+}
+
+/**
  * "Ready around 7:35 PM" — now plus the restaurant's prep time, **on the
  * restaurant's clock**.
  *
@@ -73,22 +95,22 @@ export function formatPhone(e164: string): string {
  * a client reference when a server component imports it, so a formatter kept in the
  * form would be a proxy object by the time the page tried to call it. This module has
  * no `'use client'`, so both ends can use it; the form re-exports it for its tests.
- *
- * The space before AM/PM is normalised. Since ICU 72 (Node 18.14+) `en-US` formats it
- * with U+202F, a narrow no-break space — invisible in a diff, fatal to a string
- * comparison, and the kind of thing that costs an afternoon.
  */
 export function quoteLabel(now: Date, prepTimeMinutes: number, timezone: string): string {
   const ready = new Date(now.getTime() + prepTimeMinutes * 60_000)
-  const time = new Intl.DateTimeFormat('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    // Stated rather than left to the locale: a default that ever flipped to 24-hour
-    // would silently change what every customer in the country is promised.
-    hour12: true,
-    timeZone: timezone,
-  }).format(ready)
-  return `Ready around ${time.replace(/[  ]/g, ' ')}`
+  return `Ready around ${wallClockTime(ready, timezone)}`
+}
+
+/**
+ * "Ready around 7:35 PM" for a **fixed instant** rather than an estimate — the status
+ * page's own quote, once `orders.quoted_ready_at` is a real timestamp the
+ * `PENDING_PAYMENT → NEW` flip (or an ACCEPTED bump) already pinned, not "now plus
+ * prep time". Same wording and the same restaurant's-clock rule as `quoteLabel`, so a
+ * customer reads one sentence on the checkout page and the same shape of sentence on
+ * the status page that follows it.
+ */
+export function readyAtLabel(readyAt: Date, timezone: string): string {
+  return `Ready around ${wallClockTime(readyAt, timezone)}`
 }
 
 /** `HH:MM:SS` as a customer reads a clock. `24:00:00` is a legal Postgres `time`. */
