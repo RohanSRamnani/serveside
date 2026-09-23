@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Elements, PaymentElement, useElements, useStripe } from '@stripe/react-stripe-js'
-import type { Appearance, StripeElementsOptions } from '@stripe/stripe-js'
+import type { Appearance, StripeElements, StripeElementsOptions } from '@stripe/stripe-js'
 import { stripeBrowser } from '@/lib/stripe-browser'
 import { cartSubtotalCents, cartTotals, lineTotalCents } from '@/lib/cart'
 import { formatCents, roundHalfUp, totalCentsFor } from '@/lib/money'
@@ -329,6 +329,46 @@ const PAID_INTENT_STATUSES = ['succeeded', 'processing']
  */
 export function returnUrlFor(origin: string, slug: string, orderId: string): string {
   return `${origin}${statusHref(slug, orderId)}`
+}
+
+/**
+ * The whole argument to `stripe.confirmPayment`, built where a test can read it.
+ *
+ * **Extracted for the same reason as `confirmOutcome`, at the other end of the call.**
+ * That one pins what Stripe hands back; this pins what it is handed. Inline in the
+ * handler these three fields were unreachable by any test in this suite — deleting
+ * `return_url` broke nothing, and the compiler is only a partial guard:
+ *
+ * - **`redirect` is the one TypeScript cannot save us from.** `'always'` and
+ *   `'if_required'` both satisfy an overload, and the wrong one sends *every* card
+ *   customer off to Stripe mid-checkout and back again. It is pinned by value.
+ * - **`return_url` must be absolute** — a redirect-based method leaves our origin
+ *   entirely, so there is nothing for a relative path to be relative to and Stripe
+ *   refuses one. `returnUrlFor` is the only builder.
+ * - **`elements` is the group holding the card the customer typed**, passed by
+ *   identity.
+ *
+ * `if_required` is also what makes a card confirm *in place*, which is why the
+ * success path in `PaymentPane` exists at all. A method that genuinely needs a bank
+ * page still redirects, and then finishes on the status page without that component
+ * ever running again — so `onPaid` does not fire and the cart is not cleared. That is
+ * a known seam handed to Task 6: the status page is the right place to empty a cart
+ * for an order that reached it, and it is the only place a redirect payment lands.
+ *
+ * The return type is written out so `redirect` stays the literal `'if_required'`;
+ * widened to `string` it would no longer pick the overload it belongs to.
+ */
+export function confirmArgsFor(
+  elements: StripeElements,
+  origin: string,
+  slug: string,
+  orderId: string,
+): { elements: StripeElements; redirect: 'if_required'; confirmParams: { return_url: string } } {
+  return {
+    elements,
+    redirect: 'if_required',
+    confirmParams: { return_url: returnUrlFor(origin, slug, orderId) },
+  }
 }
 
 /**
@@ -986,22 +1026,14 @@ function PaymentPane({ location, orderId, onPaid }: {
     setBusy(true)
     setError(null)
     try {
-      const outcome = confirmOutcome(await stripe.confirmPayment({
-        elements,
-        /**
-         * **`if_required`**, so a card is confirmed in place and only a method that
-         * genuinely needs a bank page redirects. `return_url` is where that redirect
-         * comes back to and must be absolute.
-         *
-         * A redirect method therefore finishes on the status page without this
-         * component ever running again — so `onPaid` does not fire and the cart is
-         * not cleared. That is a known seam handed to Task 6: the status page is the
-         * right place to empty a cart for an order that reached it, and it is the
-         * only place a redirect payment lands.
-         */
-        redirect: 'if_required',
-        confirmParams: { return_url: returnUrlFor(window.location.origin, location.slug, orderId) },
-      }))
+      // Both halves of the call are ordinary functions, and both are tested:
+      // `confirmArgsFor` is what Stripe is handed, `confirmOutcome` is what it hands
+      // back. `window.location.origin` is read here rather than inside either —
+      // there is no `window` during this client component's server render, and an
+      // event handler is the one place there certainly is one.
+      const outcome = confirmOutcome(await stripe.confirmPayment(
+        confirmArgsFor(elements, window.location.origin, location.slug, orderId),
+      ))
 
       if (outcome.kind === 'paid') {
         // Not re-enabled: the caller is clearing the cart and navigating, and a live

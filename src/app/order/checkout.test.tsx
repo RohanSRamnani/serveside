@@ -48,9 +48,9 @@ vi.mock('@stripe/react-stripe-js', () => ({
 
 import {
   CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentPaneView, PaymentStep, TIP_PERCENTS,
-  UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, confirmOutcome,
-  consentDisclosure, customTipCents, normalizePhone, orderBodyFrom, quoteLabel,
-  returnUrlFor, statusHref, submitFailureMessage, tipCentsFor, tipPresetCents,
+  UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, confirmArgsFor,
+  confirmOutcome, consentDisclosure, customTipCents, normalizePhone, orderBodyFrom,
+  quoteLabel, returnUrlFor, statusHref, submitFailureMessage, tipCentsFor, tipPresetCents,
   type CheckoutFormState,
 } from './[location]/checkout/checkout-form'
 
@@ -511,6 +511,51 @@ describe('returnUrlFor', () => {
       .toBe(`https://order.kashi.com${statusHref('kashi', 'ord-123')}`)
     expect(returnUrlFor('http://localhost:3007', 'kashi', 'ord-123'))
       .toBe('http://localhost:3007/order/kashi/status/ord-123')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// What `stripe.confirmPayment` is actually CALLED with.
+// ---------------------------------------------------------------------------
+
+describe('confirmArgsFor', () => {
+  /** Stripe's Elements group is an opaque handle here; only its identity matters. */
+  const elements = { theGroup: true } as unknown as Parameters<typeof confirmArgsFor>[0]
+
+  it('is the whole argument, so the call itself is what gets reviewed', () => {
+    // The result object, entire. `confirmOutcome` pins what comes back from Stripe;
+    // this pins what goes in — the half that used to live inline in a handler no
+    // test could reach, where deleting the `return_url` broke nothing.
+    expect(confirmArgsFor(elements, 'https://order.kashi.com', 'kashi', 'ord-123')).toEqual({
+      elements,
+      redirect: 'if_required',
+      confirmParams: { return_url: 'https://order.kashi.com/order/kashi/status/ord-123' },
+    })
+  })
+
+  it('confirms in place — `if_required`, never `always`', () => {
+    // **The one mistake TypeScript cannot catch.** Both literals satisfy an overload,
+    // and `'always'` navigates EVERY card customer off to Stripe mid-checkout and
+    // back, turning an in-place confirm into a full round trip. Pinned by value for
+    // exactly that reason.
+    expect(confirmArgsFor(elements, 'https://order.kashi.com', 'kashi', 'ord-1').redirect)
+      .toBe('if_required')
+  })
+
+  it('hands Stripe the same absolute status URL `returnUrlFor` builds', () => {
+    // The wiring, not just the value: a `return_url` that is dropped, hardcoded or
+    // built a second way is a redirect-based payment that comes back to the wrong
+    // page — or, relative, one Stripe refuses outright.
+    const origin = 'http://localhost:3007'
+    const { confirmParams } = confirmArgsFor(elements, origin, 'kashi', 'ord-9')
+    expect(confirmParams.return_url).toBe(returnUrlFor(origin, 'kashi', 'ord-9'))
+    expect(confirmParams.return_url.startsWith(`${origin}/`)).toBe(true)
+  })
+
+  it('carries THIS Elements group, which is what holds the customer’s card', () => {
+    // Passed through by identity. A fresh or wrong group confirms an intent against
+    // fields the customer never typed into.
+    expect(confirmArgsFor(elements, 'https://x.test', 'kashi', 'ord-1').elements).toBe(elements)
   })
 })
 
