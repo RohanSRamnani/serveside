@@ -39,6 +39,32 @@ export const MAX_LINES_PER_ORDER = 100
 export const MAX_TEXT_FIELD_LENGTH = 500
 
 /**
+ * The most a single order may be tipped: **$2,000.00**.
+ *
+ * `tipCents` is the one money value on the whole write path that the client supplies
+ * rather than the menu, so it is the one that needs a ceiling. Without one,
+ * `Number.isSafeInteger` happily accepts 9007199254740991: that total is handed to
+ * Stripe verbatim as the PaymentIntent amount, which refuses it **after** the order
+ * row is committed — leaving a row stuck at PENDING_PAYMENT and a 500 — and on the
+ * pay-at-pickup path it simply prints a ticket with a nonsense total.
+ *
+ * **An absolute cap in cents, not a percentage of the order.** `assertInputShape`
+ * runs before a connection is opened, deliberately (a malformed id inside the
+ * transaction is a 22P02 that poisons it), so it cannot see the subtotal and has no
+ * basis for a relative bound. The number therefore has to be one that cannot refuse a
+ * real tip on any order this product can plausibly take.
+ *
+ * $2,000 is that number. Pickup only, from an independent restaurant: the largest
+ * genuine order is a catering run, and this still clears a 25% tip on an $8,000 one.
+ * It is also three orders of magnitude below Stripe's own $999,999.99 per-charge
+ * ceiling, so the cap that bites first is always ours, with a coded rejection a
+ * customer can read — rather than Stripe's, after the money path has already started.
+ * Above this is a typo or an attack, not generosity; a customer who genuinely wants
+ * to tip more is a phone call, the same ruling `MAX_QTY_PER_STEPPER` makes.
+ */
+export const MAX_TIP_CENTS = 200_000
+
+/**
  * What one tap-tap-tap of a stepper may reach — the **UI's** own, narrower cap, and
  * the one number here the server does not enforce.
  *

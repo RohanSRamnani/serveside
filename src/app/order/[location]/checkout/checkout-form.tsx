@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { cartSubtotalCents, cartTotals, lineTotalCents } from '@/lib/cart'
 import { formatCents, roundHalfUp, totalCentsFor } from '@/lib/money'
-import { MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
+import { MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS } from '@/lib/order-limits'
 import type { CreateOrderInput } from '@/domain/create-order'
 import type { OpenState, ServiceWindow } from '@/domain/hours'
 import type { StorefrontLocation } from '@/domain/storefront'
@@ -97,6 +97,12 @@ const MAX_TIP_DOLLAR_DIGITS = 7
  * typed anything. Anything else that is not a plain dollar amount is `null`, which
  * the form shows as a hint and refuses to submit — never a silent 0, which would be a
  * customer who meant to tip and did not, and a server that was never told.
+ *
+ * **Anything over `MAX_TIP_CENTS` is `null` too**, against the same constant
+ * `assertInputShape` enforces — imported, never restated, which is the whole reason
+ * `order-limits.ts` exists. The server is what actually holds the line; this is so a
+ * customer meets the bound while the number is still in front of them and editable,
+ * instead of at the last step with no way to tell what went wrong.
  */
 export function customTipCents(dollars: string): number | null {
   const trimmed = dollars.trim()
@@ -107,7 +113,8 @@ export function customTipCents(dollars: string): number | null {
   // `'.'` on its own, and `''`, both reach here with nothing in either group.
   if (whole === '' && fraction === undefined) return null
   // `padEnd`, so "3.5" is 50 cents rather than 5.
-  return Number(whole === '' ? 0 : whole) * 100 + Number((fraction ?? '').padEnd(2, '0') || 0)
+  const cents = Number(whole === '' ? 0 : whole) * 100 + Number((fraction ?? '').padEnd(2, '0') || 0)
+  return cents > MAX_TIP_CENTS ? null : cents
 }
 
 /** What the form is currently asking for. One object, so the view takes one prop. */
@@ -629,7 +636,12 @@ export function CheckoutFormView({
                   />
                 </span>
                 {tipInvalid ? (
-                  <span className="ss-co-hint ss-co-bad" role="status">Enter an amount like 4.50.</span>
+                  /* The cap is named rather than left to be discovered: an amount
+                     over it is refused for a reason a format hint alone would not
+                     explain, and the customer is holding the number that caused it. */
+                  <span className="ss-co-hint ss-co-bad" role="status">
+                    Enter an amount like 4.50, up to ${formatCents(MAX_TIP_CENTS)}.
+                  </span>
                 ) : null}
               </label>
             ) : null}

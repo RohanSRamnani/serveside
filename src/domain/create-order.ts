@@ -11,7 +11,7 @@ import type { OrderStatus } from './order-status'
 import {
   taxCentsFor, unitPriceCentsFor, lineTotalCentsFor, totalCentsFor, assertTotalsBalance, type Totals,
 } from '@/lib/money'
-import { MAX_LINES_PER_ORDER, MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
+import { MAX_LINES_PER_ORDER, MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS } from '@/lib/order-limits'
 import { makeShortCode } from '@/lib/short-code'
 
 /**
@@ -379,6 +379,23 @@ function assertInputShape(input: CreateOrderInput): void {
   }
   if (!Number.isSafeInteger(input.tipCents) || input.tipCents < 0) {
     throw new InvalidOrderInputError(`Tip must be a whole number of cents and not negative, got ${input.tipCents}`)
+  }
+  /**
+   * **Bounded, because the tip is the one money value the client supplies.**
+   * Everything else on the receipt is read from the menu inside the transaction;
+   * this arrives in the request body. Unbounded, `Number.isSafeInteger` accepts
+   * 9007199254740991, and that total is handed to Stripe verbatim — refused *after*
+   * the order row is committed, which parks a row at PENDING_PAYMENT and answers a
+   * 500. Pay-at-pickup does not even get that: it prints the nonsense total.
+   *
+   * Refused here rather than clamped: a tip is an instruction, and silently charging
+   * a different number than the one a customer typed is the one thing this file
+   * exists to prevent. See `MAX_TIP_CENTS` for the bound's argument.
+   */
+  if (input.tipCents > MAX_TIP_CENTS) {
+    throw new InvalidOrderInputError(
+      `A tip may be at most ${MAX_TIP_CENTS} cents ($${(MAX_TIP_CENTS / 100).toFixed(0)}), got ${input.tipCents}`,
+    )
   }
   // The phone number is the whole identity of a guest order — it is how a kitchen
   // chases a no-show pickup — so a blank one is not a valid order.

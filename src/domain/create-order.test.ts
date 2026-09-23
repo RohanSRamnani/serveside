@@ -16,6 +16,7 @@ import type { MenuSnapshotPayload } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
 import { SHORT_CODE_ALPHABET } from '@/lib/short-code'
+import { MAX_TIP_CENTS } from '@/lib/order-limits'
 
 // The contract order, and the reason `Hot` gets repriced below: 2 × (1800 + 200) is
 // a subtotal of 4000, taxed at New York City's real rate, with a 500 tip.
@@ -608,6 +609,45 @@ describe('createOrder — server-side validation', () => {
         modifierOptionIds: [option(loc, 'Hot').id], notes: tooLong,
       }],
     }))).rejects.toThrow(InvalidOrderInputError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('takes a tip right up to the cap, and refuses one cent more', async () => {
+    // **The tip is the only money value on this path the client supplies** — every
+    // other number comes off the menu inside the transaction. Unbounded,
+    // `Number.isSafeInteger` accepts 9007199254740991, and that total is handed to
+    // Stripe verbatim as the PaymentIntent amount: refused *after* the order row is
+    // committed, so the row parks at PENDING_PAYMENT and the customer gets a 500.
+    // Pay-at-pickup does not even get that — it prints the nonsense total on a ticket.
+    const loc = await openRestaurant()
+
+    const { orderId } = await createOrder(planOrder(loc, {
+      tipCents: MAX_TIP_CENTS, payment: 'pay_on_pickup',
+    }))
+    const { order } = await readOrder(loc.id, orderId)
+    // At the cap exactly: accepted, stored verbatim, and carried into the total.
+    // Asserted against the row's own parts rather than restated arithmetic — this
+    // restaurant is seeded at the fixture rate, not New York's, and a second copy of
+    // the tax sum here would only ever be a way for this test to be wrong.
+    expect(order.tipCents).toBe(MAX_TIP_CENTS)
+    expect(order.totalCents).toBe(order.subtotalCents + order.taxCents + MAX_TIP_CENTS)
+    expect(order.subtotalCents).toBe(SUBTOTAL)
+
+    await expect(createOrder(planOrder(loc, { tipCents: MAX_TIP_CENTS + 1 })))
+      .rejects.toThrow(InvalidOrderInputError)
+    // The code is the contract the HTTP layer maps, not the message.
+    await expect(createOrder(planOrder(loc, { tipCents: MAX_TIP_CENTS + 1 })))
+      .rejects.toMatchObject({ code: 'invalid_input' })
+  })
+
+  it('refuses the tip values that would reach Stripe as a nonsense amount', async () => {
+    const loc = await openRestaurant()
+    // `MAX_SAFE_INTEGER` is the one that passes every other check in this function.
+    for (const tipCents of [Number.MAX_SAFE_INTEGER, 1_000_000_000, MAX_TIP_CENTS * 2]) {
+      await expect(createOrder(planOrder(loc, { tipCents })), String(tipCents))
+        .rejects.toThrow(InvalidOrderInputError)
+    }
+    // Refused before a connection is opened, so nothing was written for any of them.
     expect(await orderCount(loc.id)).toBe(0)
   })
 

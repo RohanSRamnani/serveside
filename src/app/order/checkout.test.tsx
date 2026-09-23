@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CartLine } from './[location]/cart-provider'
 import type { StorefrontLocation } from '@/domain/storefront'
+import { MAX_TIP_CENTS } from '@/lib/order-limits'
 import {
   CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentStep, TIP_PERCENTS,
   UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, consentDisclosure,
@@ -171,6 +172,26 @@ describe('customTipCents', () => {
       expect(customTipCents(typed), JSON.stringify(typed)).toBeNull()
     }
   })
+
+  it('takes a tip up to the shared cap and refuses one cent more', () => {
+    // The same `MAX_TIP_CENTS` the server enforces, imported rather than restated —
+    // a client looser than the server wastes a customer's time at the last step, and
+    // a client tighter than it refuses a tip nobody can explain. `order-limits.ts`
+    // has no imports of its own precisely so the browser can read this number.
+    expect(customTipCents('2000')).toBe(MAX_TIP_CENTS)
+    expect(customTipCents('2000.00')).toBe(MAX_TIP_CENTS)
+    expect(customTipCents('1999.99')).toBe(MAX_TIP_CENTS - 1)
+    expect(customTipCents('2000.01')).toBeNull()
+    expect(customTipCents('9999999.99')).toBeNull()
+  })
+
+  it('keeps the cap the server’s number, not a copy of it', () => {
+    // If someone retunes `MAX_TIP_CENTS`, this still holds; a hardcoded 200000 here
+    // would pass while the two sides quietly disagreed.
+    const atCap = (MAX_TIP_CENTS / 100).toFixed(2)
+    expect(customTipCents(atCap)).toBe(MAX_TIP_CENTS)
+    expect(customTipCents(((MAX_TIP_CENTS + 1) / 100).toFixed(2))).toBeNull()
+  })
 })
 
 describe('tipCentsFor', () => {
@@ -183,6 +204,9 @@ describe('tipCentsFor', () => {
     // A silent fallback to 0 here is a customer who meant to tip $5 and did not, and
     // a server who was never told. The submit is blocked instead.
     expect(tipCentsFor(form({ tipPercent: null, customTip: 'ten bucks' }), 3700)).toBeNull()
+    // Over the cap is the same kind of answer: blocked, never clamped. Clamping would
+    // charge a number the customer did not type.
+    expect(tipCentsFor(form({ tipPercent: null, customTip: '50000' }), 3700)).toBeNull()
   })
 })
 
