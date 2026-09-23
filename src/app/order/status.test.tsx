@@ -1,10 +1,10 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { OrderStatus } from '@/domain/order-status'
 import { readyAtLabel } from './[location]/storefront-copy'
 import {
-  STRIP_STEPS, clearedMarkerKey, isTerminalStatus, shouldClearCartOnArrival,
-  shouldKeepPolling, statusPresentation,
+  STRIP_STEPS, cartArrivalStep, clearedMarkerKey, isTerminalStatus,
+  shouldClearCartOnArrival, shouldKeepPolling, statusPresentation,
 } from './[location]/status/status-copy'
 import { StatusView } from './[location]/status/[orderId]/status-client'
 
@@ -119,6 +119,69 @@ describe('shouldClearCartOnArrival', () => {
 
   it('clears again for a second, different order reaching the page in the same tab', () => {
     expect(shouldClearCartOnArrival('ord-2', 'ord-1')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The arrival step — not just the decision, but proof the calls actually land.
+//
+// Fix round 1: `StatusClient`'s first effect run happens before `CartProvider`'s own
+// hydration effect (React flushes a child's passive effects before its parent's), so
+// `cart.clear()` called then is a guaranteed no-op — and writing the "cleared" marker
+// regardless made that permanent. These pin the fix: nothing happens before
+// `hydrated`, and `clear`/`writeMarker` are asserted CALLED, not just decided.
+// ---------------------------------------------------------------------------
+
+describe('cartArrivalStep', () => {
+  it('does nothing before hydration — clear() would be a no-op on the provider’s still-initial state', () => {
+    const clear = vi.fn()
+    const writeMarker = vi.fn()
+    const result = cartArrivalStep({ hydrated: false, marker: null, orderId: 'ord-1', clear, writeMarker })
+    expect(result).toEqual({ cleared: false, wroteMarker: false })
+    expect(clear).not.toHaveBeenCalled()
+    expect(writeMarker).not.toHaveBeenCalled()
+  })
+
+  it('does nothing before hydration even if the marker already looks stale', () => {
+    // The marker is not what gates this — hydration is. A marker naming some other
+    // order must not make this run early just because `shouldClearCartOnArrival`
+    // alone would have said yes.
+    const clear = vi.fn()
+    const writeMarker = vi.fn()
+    const result = cartArrivalStep({ hydrated: false, marker: 'ord-0', orderId: 'ord-1', clear, writeMarker })
+    expect(result).toEqual({ cleared: false, wroteMarker: false })
+    expect(clear).not.toHaveBeenCalled()
+    expect(writeMarker).not.toHaveBeenCalled()
+  })
+
+  it('clears once and writes the marker once, on a real, hydrated arrival', () => {
+    const clear = vi.fn()
+    const writeMarker = vi.fn()
+    const result = cartArrivalStep({ hydrated: true, marker: null, orderId: 'ord-1', clear, writeMarker })
+    expect(result).toEqual({ cleared: true, wroteMarker: true })
+    expect(clear).toHaveBeenCalledTimes(1)
+    expect(writeMarker).toHaveBeenCalledTimes(1)
+    expect(writeMarker).toHaveBeenCalledWith('ord-1')
+  })
+
+  it('does nothing on a second, hydrated call for the same order — already handled', () => {
+    // What a reload or a remount after the first call looks like: the marker now
+    // holds what that first call just wrote.
+    const clear = vi.fn()
+    const writeMarker = vi.fn()
+    const result = cartArrivalStep({ hydrated: true, marker: 'ord-1', orderId: 'ord-1', clear, writeMarker })
+    expect(result).toEqual({ cleared: false, wroteMarker: false })
+    expect(clear).not.toHaveBeenCalled()
+    expect(writeMarker).not.toHaveBeenCalled()
+  })
+
+  it('clears again for a different order once hydrated, even with a marker already set', () => {
+    const clear = vi.fn()
+    const writeMarker = vi.fn()
+    const result = cartArrivalStep({ hydrated: true, marker: 'ord-1', orderId: 'ord-2', clear, writeMarker })
+    expect(result).toEqual({ cleared: true, wroteMarker: true })
+    expect(clear).toHaveBeenCalledTimes(1)
+    expect(writeMarker).toHaveBeenCalledWith('ord-2')
   })
 })
 

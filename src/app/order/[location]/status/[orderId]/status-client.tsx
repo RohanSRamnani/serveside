@@ -6,7 +6,7 @@ import { SHELL_CSS } from '../../shell-css'
 import { formatPhone, readyAtLabel } from '../../storefront-copy'
 import { useCart } from '../../cart-provider'
 import {
-  STRIP_STEPS, clearedMarkerKey, shouldClearCartOnArrival, shouldKeepPolling,
+  STRIP_STEPS, cartArrivalStep, clearedMarkerKey, shouldKeepPolling,
   statusPresentation, type PaymentStatus, type StripStep,
 } from '../status-copy'
 
@@ -64,29 +64,48 @@ export default function StatusClient({ slug, orderId, location, initial }: Statu
    * card confirm already clear the cart themselves and a second `clear()` on an
    * already-empty cart is a no-op.
    *
-   * `shouldClearCartOnArrival` is the whole decision, pure and tested; this effect
-   * only reads the marker, asks it, and (on `true`) clears and writes the marker
-   * back. Deliberately keyed on `[slug, orderId]` and not on `cart` — `cart.clear` is
-   * a stable identity from context, and including it would invite a re-run this
-   * effect must not have.
+   * **Gated on `cart.hydrated`, and that gate is load-bearing (fix round 1).** React
+   * flushes a child's passive effects before its parent's, and this component is
+   * `CartProvider`'s child — so on the very first run, before `CartProvider`'s own
+   * hydration effect has read `localStorage`, `cart.clear()` is a guaranteed no-op
+   * (`CartProvider`'s `update` refuses to touch a store whose `slug` is still null).
+   * Writing the "cleared" marker anyway made that failure permanent, because every
+   * later read of the marker found the order already "handled". `cart.hydrated` is
+   * the flag `Cart` publishes for exactly this — "no dishes" vs. "have not read
+   * storage yet" — so this effect does nothing on that first run and is listed in
+   * the dependency array so it runs again the moment hydration flips it to `true`.
+   *
+   * `cartArrivalStep` is the whole decision **and** the two side effects, pulled out
+   * so both are under test without a browser; this effect only supplies the
+   * `localStorage` read/write `cartArrivalStep` is handed as plain functions.
+   * `clear` is not listed in the deps: it is a stable identity all the way down
+   * (`useCallback` over a `useCallback([])` in `cart-provider.tsx`), so omitting it
+   * changes nothing about when this runs.
    */
   useEffect(() => {
-    let clearedFor: string | null = null
+    let marker: string | null = null
     try {
-      clearedFor = window.localStorage.getItem(clearedMarkerKey(slug))
+      marker = window.localStorage.getItem(clearedMarkerKey(slug))
     } catch {
-      // Private mode, disabled storage, a getter that throws. Fall through and try
-      // to clear anyway — the worst case is a harmless repeat clear() next time,
-      // because the marker could not be remembered here either.
+      // Private mode, disabled storage, a getter that throws. `cartArrivalStep`
+      // still runs with `marker: null` — the safe direction, since the worst case
+      // is a harmless repeat clear() next time, the marker being equally unable to
+      // be remembered here.
     }
-    if (!shouldClearCartOnArrival(orderId, clearedFor)) return
-    cart.clear()
-    try {
-      window.localStorage.setItem(clearedMarkerKey(slug), orderId)
-    } catch {
-      // Same as above. Nothing about the order depends on this write succeeding.
-    }
-  }, [slug, orderId])
+    cartArrivalStep({
+      hydrated: cart.hydrated,
+      marker,
+      orderId,
+      clear: cart.clear,
+      writeMarker: (id) => {
+        try {
+          window.localStorage.setItem(clearedMarkerKey(slug), id)
+        } catch {
+          // Same as above. Nothing about the order depends on this write succeeding.
+        }
+      },
+    })
+  }, [slug, orderId, cart.hydrated])
 
   /**
    * The poll. `feed-client.tsx`'s own pattern — `fetch` with `cache: 'no-store'`, an

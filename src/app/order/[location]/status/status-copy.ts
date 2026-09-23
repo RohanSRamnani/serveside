@@ -153,3 +153,47 @@ export function clearedMarkerKey(slug: string): string {
 export function shouldClearCartOnArrival(orderId: string, clearedFor: string | null): boolean {
   return clearedFor !== orderId
 }
+
+/**
+ * The whole "clear the cart, once, on arrival" step — not just
+ * `shouldClearCartOnArrival`'s sub-decision, but what actually happens once
+ * `CartProvider`'s own hydration is accounted for.
+ *
+ * **Why `hydrated` has to gate this, and not only the marker (fix round 1).**
+ * `CartProvider`'s state starts at `{ slug: null, lines: [] }` on every mount, and
+ * its `clear()` — like every other mutation — is a deliberate no-op while
+ * `store.slug` is still null (`update` in `cart-provider.tsx`, the same guard
+ * `shouldPersist` exists for). React flushes a child's passive effects **before**
+ * its parent's, and `StatusClient` is `CartProvider`'s child, so calling `clear()`
+ * from this effect's very first run — before `CartProvider`'s own hydration effect
+ * has read `localStorage` and set a real `slug` — silently does nothing. Writing the
+ * "cleared" marker regardless made that failure permanent: every later reload read
+ * the marker, decided there was nothing left to clear, and the dishes stayed in the
+ * cart forever — invisible in a manual check against an already-empty cart, and the
+ * exact case this function exists for (a redirect-based payment returning to a page
+ * that just mounted). `hydrated` is exactly the flag `Cart` publishes to tell "no
+ * dishes" from "have not read storage yet" apart (see its doc comment), and it is
+ * what must gate the *marker write*, not only the clear.
+ *
+ * `clear` and `writeMarker` are the two side effects, injected rather than called
+ * directly, so whether they actually **ran** is itself under test — not just
+ * whether the sub-decision was correct.
+ */
+export function cartArrivalStep(args: {
+  hydrated: boolean
+  /** The marker already on record for this slug — read by the caller, once, per run. */
+  marker: string | null
+  orderId: string
+  clear: () => void
+  writeMarker: (orderId: string) => void
+}): { cleared: boolean; wroteMarker: boolean } {
+  const { hydrated, marker, orderId, clear, writeMarker } = args
+  // Not yet meaningful: `clear()` called now would be the no-op described above, and
+  // writing the marker anyway would be the bug. Nothing happens; the effect that
+  // calls this runs again once `hydrated` flips true.
+  if (!hydrated) return { cleared: false, wroteMarker: false }
+  if (!shouldClearCartOnArrival(orderId, marker)) return { cleared: false, wroteMarker: false }
+  clear()
+  writeMarker(orderId)
+  return { cleared: true, wroteMarker: true }
+}
