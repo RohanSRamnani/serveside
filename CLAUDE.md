@@ -268,9 +268,12 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   on the platform account — that is what populates `event.account`. Registered on a
   connected account it is absent, and every flip becomes a logged no-op.
 - **The `PENDING_PAYMENT → NEW` flip sets three things together**: `status`,
-  `paymentStatus = 'PAID'`, and `quotedReadyAt = <flip time> + location.prepTimeMinutes`.
-  The clock starts when the money lands, not at checkout — a promise made while the
-  customer is still typing a card number has an unknown amount of it already spent.
+  `paymentStatus`, and `quotedReadyAt` — `quotedReadyAtFrom(<flip time>,
+  prepTimeMinutes)` in `src/domain/order-status.ts`, one function so the promise is one
+  rule. The clock starts when the kitchen takes the order, not at checkout — a promise
+  made while the customer is still typing a card number has an unknown amount of it
+  already spent. The Stripe webhook does it with `PAID`, the outage failover with
+  `PAY_ON_PICKUP`.
 - **The kitchen printer polls us, and the serial is the whole of its identity.**
   `/api/printers/cloudprnt` is unauthenticated by protocol — a thermal printer has no
   session to hold. POST is the poll and the heartbeat; GET hands over the payload and
@@ -315,9 +318,39 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `timezone` because a ticket prints the restaurant's wall clock, never the server's,
   and that column is not on the order row. `src/domain/ticket.test.ts` pins the exact
   output — change the layout and you change the golden, deliberately.
-- **Every path that reaches NEW must send `order/created`, and there are two.** The
-  Stripe webhook after the flip, and `POST /api/orders` for a pay-at-pickup order,
-  which `createOrder` writes straight to NEW. The second was missing until Task 14:
+- **A Stripe outage does not refuse the order; it moves it to the counter.** A failure
+  to *create* the PaymentIntent that is Stripe's or the network's fault
+  (`isStripeOutage`, `src/lib/stripe.ts`: `StripeConnectionError`, `StripeAPIError`,
+  `StripeRateLimitError`, or a bare transport errno) makes `POST /api/orders` convert
+  the order in one `withLocation` — NEW, `PAY_ON_PICKUP`, `quotedReadyAt` from now,
+  **no** `stripePaymentIntentId` — announce it, and answer 200 `{ paidAtPickup: true }`;
+  the checkout says so and routes to the status page. Nothing else is an outage:
+  `StripeAccountMissingError` is still 503, and a bad key, a missing permission, a
+  malformed request or a card error still cancel and answer 500. The false positive is
+  the expensive one — a misconfigured deployment read as an outage turns every card
+  order on the platform into an unpaid one — so it is classified by the SDK's `type`
+  against a short allow-list and fails closed on anything else. Classified by `type`,
+  never `instanceof`: the route's tests mock the `stripe` module whole, and two copies
+  of the SDK in one process produce errors that fail `instanceof` while being the same
+  errors. A **card decline** is not this: it happens at confirm time in the browser and
+  is Task 5's inline retry on the same intent.
+- **Pay-at-pickup is capped at `MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY` (10) open
+  orders per contact phone per location per day** — `createOrder`, inside the
+  transaction, before the INSERT, `pay_on_pickup` only, rejecting `unpaid_order_cap`
+  (422). It takes no money and needs no account, so it is the one path a stranger can
+  use to make a kitchen cook forty dinners nobody collects. **Serialised per (location,
+  phone) by a `pg_advisory_xact_lock` taken before the COUNT** — READ COMMITTED gives a
+  COUNT no lock, and without it a scripted burst all reads nine and all writes (a test
+  pins it). Only **open** orders count
+  (COMPLETED/REJECTED/CANCELED do not), or a regular who collects everything is locked
+  out by their own history; the day is the **restaurant's**, `startOfLocalDay` in
+  `locations.timezone`, because a UTC day rolls at 8pm in New York, mid-service. A card
+  order that failed over to pay-at-pickup is **never** re-checked — that conversion is
+  our outage, not the customer's doing.
+- **Every path that reaches NEW must send `order/created`, and there are three.** The
+  Stripe webhook after the flip, `POST /api/orders` for a pay-at-pickup order, which
+  `createOrder` writes straight to NEW, and the Stripe-outage failover in that same
+  route. The second was missing until Task 14:
   those orders were never rendered, never queued for a printer and never texted about —
   they existed only on the kitchen feed. The route gates on the **status `createOrder`
   returned**, not the payment mode, and a failure there is logged and still answers
@@ -460,7 +493,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `npm run spine:proof` — the end-to-end proof: a real pay-on-pickup order through
   `createOrder`, the real `fanOut` driven with an inline `step`, then it polls
   `print_jobs` and prints the rendered ticket, ending `SPINE OK`. Needs `DATABASE_URL`
-  on `app_user` (it says so, with the fix, if not) and a seeded restaurant.
+  on `app_user` (it says so, with the fix, if not) and a seeded restaurant. Each run
+  invents its own 555 number (`proofPhone`), because the order it leaves stays **open**
+  forever and a fixed number would hit the unpaid-order cap on the eleventh run of the
+  day — the proof failing for the one reason that is not a bug.
 - The local loop is three terminals: `npx inngest-cli dev`, `npm run dev`, and
   `stripe listen --forward-to localhost:3000/api/stripe/webhook` — whose `whsec_…` goes
   in `STRIPE_WEBHOOK_SECRET`. `README.md` has the env table and the card walkthrough.

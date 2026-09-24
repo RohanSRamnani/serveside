@@ -65,6 +65,34 @@ export const MAX_TEXT_FIELD_LENGTH = 500
 export const MAX_TIP_CENTS = 200_000
 
 /**
+ * How many **open pay-at-pickup orders one phone number may have at one restaurant
+ * in one day**: ten.
+ *
+ * The one number in this file that is a business rule rather than a sanity bound, and
+ * it is here because it belongs with the others a cart has to know about — the reason
+ * this module exists is that a limit the client cannot see is a limit a customer meets
+ * at the last step.
+ *
+ * **Why the cap exists at all.** Pay-at-pickup takes no money, asks for no account and
+ * needs nothing but a phone number somebody typed. That is deliberate — it is what
+ * lets a restaurant with no Stripe onboarding trade, and it is where a card order
+ * lands when Stripe is down. It also means the only thing standing between a bored
+ * stranger and a kitchen cooking forty dinners nobody collects is this number. The
+ * cost of that is ingredients and a cook's evening, which no chargeback process gives
+ * back.
+ *
+ * **Why ten, and why per day.** A big family order is one order. An office lunch run
+ * is one order. Ten *separate, still-open* orders on one number before anybody has
+ * collected anything is already past what a real evening looks like, so the customer
+ * this turns away is one who should be phoning the restaurant instead — which is what
+ * the rejection tells them to do. Counting only the **open** ones is what keeps a
+ * regular who collects every order from being locked out by their own history, and
+ * the day rolls at **local midnight at the restaurant**: on UTC, a New York kitchen's
+ * cap would reset at 8pm, in the middle of service.
+ */
+export const MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY = 10
+
+/**
  * What one tap-tap-tap of a stepper may reach — the **UI's** own, narrower cap, and
  * the one number here the server does not enforce.
  *

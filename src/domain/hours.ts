@@ -184,6 +184,29 @@ export function nextLocalHour(at: Date, timeZone: string, hour: number): Date {
   return instantOfLocalHour(new Date(day.getTime() + DAY_MS), hour, timeZone)
 }
 
+/**
+ * The instant the restaurant's **own day** started — midnight on the calendar day
+ * `at` falls on, read in the location's timezone.
+ *
+ * This is what "today" means anywhere a per-day rule is counted, and it has to be the
+ * restaurant's day rather than UTC's: a New York kitchen's day rolls at 8pm UTC, which
+ * is the middle of dinner service. A cap that reset there would hand somebody a fresh
+ * allowance on the busiest two hours of the night.
+ *
+ * Built on the same two pieces `nextLocalHour` uses — the wall clock through `Intl`,
+ * then the offset in force *at the instant being recovered* — so it is right across a
+ * DST boundary, where a local day is 23 or 25 hours long. In a zone whose clocks
+ * spring forward across midnight itself (no US zone does), local midnight does not
+ * exist and this resolves to the first instant after the gap, which is the earliest
+ * moment that day can be said to have begun.
+ */
+export function startOfLocalDay(at: Date, timeZone: string): Date {
+  const local = localParts(at, timeZone)
+  // The calendar day held as a UTC date, which is the shape `instantOfLocalHour` reads.
+  const day = new Date(Date.UTC(local.year, local.month - 1, local.day))
+  return instantOfLocalHour(day, 0, timeZone)
+}
+
 const DAY_MS = 24 * 60 * 60_000
 
 /** The instant at which `timeZone`'s clock reads this (UTC-held) calendar day at `hour:00:00`. */

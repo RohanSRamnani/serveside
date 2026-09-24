@@ -2,9 +2,9 @@ import { eq } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { locations, orders, orderEvents } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
-import { transition } from '@/domain/order-status'
+import { quotedReadyAtFrom, transition } from '@/domain/order-status'
 import { createOrder, OrderRejectedError, type CreateOrderInput, type CreateOrderResult } from '@/domain/create-order'
-import { createPaymentIntentFor, StripeAccountMissingError } from '@/lib/stripe'
+import { createPaymentIntentFor, isStripeOutage, StripeAccountMissingError } from '@/lib/stripe'
 import { sendOrderCreated } from '@/inngest/client'
 
 /**
@@ -15,9 +15,21 @@ import { sendOrderCreated } from '@/inngest/client'
  * PaymentIntent is opened on the restaurant's connected account. What is left here is
  * the HTTP contract, which is the part worth stating precisely:
  *
+ *   200 + `{ orderId, shortCode, clientSecret }`
+ *                                     a card order, parked at PENDING_PAYMENT with an
+ *                                     intent on the restaurant's account to confirm.
+ *   200 + `{ orderId, shortCode }`    a pay-at-pickup order, already NEW and already
+ *                                     announced to the kitchen.
+ *   200 + `{ orderId, shortCode, paidAtPickup: true }`
+ *                                     **a card order Stripe could not take.** The
+ *                                     order was converted to pay-at-pickup rather than
+ *                                     refused — see `failOverToPickup`. There is no
+ *                                     client secret and there is no intent; the money
+ *                                     is collected at the counter.
  *   422 + `{ error: code, message }`   an `OrderRejectedError`. Something the customer
- *                                     can act on: sold out, closed, pick a spice. The
- *                                     `code` is the stable contract, not the message.
+ *                                     can act on: sold out, closed, pick a spice, too
+ *                                     many unpaid orders open today. The `code` is the
+ *                                     stable contract, not the message.
  *   503 + `stripe_account_missing`     the restaurant has not finished Stripe
  *                                     onboarding. Not the customer's fault and not
  *                                     permanent, hence 503 rather than 422.
@@ -71,6 +83,44 @@ export async function POST(req: Request): Promise<Response> {
 
     return Response.json({ orderId: order.orderId, shortCode: order.shortCode, clientSecret }, { status: 200 })
   } catch (err) {
+    /**
+     * **Stripe is down: take the order anyway, at the counter.**
+     *
+     * The alternative is a restaurant with a full dining room whose website says
+     * "something went wrong on our side" for as long as Stripe's incident lasts. Every
+     * one of those orders goes to the phone or goes nowhere, and none of it is the
+     * customer's doing or the restaurant's.
+     *
+     * Only for a failure that is Stripe's or the network's — `isStripeOutage` is the
+     * whole of that judgement and the argument for its shortness is written there.
+     * Anything else (a bad key, a permission, a card) falls through to the cancel
+     * below, because converting *those* would sell food on the strength of our own bug.
+     */
+    if (isStripeOutage(err)) {
+      console.error(
+        '[POST /api/orders] Stripe could not open an intent for order', order.orderId,
+        '— converting it to pay-at-pickup:', err,
+      )
+      const converted = await failOverToPickup(input.locationId, order)
+      if (converted) {
+        // After the commit and exactly as the pay-at-pickup branch does it: the order
+        // is NEW now, so the ticket and the owner's text are owed. Best-effort, for the
+        // reason `announce` gives — the order is committed either way.
+        await announce(converted, input.locationId)
+        return Response.json(
+          { orderId: order.orderId, shortCode: order.shortCode, paidAtPickup: true },
+          { status: 200 },
+        )
+      }
+      // The conversion itself failed, or found the order already moved on by something
+      // else. Either way this order has no intent and may not be left at
+      // PENDING_PAYMENT, so it goes down the ordinary path below — where `abandon`
+      // ends it if it is still ours to end, and the customer is told plainly that
+      // nothing was ordered rather than being sent to a status page for an order that
+      // is not on any kitchen's board.
+      console.error('[POST /api/orders] pay-at-pickup failover did not convert order', order.orderId)
+    }
+
     // The order is already committed at PENDING_PAYMENT, and without an intent it can
     // never be paid — so it is cancelled rather than parked forever. `PENDING_PAYMENT
     // → CANCELED` is exactly the "an abandoned checkout has to end somewhere" edge the
@@ -84,6 +134,83 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 }
+
+/**
+ * Turns a card order that Stripe could not take into a pay-at-pickup order — one
+ * transaction, or nothing.
+ *
+ * **Not `abandon`'s sibling: its opposite.** `abandon` ends an order that can never be
+ * paid; this one keeps an order that can still be paid, at the counter, the way every
+ * restaurant took money before this product existed. The three facts it writes are one
+ * fact — the kitchen owns this order now:
+ *
+ * - `status` NEW, through the machine, so the move is legal and writes its own event.
+ * - `paymentStatus` PAY_ON_PICKUP, which is what the till and the ticket read.
+ * - `quotedReadyAt`, from this moment, the same promise the webhook makes when money
+ *   lands: the clock starts when the kitchen takes it.
+ *
+ * **`stripePaymentIntentId` stays null.** No intent was created, and the column is
+ * UNIQUE and is how the webhook proves an event belongs to an order. A placeholder
+ * there would be a lie a later payment could not be checked against.
+ *
+ * **`for('update')` and the status guard** are the same pair the webhook's flip uses:
+ * the row is locked before it is read, and an order that is no longer PENDING_PAYMENT
+ * belongs to whatever moved it. Returns the converted order for the caller to announce
+ * — after the commit, never inside it, or the fan-out reads a row that is not visible
+ * yet. A throw in here is caught, logged and reported as "did not convert": the caller
+ * then falls back to cancelling, because the one state that must never survive this
+ * function is PENDING_PAYMENT with no intent.
+ */
+async function failOverToPickup(
+  locationId: string,
+  placed: CreateOrderResult,
+): Promise<CreateOrderResult | null> {
+  const convertedAt = new Date()
+  try {
+    return await withLocation(locationId, async (tx) => {
+      const [order] = await tx.select().from(orders).where(eq(orders.id, placed.orderId)).for('update').limit(1)
+      // Gone, or already moved on by something else. Not ours to convert.
+      if (!order || order.status !== 'PENDING_PAYMENT') return null
+
+      // `locations` is not under RLS and is read on `tx`, so the prep time that makes
+      // the promise is the one in force in the transaction that records it.
+      const [location] = await tx
+        .select({ prepTimeMinutes: locations.prepTimeMinutes })
+        .from(locations).where(eq(locations.id, locationId)).limit(1)
+      if (!location) throw new Error(`Unknown location ${locationId}`)
+
+      const { next, event } = transition(order, 'NEW', 'system')
+      await tx.update(orders).set({
+        status: next,
+        paymentStatus: 'PAY_ON_PICKUP',
+        quotedReadyAt: quotedReadyAtFrom(convertedAt, location.prepTimeMinutes),
+      }).where(eq(orders.id, order.id))
+
+      await tx.insert(orderEvents).values({
+        orderId: order.id,
+        ...event,
+        // The audit row a cook and a customer both read. **Never the raw error**: a
+        // Stripe exception names accounts and internals, and this row is rendered on a
+        // support screen. What matters six months from now is that this order was not
+        // charged and why.
+        payload: { ...event.payload, reason: CARD_UNAVAILABLE_REASON },
+      })
+
+      return { ...placed, status: next }
+    })
+  } catch (err) {
+    console.error('[POST /api/orders] could not convert order', placed.orderId, 'to pay-at-pickup:', err)
+    return null
+  }
+}
+
+/**
+ * Why a card order became a pay-at-pickup one, in words. Stored on the event and read
+ * by staff and by the customer — so it says what happened to *their order*, not what
+ * Stripe's SDK said to us.
+ */
+const CARD_UNAVAILABLE_REASON =
+  'Card payments were unavailable, so this order was switched to pay at pickup.'
 
 /**
  * Hands a pay-at-pickup order to the fan-out — the ticket, and the owner's text.

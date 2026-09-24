@@ -4,19 +4,22 @@ import {
   createOrder, OrderRejectedError,
   InvalidOrderInputError, ItemUnavailableError, LocationClosedError, LocationInactiveError,
   MenuUnavailableError, ModifierSelectionError, OptionUnavailableError,
-  UnknownMenuItemError, UnknownModifierOptionError,
+  UnknownMenuItemError, UnknownModifierOptionError, UnpaidOrderCapError,
   type CreateOrderInput,
 } from './create-order'
 import { buildMenuSnapshot } from './snapshot'
+import { startOfLocalDay } from './hours'
 import {
   menus, menuCategories, menuItems, modifierOptions, itemModifierGroups, menuSnapshots,
   orders, orderItems, orderItemModifiers, orderEvents, orderPauses,
 } from '@/db/schema'
 import type { MenuSnapshotPayload } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
-import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
+import {
+  CAP_PHONE, seedLocationWithMenu, seedBusinessHours, seedUnpaidPickupOrders, type SeededMenu,
+} from '@/test/seed'
 import { SHORT_CODE_ALPHABET } from '@/lib/short-code'
-import { MAX_TIP_CENTS } from '@/lib/order-limits'
+import { MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, MAX_TIP_CENTS } from '@/lib/order-limits'
 
 // The contract order, and the reason `Hot` gets repriced below: 2 × (1800 + 200) is
 // a subtotal of 4000, taxed at New York City's real rate, with a 500 tip.
@@ -805,5 +808,163 @@ describe('createOrder — when the restaurant cannot take it', () => {
     await expect(createOrder(planOrder(loc, {
       locationId: '00000000-0000-0000-0000-000000000000',
     }))).rejects.toThrow(/unknown location/i)
+  })
+})
+
+/**
+ * **The unpaid-order cap: at most ten open pay-at-pickup orders per phone per day,
+ * per restaurant.**
+ *
+ * Pay-at-pickup takes no money and asks for no account, which is exactly what makes
+ * it orderable by anyone with a phone number they typed. Ten open ones on one number
+ * in one day is already well past any real dinner, and the failure it prevents is a
+ * kitchen cooking food nobody is coming for — the one abuse this product cannot
+ * absorb, because the cost of it is ingredients and a cook's evening rather than a
+ * chargeback.
+ *
+ * Every conjunct in the count is load-bearing, and each has a test below:
+ *
+ * - **Open only.** COMPLETED, REJECTED and CANCELED orders are settled; a regular who
+ *   picks up every order they place must never be locked out by their own history.
+ * - **Pay-at-pickup only.** A card order has money behind it and is not this problem.
+ * - **This phone, this restaurant.** The scope is the transaction's.
+ * - **Today, at the restaurant.** The window rolls at local midnight, not UTC's —
+ *   otherwise a New York kitchen's cap resets at 8pm, mid-service.
+ */
+describe('createOrder — the unpaid-order cap', () => {
+  it(`refuses order ${MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY + 1} on one phone, and writes nothing`, async () => {
+    // **The boundary, and it is placed through the real write path**: with the day one
+    // short of the cap the next order goes through, and the row `createOrder` itself
+    // wrote is what makes the one after it the eleventh. Nine of the ten are seeded
+    // directly — the cap is a property of the rows, and filling it through the whole
+    // journey ten times would be a hundred round trips to say the same thing.
+    const loc = await openRestaurant()
+    // Stated, not assumed: the cap counts by phone, and a seeder and a fixture that
+    // quietly disagreed would make every test in this block pass for the wrong reason.
+    expect(planOrder(loc).contact.phone).toBe(CAP_PHONE)
+
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY - 1)
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))).resolves.toBeTruthy()
+    expect(await orderCount(loc.id)).toBe(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+
+    const rejected = await createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))
+      .then(() => null, (err: unknown) => err)
+
+    expect(rejected).toBeInstanceOf(UnpaidOrderCapError)
+    expect(rejected).toBeInstanceOf(OrderRejectedError)
+    expect((rejected as UnpaidOrderCapError).code).toBe('unpaid_order_cap')
+    // Something a customer can act on, with the number in it — and the number comes
+    // from the constant, so the sentence cannot drift away from the rule.
+    expect((rejected as Error).message).toContain(String(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY))
+    expect((rejected as Error).message).toMatch(/call/i)
+    // Refused inside the transaction and before the INSERT: nothing was written.
+    expect(await orderCount(loc.id)).toBe(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+  })
+
+  it('holds under a burst — simultaneous posts cannot all read nine and all write', async () => {
+    // The abuse this cap exists for is a script, and a script sends its orders at once.
+    // Postgres's default READ COMMITTED gives a COUNT no lock, so without serialising,
+    // every transaction in a burst counts the same nine and inserts — and the cap is
+    // overshot by however many requests landed together (on serverless, one per
+    // instance). One order from the burst gets the last place; the rest are refused.
+    const loc = await openRestaurant()
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY - 1)
+
+    const burst = await Promise.allSettled(
+      Array.from({ length: 3 }, () => createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))),
+    )
+
+    expect(burst.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
+    for (const refused of burst.filter((r): r is PromiseRejectedResult => r.status === 'rejected')) {
+      expect(refused.reason).toBeInstanceOf(UnpaidOrderCapError)
+    }
+    expect(await orderCount(loc.id)).toBe(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+  })
+
+  it('does not count an order the restaurant is finished with', async () => {
+    // A regular who collects everything they order would otherwise be locked out by
+    // their own good behaviour on their eleventh visit of the day.
+    const loc = await openRestaurant()
+    for (const status of ['COMPLETED', 'REJECTED', 'CANCELED'] as const) {
+      await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, { status })
+    }
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))).resolves.toMatchObject({
+      status: 'NEW',
+    })
+  })
+
+  it('counts each phone separately', async () => {
+    // Otherwise one busy office locks out the street. The cap is about one person
+    // ordering food they will not collect, not about how busy the restaurant is.
+    const loc = await openRestaurant()
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, {
+      contactPhone: '+15550009999',
+    })
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))).resolves.toBeTruthy()
+  })
+
+  it('does not count card orders', async () => {
+    // A card order has money behind it — an unpaid one is parked at PENDING_PAYMENT
+    // and no kitchen has heard of it, and a paid one is paid.
+    const loc = await openRestaurant()
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, {
+      status: 'PENDING_PAYMENT', paymentStatus: 'REQUIRES_PAYMENT',
+    })
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, {
+      status: 'NEW', paymentStatus: 'PAID',
+    })
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))).resolves.toBeTruthy()
+  })
+
+  it('does not apply to a card order at all', async () => {
+    // The cap exists because pay-at-pickup takes no money. A customer who is paying
+    // now is never turned away by it, whatever yesterday looked like.
+    const loc = await openRestaurant()
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+    await expect(createOrder(planOrder(loc, { payment: 'card' }))).resolves.toMatchObject({
+      status: 'PENDING_PAYMENT',
+    })
+  })
+
+  it('does not count yesterday’s orders', async () => {
+    // The ruling's own shape: ten open orders written normally, then back-dated with a
+    // direct update — 30 hours, because a local day is 25 hours long on the morning
+    // the clocks go back, so anything less could still be "today" once a year.
+    const loc = await openRestaurant()
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+    await withLocation(loc.id, (tx) => tx.update(orders)
+      .set({ createdAt: new Date(Date.now() - 30 * 60 * 60_000) })
+      .where(eq(orders.contactPhone, CAP_PHONE)))
+
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' }))).resolves.toBeTruthy()
+  })
+
+  it('draws the line at the restaurant’s own midnight, to the millisecond', async () => {
+    // "Yesterday doesn't count" passes under any implementation that has a day at all.
+    // This pair is what pins *which* day: rows one millisecond before the restaurant's
+    // midnight are yesterday's, rows at it are today's. **Asia/Kolkata on purpose** —
+    // +5:30, so its midnight is never UTC's and never New York's: an implementation that
+    // counted a UTC day, the server's day or a rolling 24 hours gets one of these two
+    // wrong at every hour of the day, not just some of them. (`startOfLocalDay` itself
+    // is pinned case by case, DST included, in `hours.test.ts`; this pins the wiring —
+    // that `createOrder` asks it about *this location's* zone.)
+    //
+    // The one window this cannot see across is the restaurant's midnight passing
+    // between `now` below and the INSERT: under a second, once a day.
+    const zone = 'Asia/Kolkata'
+    const midnight = startOfLocalDay(new Date(), zone)
+
+    const lastNight = await openRestaurant({ timezone: zone })
+    await seedUnpaidPickupOrders(lastNight.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, {
+      createdAt: new Date(midnight.getTime() - 1),
+    })
+    await expect(createOrder(planOrder(lastNight, { payment: 'pay_on_pickup' }))).resolves.toBeTruthy()
+
+    const thisMorning = await openRestaurant({ timezone: zone })
+    await seedUnpaidPickupOrders(thisMorning.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, {
+      createdAt: midnight,
+    })
+    await expect(createOrder(planOrder(thisMorning, { payment: 'pay_on_pickup' })))
+      .rejects.toThrow(UnpaidOrderCapError)
   })
 })

@@ -47,10 +47,11 @@ vi.mock('@stripe/react-stripe-js', () => ({
 }))
 
 import {
-  CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentPaneView, PaymentStep, TIP_PERCENTS,
-  UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref, confirmArgsFor,
-  confirmOutcome, consentDisclosure, customTipCents, normalizePhone, orderBodyFrom,
-  quoteLabel, returnUrlFor, statusHref, submitFailureMessage, tipCentsFor, tipPresetCents,
+  CARD_PAYMENTS_DOWN_MESSAGE, CheckoutFormView, NETWORK_FAILURE_MESSAGE, PaymentPaneView,
+  PaymentStep, TIP_PERCENTS, UNREADABLE_SUCCESS_MESSAGE, cardPaymentAvailable, checkoutHref,
+  confirmArgsFor, confirmOutcome, consentDisclosure, customTipCents, normalizePhone,
+  orderBodyFrom, placedOutcome, quoteLabel, returnUrlFor, statusHref, submitFailureMessage,
+  tipCentsFor, tipPresetCents,
   type CheckoutFormState,
 } from './[location]/checkout/checkout-form'
 
@@ -407,6 +408,63 @@ describe('submitFailureMessage', () => {
 // Which payment modes exist at all.
 // ---------------------------------------------------------------------------
 
+/**
+ * **What a 200 from `POST /api/orders` means**, pulled out of the submit handler for
+ * the same reason `submitFailureMessage` and `confirmOutcome` were: there is no jsdom
+ * here, so the branch has to be an ordinary function to be testable at all — and this
+ * one decides whether a Payment Element is mounted, which is the difference between a
+ * customer paying and a customer staring at a form for an order that has no intent.
+ */
+describe('placedOutcome', () => {
+  it('sends a card order to the Payment Element', () => {
+    expect(placedOutcome({ orderId: 'ord-1', shortCode: 'K7M2', clientSecret: CLIENT_SECRET }))
+      .toEqual({ kind: 'card', orderId: 'ord-1', shortCode: 'K7M2', clientSecret: CLIENT_SECRET })
+  })
+
+  it('sends an ordinary pay-at-pickup order straight to the status page, saying nothing', () => {
+    // Nothing went wrong, so there is no notice: the customer chose this.
+    expect(placedOutcome({ orderId: 'ord-2', shortCode: 'K7M3' }))
+      .toEqual({ kind: 'pickup', orderId: 'ord-2', notice: null })
+  })
+
+  it('reads `paidAtPickup` as the Stripe-outage failover, and names it', () => {
+    // The route converted a card order because Stripe was unreachable. The customer
+    // asked to pay now and is going to pay at the counter instead, so they are told —
+    // in the brief's own words, which is what a restaurant would say on the phone.
+    expect(placedOutcome({ orderId: 'ord-3', shortCode: 'K7M4', paidAtPickup: true }))
+      .toEqual({ kind: 'pickup', orderId: 'ord-3', notice: CARD_PAYMENTS_DOWN_MESSAGE })
+  })
+
+  it('never mounts the Payment Element for a failover, whatever else is in the body', () => {
+    // **The flag wins over the secret.** A failover order has no PaymentIntent, so a
+    // Payment Element mounted for it is a form that cannot succeed — and the customer
+    // would be trying to pay for an order the kitchen is already cooking on the
+    // understanding that they will pay at the counter.
+    const outcome = placedOutcome({
+      orderId: 'ord-4', shortCode: 'K7M5', paidAtPickup: true, clientSecret: CLIENT_SECRET,
+    })
+    expect(outcome.kind).toBe('pickup')
+  })
+
+  it('takes `paidAtPickup` as a boolean and not as anything truthy', () => {
+    // The same identity test the consent flag gets, and for a smaller version of the
+    // same reason: `'false'` is truthy, and a string here would come from something
+    // that is not our route.
+    for (const bad of ['true', 'false', 1, {}]) {
+      expect(placedOutcome({ orderId: 'o', shortCode: 'K7M6', paidAtPickup: bad }), JSON.stringify(bad))
+        .toEqual({ kind: 'pickup', orderId: 'o', notice: null })
+    }
+  })
+
+  it('calls a 200 we cannot read unreadable rather than guessing', () => {
+    // Unreachable by the route's contract. It must not become "nothing was ordered":
+    // a 200 means the order exists, and a retry would be a second dinner.
+    for (const body of [{}, { orderId: 'ord-5' }, { shortCode: 'K7M7' }, { orderId: 7, shortCode: 'K7M8' }]) {
+      expect(placedOutcome(body), JSON.stringify(body)).toEqual({ kind: 'unreadable' })
+    }
+  })
+})
+
 describe('cardPaymentAvailable', () => {
   it('needs BOTH halves of the direct charge, and there are four ways to ask', () => {
     // The two are one fact, not two. The platform's publishable key says *we* can
@@ -651,6 +709,37 @@ describe('CheckoutFormView', () => {
     expect(markup).toContain('Butter Chicken is sold out')
     expect(markup).toContain('Butter Chicken')
     expect(markup).toContain('value="Rohan R"')
+  })
+
+  it('shows the Stripe-outage sentence in the render a customer actually sees — cart already cleared', () => {
+    // The render that matters is the one between the 200 and the status page: the route
+    // converted the order, the cart has just been emptied, and the page is navigating.
+    // Rendered with a full cart this test would pass while the customer saw "There's
+    // nothing in your order yet" — the empty state replaces the form, and the form is
+    // where the error slot lives. React batches the notice and the cart clear into one
+    // render, so that is the only render there is.
+    const markup = render({ lines: [], hydrated: true, notice: CARD_PAYMENTS_DOWN_MESSAGE })
+    expect(markup).toContain(CARD_PAYMENTS_DOWN_MESSAGE)
+    // A status, not an alert: the order went through, and this says how it will be paid.
+    expect(markup).toMatch(/role="status"/)
+    // Not the empty-cart state: "nothing in your order" and a link back to the menu would
+    // tell a customer whose dinner is being cooked that it does not exist.
+    expect(markup).not.toMatch(/nothing in your order/i)
+    // And no form: the order is placed, and a live submit is a second dinner.
+    expect(markup).not.toMatch(/data-submit="1"/)
+  })
+
+  it('says the unpaid-order cap in words a customer can act on', () => {
+    // The route answers 422 `unpaid_order_cap` with the domain's own sentence, and
+    // `submitFailureMessage` passes a 422 through verbatim — so what the customer
+    // reads is what `createOrder` wrote. It names the number and the way out.
+    const capped = submitFailureMessage(422, {
+      error: 'unpaid_order_cap',
+      message: 'You already have 10 unpaid pickup orders today — call the restaurant to place another.',
+    })
+    expect(capped).toMatch(/10 unpaid pickup orders/)
+    expect(capped).toMatch(/call the restaurant/)
+    expect(render({ error: capped })).toContain(capped)
   })
 
   it('tells a customer with an empty cart where to go, and shows no form at all', () => {

@@ -235,6 +235,21 @@ export type ProofResult = {
 }
 
 /**
+ * **A different fake customer every run**, in the 555 area code, which the NANP never
+ * assigns — so it is E.164-shaped (`assertInputShape` insists) and cannot ring anyone.
+ *
+ * It used to be one fixed number, and the unpaid-order cap is what makes that wrong:
+ * a proof leaves its order **open** at NEW forever, and nothing tears the test branch
+ * or a dev database down, so the eleventh run of the day against one location was
+ * refused `unpaid_order_cap` — the proof failing for the one reason that is not a bug.
+ * Ten proofs on one number genuinely *is* ten unpaid dinners on one phone; they are
+ * separate fake customers, so they get separate fake numbers.
+ */
+export function proofPhone(): string {
+  return `+1555${String(Date.now()).slice(-7)}`
+}
+
+/**
  * Place, fan out, wait for the ticket. The whole spine, minus HTTP.
  *
  * Exported so the suite can drive exactly what the CLI drives, against a location
@@ -249,7 +264,7 @@ export async function runProof(locationId: string): Promise<ProofResult> {
     locationId,
     channel: 'web',
     fulfillment: 'pickup',
-    contact: { name: 'Spine Proof', phone: '+15551234567', email: 'proof@serveside.test' },
+    contact: { name: 'Spine Proof', phone: proofPhone(), email: 'proof@serveside.test' },
     items,
     tipCents: 500,
     payment: 'pay_on_pickup',

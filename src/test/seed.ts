@@ -220,6 +220,56 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
 }
 
 /**
+ * What a seeded unpaid-pickup order may vary. Everything else is fixed and cheap —
+ * these rows exist to be *counted*, not read.
+ */
+export type UnpaidOrderOverrides = Partial<Pick<
+  typeof orders.$inferInsert, 'contactPhone' | 'status' | 'paymentStatus' | 'createdAt'
+>>
+/** The phone the unpaid-order cap is counted against unless a test says otherwise. */
+export const CAP_PHONE = '+15551234567'
+
+/**
+ * `count` open pay-at-pickup orders on one phone, written straight to the table in
+ * one transaction.
+ *
+ * **Deliberately not `createOrder` ten times.** The unpaid-order cap is a property of
+ * the *rows* — status, payment status, phone and the local day — and filling it
+ * through the whole write path would be a hundred round trips to say the same thing.
+ * The test that proves the real path writes a row the counter sees places its orders
+ * through `createOrder` instead; this is for the ones that vary one field to prove it
+ * is not counted.
+ *
+ * No lines: nothing that counts these reads them.
+ */
+export async function seedUnpaidPickupOrders(
+  locationId: string,
+  count: number,
+  over: UnpaidOrderOverrides = {},
+): Promise<void> {
+  if (count === 0) return
+  await withLocation(locationId, async (tx) => {
+    const snapshot = await buildMenuSnapshot(locationId, tx)
+    await tx.insert(orders).values(Array.from({ length: count }, () => ({
+      locationId,
+      shortCode: 'U0PC',
+      channel: 'web' as const,
+      fulfillment: 'pickup' as const,
+      status: 'NEW' as const,
+      paymentStatus: 'PAY_ON_PICKUP' as const,
+      contactName: 'Rohan R',
+      contactPhone: CAP_PHONE,
+      subtotalCents: 1000,
+      taxCents: 0,
+      tipCents: 0,
+      totalCents: 1000,
+      menuSnapshotId: snapshot.id,
+      ...over,
+    })))
+  })
+}
+
+/**
  * A provisioned printer. `serial` is the unit's MAC address and is UNIQUE across
  * the **platform**, so it has to be collision-proof the way slugs are — the `test`
  * branch is never torn down, and a fixed MAC here passes once and 23505s forever

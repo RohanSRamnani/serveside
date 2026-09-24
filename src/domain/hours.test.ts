@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isOpenAt, nextLocalHour } from './hours'
+import { isOpenAt, nextLocalHour, startOfLocalDay } from './hours'
 import { businessHours, holidayClosures, orderPauses } from '@/db/schema'
 import { seedLocation } from '@/test/seed'
 import { withLocation } from '@/repo/scoped'
@@ -245,5 +245,62 @@ describe('nextLocalHour', () => {
     // moment anyone does this arithmetic in whole hours.
     expect(nextLocalHour(new Date('2026-09-22T20:00:00Z'), 'Asia/Kolkata', 6).toISOString())
       .toBe('2026-09-23T00:30:00.000Z')
+  })
+})
+
+/**
+ * **The restaurant's day** — what the unpaid-order cap counts inside, so its edges are
+ * the cap's edges. Pure, so every case is an instant in and an instant out, written as
+ * UTC on both sides for the reason at the top of this file.
+ */
+describe('startOfLocalDay', () => {
+  const NEW_YORK = 'America/New_York'
+
+  it('is local midnight, not UTC midnight', () => {
+    // 14:00 EDT Tuesday → 00:00 EDT Tuesday, which is 04:00 UTC.
+    expect(startOfLocalDay(new Date('2026-09-22T18:00:00Z'), NEW_YORK).toISOString())
+      .toBe('2026-09-22T04:00:00.000Z')
+  })
+
+  it('stays on the restaurant’s day after UTC has already rolled to tomorrow', () => {
+    // **The case the whole helper exists for.** 22:30 EDT Tuesday is already Wednesday
+    // in UTC. A UTC day would hand this customer a fresh allowance at 8pm, mid-service;
+    // the restaurant's day is still Tuesday until its own midnight.
+    expect(startOfLocalDay(new Date('2026-09-23T02:30:00Z'), NEW_YORK).toISOString())
+      .toBe('2026-09-22T04:00:00.000Z')
+  })
+
+  it('uses the winter offset in winter', () => {
+    // 07:00 EST Thursday → 00:00 EST, which is 05:00 UTC.
+    expect(startOfLocalDay(new Date('2026-01-15T12:00:00Z'), NEW_YORK).toISOString())
+      .toBe('2026-01-15T05:00:00.000Z')
+  })
+
+  it('uses the offset in force AT midnight on the day the clocks go forward', () => {
+    // 2026-03-08: 11:00 EDT now, but midnight that morning was still EST. The offset
+    // in force *now* would put the start an hour late and drop the day's first hour.
+    expect(startOfLocalDay(new Date('2026-03-08T15:00:00Z'), NEW_YORK).toISOString())
+      .toBe('2026-03-08T05:00:00.000Z')
+  })
+
+  it('uses the offset in force AT midnight on the day the clocks go back', () => {
+    // 2026-11-01: 13:00 EST now, but midnight was still EDT — the 25-hour day.
+    expect(startOfLocalDay(new Date('2026-11-01T18:00:00Z'), NEW_YORK).toISOString())
+      .toBe('2026-11-01T04:00:00.000Z')
+  })
+
+  it('is exactly `at` when `at` is local midnight, and the instant before is yesterday', () => {
+    // The boundary is inclusive on the new day: an order at 00:00:00 local counts
+    // today, one a millisecond earlier counts yesterday.
+    const midnight = new Date('2026-09-22T04:00:00.000Z')
+    expect(startOfLocalDay(midnight, NEW_YORK).toISOString()).toBe(midnight.toISOString())
+    expect(startOfLocalDay(new Date(midnight.getTime() - 1), NEW_YORK).toISOString())
+      .toBe('2026-09-21T04:00:00.000Z')
+  })
+
+  it('handles a zone whose offset is not a whole number of hours', () => {
+    // 01:30 IST Wednesday (+5:30) → 00:00 IST Wednesday, which is 18:30 UTC Tuesday.
+    expect(startOfLocalDay(new Date('2026-09-22T20:00:00Z'), 'Asia/Kolkata').toISOString())
+      .toBe('2026-09-22T18:30:00.000Z')
   })
 })

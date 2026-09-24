@@ -59,6 +59,25 @@ export function canTransition(from: OrderStatus, to: OrderStatus): boolean {
   return (ORDER_TRANSITIONS[from] ?? []).includes(to)
 }
 
+/**
+ * **What the customer is promised**: the moment the order reached the kitchen, plus
+ * the location's prep time.
+ *
+ * One line, and it is a function so that there is one of it. The rule it encodes is
+ * that *the clock starts when the kitchen takes the order* — not at checkout. A card
+ * order's promise is made when the money lands (the Stripe webhook), a pay-at-pickup
+ * order's when it is written, and a card order that failed over to pay-at-pickup
+ * because Stripe was unreachable gets its promise at the moment of the conversion. All
+ * three are the same arithmetic on purpose: a promise made while a customer was still
+ * typing a card number has an unknown amount of it already spent.
+ *
+ * Pure, and takes the minutes rather than a location, so a caller that has a bump to
+ * add (the kitchen's "give me ten more") adds it to the argument.
+ */
+export function quotedReadyAtFrom(at: Date, prepMinutes: number): Date {
+  return new Date(at.getTime() + prepMinutes * 60_000)
+}
+
 /** Thrown, never returned: an illegal move is a bug or an attack, not a state. */
 export class IllegalTransitionError extends Error {
   readonly from: OrderStatus

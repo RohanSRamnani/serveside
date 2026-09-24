@@ -1,17 +1,21 @@
-import { eq, inArray } from 'drizzle-orm'
+import { and, count, eq, gte, inArray, notInArray, sql } from 'drizzle-orm'
 import {
-  locations, menus, menuItems, modifierOptions, orderEvents, paymentStatus as paymentStatusEnum,
+  locations, menus, menuItems, modifierOptions, orderEvents, orders,
+  paymentStatus as paymentStatusEnum,
 } from '@/db/schema'
 import type { OrderEventPayload } from '@/db/schema'
 import { withLocation, isUuid, type ScopedTx } from '@/repo/scoped'
 import { ordersRepo, type NewOrderLine } from '@/repo/orders-repo'
-import { isOpenAt, type ClosedReason } from './hours'
+import { isOpenAt, startOfLocalDay, type ClosedReason } from './hours'
 import { getOrBuildCurrentSnapshot } from './snapshot'
 import type { OrderStatus } from './order-status'
 import {
   taxCentsFor, unitPriceCentsFor, lineTotalCentsFor, totalCentsFor, assertTotalsBalance, type Totals,
 } from '@/lib/money'
-import { MAX_LINES_PER_ORDER, MAX_QTY_PER_LINE, MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS } from '@/lib/order-limits'
+import {
+  MAX_LINES_PER_ORDER, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY, MAX_QTY_PER_LINE,
+  MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS,
+} from '@/lib/order-limits'
 import { makeShortCode } from '@/lib/short-code'
 
 /**
@@ -211,6 +215,28 @@ export class ModifierSelectionError extends OrderRejectedError {
 }
 
 /**
+ * This phone already has as many open pay-at-pickup orders as one number gets in a
+ * day at this restaurant.
+ *
+ * The rejection a customer is most likely to meet without having done anything wrong,
+ * so the message is the whole of the answer: it says how many, and it says what to do
+ * instead. The number comes from the constant rather than the sentence, so the copy
+ * cannot drift away from the rule it describes.
+ */
+export class UnpaidOrderCapError extends OrderRejectedError {
+  readonly code = 'unpaid_order_cap'
+  readonly openOrders: number
+
+  constructor(openOrders: number) {
+    super(
+      `You already have ${MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY} unpaid pickup orders today — `
+      + 'call the restaurant to place another.',
+    )
+    this.openOrders = openOrders
+  }
+}
+
+/**
  * E.164, as the standard writes it: a `+`, a country code whose first digit is not 0,
  * and 7 to 15 digits in total.
  *
@@ -253,6 +279,27 @@ export async function createOrder(input: CreateOrderInput): Promise<CreateOrderR
     const openState = await isOpenAt(input.locationId, placedAt, tx)
     // `reason` is always set when `open` is false; the fallback is for the type.
     if (!openState.open) throw new LocationClosedError(input.locationId, openState.reason ?? 'closed_hours')
+
+    /**
+     * **The unpaid-order cap**, and it applies to pay-at-pickup only — see
+     * `MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY` for why the cap exists at all.
+     *
+     * Checked here rather than in `assertInputShape` because it is the one bound that
+     * needs the database *and* the location's timezone. Being inside the transaction
+     * that writes the order is necessary and **not sufficient**: under READ COMMITTED a
+     * COUNT takes no lock, so a burst of simultaneous posts would all read nine and all
+     * write. `assertUnderUnpaidCap` serialises them first — see the lock there.
+     *
+     * **A card order that failed over to pay-at-pickup is never re-checked.** That
+     * conversion happens in `POST /api/orders` after this function has returned, when
+     * Stripe could not be reached: the customer asked to pay now and the platform
+     * could not take their money. Counting that against them would be charging them
+     * for our outage — so the failover writes the order directly and does not come
+     * back through here.
+     */
+    if (input.payment === 'pay_on_pickup') {
+      await assertUnderUnpaidCap(tx, input.locationId, input.contact.phone, placedAt, location.timezone)
+    }
 
     const lines = await priceLines(tx, input)
     const totals = totalsFor(lines, input.tipCents, location.taxRatePer100k)
@@ -332,6 +379,10 @@ async function readLocation(tx: ScopedTx, locationId: string) {
       status: locations.status,
       taxRatePer100k: locations.taxRatePer100k,
       prepTimeMinutes: locations.prepTimeMinutes,
+      // The restaurant's own day is what the unpaid-order cap counts inside. Read on
+      // the same row as the tax rate so one transaction answers every question it has
+      // about this location.
+      timezone: locations.timezone,
     })
     .from(locations)
     .where(eq(locations.id, locationId))
@@ -341,6 +392,63 @@ async function readLocation(tx: ScopedTx, locationId: string) {
   // `isOpenAt` makes.
   if (!location) throw new Error(`Unknown location ${locationId}`)
   return location
+}
+
+/**
+ * How many open pay-at-pickup orders this phone already has at this restaurant today,
+ * and a refusal if that is already the cap.
+ *
+ * Every conjunct in the WHERE is load-bearing:
+ *
+ * - **`paymentStatus = 'PAY_ON_PICKUP'`** — a card order has money behind it and is
+ *   not what this guards against.
+ * - **not COMPLETED / REJECTED / CANCELED** — the restaurant is finished with those.
+ *   Without this, a regular who collects every order they place is locked out by
+ *   their own good behaviour, which is the opposite of the intent.
+ * - **`createdAt >=` the start of today *at the restaurant*** — `startOfLocalDay`, not
+ *   a UTC day and not "the last 24 hours". A rolling window would let one bad evening
+ *   bleed into the next day's service, and UTC's day rolls at 8pm in New York.
+ *
+ * **No `location_id` predicate**, and that is the house rule rather than an oversight:
+ * the transaction is scoped and RLS supplies it. Writing it back here would hide the
+ * day RLS stops working — see `ordersRepo`.
+ */
+async function assertUnderUnpaidCap(
+  tx: ScopedTx,
+  locationId: string,
+  phone: string,
+  at: Date,
+  timezone: string,
+): Promise<void> {
+  /**
+   * **One pay-at-pickup order per phone per restaurant at a time**, until this
+   * transaction commits or rolls back.
+   *
+   * The abuse the cap exists for is a script, and a script sends its orders at once.
+   * READ COMMITTED gives the COUNT below no lock, so without this every transaction in
+   * a burst counts the same nine and inserts — overshooting by however many requests
+   * landed together, which on serverless is one per instance. With it, the next order
+   * in line waits here until this one is written or gone, and READ COMMITTED's fresh
+   * snapshot *per statement* is what then lets its COUNT see this order's row.
+   *
+   * Transaction-scoped, like the fan-out's per-order lock, so nothing can leak it.
+   * Keyed on location **and** phone, and namespaced, so it contends with nothing else:
+   * not another customer, not another restaurant, not that per-order lock. The key is
+   * a lock name, not a predicate — the COUNT still scopes by RLS alone.
+   */
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`unpaid-cap:${locationId}:${phone}`}, 0))`)
+
+  const [row] = await tx
+    .select({ open: count() })
+    .from(orders)
+    .where(and(
+      eq(orders.contactPhone, phone),
+      eq(orders.paymentStatus, 'PAY_ON_PICKUP'),
+      notInArray(orders.status, ['COMPLETED', 'REJECTED', 'CANCELED']),
+      gte(orders.createdAt, startOfLocalDay(at, timezone)),
+    ))
+  const open = row?.open ?? 0
+  if (open >= MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY) throw new UnpaidOrderCapError(open)
 }
 
 /**

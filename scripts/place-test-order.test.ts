@@ -24,7 +24,7 @@ const { sendSms } = vi.hoisted(() => ({ sendSms: vi.fn() }))
 vi.mock('@/lib/sms', () => ({ sendSms }))
 
 const {
-  runProof, chooseProofLines, awaitQueuedTicket,
+  runProof, chooseProofLines, awaitQueuedTicket, proofPhone,
 } = await import('./place-test-order')
 
 if (!neonConfig.webSocketConstructor && typeof globalThis.WebSocket !== 'undefined') {
@@ -127,6 +127,28 @@ describe('chooseProofLines', () => {
   it('says so when nothing on the menu can be ordered', () => {
     expect(() => chooseProofLines(snapshot([item({ id: 'x', name: 'Sold out', is86d: true })])))
       .toThrow(/No orderable item/)
+  })
+})
+
+describe('proofPhone', () => {
+  it('is a fresh unreachable number every run, so the proof never meets the unpaid cap', () => {
+    // A proof leaves its order open at NEW forever and nothing tears a dev database
+    // down, so a fixed number would be `unpaid_order_cap` on the eleventh run of the
+    // day — the proof failing for the one reason that is not a bug. Ten proofs on one
+    // number really are ten unpaid dinners on one phone; these are separate fake
+    // customers, so they get separate fake numbers.
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-22T18:00:00.000Z'))
+      const first = proofPhone()
+      vi.setSystemTime(new Date('2026-09-22T18:00:01.000Z'))
+      expect(proofPhone()).not.toBe(first)
+      // E.164, which `assertInputShape` insists on — and area code 555, which the NANP
+      // never assigns, so no run of this script can ring a real person.
+      expect(first).toMatch(/^\+1555\d{7}$/)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

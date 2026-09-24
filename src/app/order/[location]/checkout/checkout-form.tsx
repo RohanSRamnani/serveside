@@ -219,6 +219,49 @@ export const UNREADABLE_SUCCESS_MESSAGE =
   'Your order may have gone through. Please call the restaurant to check before ordering again.'
 
 /**
+ * What a customer is told when the route took their card order as a **pay-at-pickup**
+ * order because Stripe could not be reached.
+ *
+ * The brief's sentence, verbatim. Short on purpose: the order happened, the kitchen
+ * has it, and the only thing that changed is where the money is collected — which is
+ * exactly what a restaurant says on the phone when the terminal is down. Everything
+ * else the customer needs is on the status page they are about to land on.
+ */
+export const CARD_PAYMENTS_DOWN_MESSAGE = 'card payments are down — pay at pickup'
+
+/**
+ * What a **200** from `POST /api/orders` means, as a value.
+ *
+ * **Pulled out of the submit handler for the same reason as `submitFailureMessage`
+ * and `confirmOutcome`**: there is no jsdom here, so a branch is only testable if it
+ * is an ordinary function — and this one decides whether a Payment Element gets
+ * mounted, which is the difference between a customer paying and a customer staring at
+ * a card form for an order that has no PaymentIntent behind it.
+ *
+ * **`paidAtPickup` is read first and wins over `clientSecret`.** A failover order was
+ * never charged and holds no intent, so a Payment Element mounted for one is a form
+ * that cannot succeed — and worse, it invites payment for an order the kitchen is
+ * already cooking on the understanding that it will be paid at the counter. Read as an
+ * identity test against `true`, the same rule the consent flag gets: a truthy string
+ * would have come from something that is not our route.
+ */
+export type PlacedOutcome =
+  /** A card order, parked at PENDING_PAYMENT. Mount the Payment Element. */
+  | { kind: 'card'; orderId: string; shortCode: string; clientSecret: string }
+  /** Already NEW and already with the kitchen. Clear the cart, show `notice`, go to status. */
+  | { kind: 'pickup'; orderId: string; notice: string | null }
+  /** A 200 whose body we cannot read — unreachable by the route's contract. */
+  | { kind: 'unreadable' }
+
+export function placedOutcome(body: Record<string, unknown>): PlacedOutcome {
+  const { orderId, shortCode, clientSecret, paidAtPickup } = body
+  if (typeof orderId !== 'string' || typeof shortCode !== 'string') return { kind: 'unreadable' }
+  if (paidAtPickup === true) return { kind: 'pickup', orderId, notice: CARD_PAYMENTS_DOWN_MESSAGE }
+  if (typeof clientSecret === 'string') return { kind: 'card', orderId, shortCode, clientSecret }
+  return { kind: 'pickup', orderId, notice: null }
+}
+
+/**
  * Can this restaurant take a card on this deployment at all?
  *
  * **Two halves of one fact, and both are required.** The platform's publishable key
@@ -468,6 +511,7 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
   const [form, setForm] = useState<CheckoutFormState>(blankForm)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [placed, setPlaced] = useState<PlacedCardOrder | null>(null)
   const [quote, setQuote] = useState(initialQuote)
 
@@ -537,23 +581,38 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
       const body: Record<string, unknown> = await res.json().catch(() => ({}))
 
       if (res.status === 200) {
-        if (typeof body.orderId === 'string' && typeof body.shortCode === 'string') {
-          if (typeof body.clientSecret === 'string') {
-            /**
-             * A card order, parked at PENDING_PAYMENT. **The cart is deliberately not
-             * cleared**: nothing has been paid, and Task 5's Payment Element can
-             * still fail or be abandoned — a customer who backs out must find their
-             * dishes where they left them.
-             */
-            setPlaced({ orderId: body.orderId, shortCode: body.shortCode, clientSecret: body.clientSecret })
-            return
-          }
-          // Pay at pickup. The order is already NEW, the kitchen has been told, and
-          // the cart's whole purpose is served — so it is emptied before the
-          // navigation, or a customer returning to the menu finds a cart they have
-          // already ordered.
+        const outcome = placedOutcome(body)
+        if (outcome.kind === 'card') {
+          /**
+           * A card order, parked at PENDING_PAYMENT. **The cart is deliberately not
+           * cleared**: nothing has been paid, and Task 5's Payment Element can
+           * still fail or be abandoned — a customer who backs out must find their
+           * dishes where they left them.
+           */
+          setPlaced({
+            orderId: outcome.orderId, shortCode: outcome.shortCode, clientSecret: outcome.clientSecret,
+          })
+          return
+        }
+        if (outcome.kind === 'pickup') {
+          /**
+           * Pay at pickup — either because they chose it, or because Stripe was down
+           * and the route converted the order rather than refusing it. Both are the
+           * same thing now: the order is NEW, the kitchen has been told, and the
+           * cart's whole purpose is served — so it is emptied before the navigation,
+           * or a customer returning to the menu finds a cart they have already
+           * ordered.
+           *
+           * The notice is set *before* the push so the sentence is on screen for the
+           * moment the status page takes to arrive; a customer who asked to pay by
+           * card and is suddenly on a status page has to be told why. **Its own
+           * state, not `error`**: React renders it in the same pass as the cart clear,
+           * and an empty cart swaps the whole form — error slot included — for the
+           * empty state. `notice` is what the view shows *instead* of both.
+           */
+          if (outcome.notice) setNotice(outcome.notice)
           cart.clear()
-          router.push(statusHref(location.slug, body.orderId))
+          router.push(statusHref(location.slug, outcome.orderId))
           return
         }
         /**
@@ -615,6 +674,7 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
       form={form}
       busy={busy}
       error={error}
+      notice={notice}
       onChange={change}
       onSubmit={submit}
     />
@@ -633,12 +693,22 @@ export type CheckoutFormViewProps = {
   form: CheckoutFormState
   busy: boolean
   error: string | null
+  /**
+   * The order is placed and the page is on its way to the status page — with this
+   * sentence to say how. Set only for the Stripe-outage failover today
+   * (`CARD_PAYMENTS_DOWN_MESSAGE`). When present it **replaces both the form and the
+   * empty-cart state**: the cart has just been cleared, and "there's nothing in your
+   * order" is the one thing a customer whose dinner is being cooked must not read.
+   * Optional so every other render of this view is unchanged.
+   */
+  notice?: string | null
   onChange: (patch: Partial<CheckoutFormState>) => void
   onSubmit: () => void
 }
 
 export function CheckoutFormView({
-  location, lines, hydrated, closedReason, cardAvailable, quote, form, busy, error, onChange, onSubmit,
+  location, lines, hydrated, closedReason, cardAvailable, quote, form, busy, error, notice = null,
+  onChange, onSubmit,
 }: CheckoutFormViewProps) {
   const totals = cartTotals(lines, location.taxRatePer100k)
   const tipCents = tipCentsFor(form, totals.subtotalCents)
@@ -671,7 +741,11 @@ export function CheckoutFormView({
         <p className="ss-co-sub">{location.name} · Pickup</p>
       </header>
 
-      {empty ? (
+      {notice ? (
+        <div className="ss-co-handoff" role="status">
+          <p className="ss-co-handoff-line">{notice}</p>
+        </div>
+      ) : empty ? (
         <div className="ss-co-empty">
           <p className="ss-co-empty-line">There’s nothing in your order yet.</p>
           <a className="ss-co-empty-link" href={menuHref(location.slug)}>Back to the menu</a>
@@ -1159,6 +1233,8 @@ export const CHECKOUT_CSS = `
 }
 .ss-co-sub { margin-top: 2px; font-size: 13px; color: var(--ink-soft); }
 .ss-co-empty { padding: 48px 16px; text-align: center; }
+.ss-co-handoff { padding: 48px 16px; text-align: center; }
+.ss-co-handoff-line { font-size: 16px; font-weight: 650; line-height: 1.45; color: var(--ink); }
 .ss-co-empty-line { font-size: 15.5px; color: var(--ink-soft); }
 .ss-co-empty-link {
   display: inline-block; margin-top: 14px; padding: 12px 18px; min-height: 48px;

@@ -3,7 +3,7 @@ import { and, desc, eq } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { locations, orders, orderEvents, webhookEvents } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
-import { transition } from '@/domain/order-status'
+import { quotedReadyAtFrom, transition } from '@/domain/order-status'
 import { stripe } from '@/lib/stripe'
 import { env } from '@/lib/env'
 import { sendOrderCreated, sendProvenanceRefused, type ProvenanceRefusal } from '@/inngest/client'
@@ -323,7 +323,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     await tx.update(orders).set({
       status: next,
       paymentStatus: 'PAID',
-      quotedReadyAt: new Date(paidAt.getTime() + location.prepTimeMinutes * 60_000),
+      quotedReadyAt: quotedReadyAtFrom(paidAt, location.prepTimeMinutes),
       // `??`, not an overwrite: the checkout already wrote this, and the column is
       // UNIQUE. Set here only to heal an order whose checkout died after the intent
       // was created but before the id reached the row.

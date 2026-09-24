@@ -4,7 +4,10 @@ import type { GetStepTools } from 'inngest'
 import type { inngest as inngestClient } from '@/inngest/client'
 import { orders, orderEvents, menus, printJobs } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
-import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
+import {
+  CAP_PHONE, seedLocationWithMenu, seedBusinessHours, seedUnpaidPickupOrders, type SeededMenu,
+} from '@/test/seed'
+import { MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY } from '@/lib/order-limits'
 
 /**
  * The public write path, and the only route in this plan a stranger can POST to.
@@ -56,6 +59,17 @@ vi.mock('@/lib/sms', () => ({ sendSms }))
 
 const { POST } = await import('./orders/route')
 const { fanOut } = await import('@/inngest/order-created')
+
+/**
+ * The SDK's **real** error classes, reached around the module mock above.
+ *
+ * `vi.mock('stripe')` replaces the whole module for this file, so a `new
+ * Stripe.errors.StripeAPIError(...)` written the ordinary way would be a
+ * `TypeError` on `undefined`. `importActual` loads the genuine module beside the
+ * mock — which matters, because the failover's whole decision is "is this error one
+ * of Stripe's own", and a hand-rolled stand-in would prove nothing about that.
+ */
+const stripeErrors = (await vi.importActual<typeof import('stripe')>('stripe')).default.errors
 
 /** The seeded menu's own arithmetic: (1800 + 50) × 2 = 3700, tax 875bps → 324, tip 500. */
 const TIP_CENTS = 500
@@ -418,5 +432,205 @@ describe('POST /api/orders', () => {
 
     const [row] = await withLocation(loc.id, (tx) => tx.select().from(orders).where(eq(orders.status, 'CANCELED')))
     expect(row).toBeDefined()
+  })
+})
+
+/**
+ * **The storefront keeps taking orders when Stripe is down.**
+ *
+ * An order is already committed at PENDING_PAYMENT by the time the intent is
+ * attempted, and the default behaviour for a failure there is to cancel it — which
+ * is right when the order can never be paid, and wrong when the only thing that
+ * happened is that Stripe had a bad ten minutes. A restaurant with a full dining
+ * room and a website that says "something went wrong on our side" loses the order to
+ * the phone, or loses it entirely.
+ *
+ * So a **Stripe-or-network** failure converts the order to the mode every restaurant
+ * can always do: NEW / PAY_ON_PICKUP, with a ready time, announced to the kitchen,
+ * and answered 200 with `paidAtPickup: true` so the checkout can say so. The money is
+ * collected at the counter, which is what a restaurant did for a hundred years before
+ * this product existed.
+ *
+ * What must **not** happen is the same treatment for a failure that is about this
+ * request: a declined card, a bad key, a permission we do not have. Those cancel and
+ * answer as before, because converting them would sell food on the strength of our
+ * own bug.
+ */
+describe('POST /api/orders — pay-at-pickup failover when Stripe is down', () => {
+  /** Every class the ruling calls an outage, driven through the real route. */
+  const outages: Array<[string, () => Error]> = [
+    ['a Stripe 5xx (StripeAPIError)', () => new stripeErrors.StripeAPIError({ message: 'api down', statusCode: 503 })],
+    ['a connection failure', () => new stripeErrors.StripeConnectionError({ message: 'could not reach stripe' })],
+  ]
+
+  for (const [label, makeError] of outages) {
+    it(`converts a card order to pay-at-pickup on ${label}`, async () => {
+      const loc = await openRestaurant()
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      paymentIntentsCreate.mockRejectedValueOnce(makeError())
+
+      let res: Response
+      let logged: string
+      try {
+        res = await post(cartFor(loc))
+        // Read before the restore, which clears the recorded calls with the spy.
+        logged = error.mock.calls.flat().join(' ')
+      } finally {
+        error.mockRestore()
+      }
+      expect(res.status).toBe(200)
+      const body = await res.json()
+
+      // **Never silent.** Until error reporting lands, this log line is the only way we
+      // learn that Stripe is down and card orders are being taken at the counter — and
+      // it names the order, so each converted one can be found. The raw error belongs
+      // here, in our log, and nowhere a customer reads.
+      expect(logged).toMatch(/converting it to pay-at-pickup/)
+      expect(logged).toContain(body.orderId)
+
+      // The flag is the contract the checkout branches on, and the absent client
+      // secret is what keeps it from mounting a Payment Element for an order that has
+      // no intent to confirm.
+      expect(body.paidAtPickup).toBe(true)
+      expect(body.clientSecret).toBeUndefined()
+      expect(body.orderId).toEqual(expect.any(String))
+      expect(body.shortCode).toHaveLength(4)
+
+      const order = await readOrder(loc.id, body.orderId)
+      expect(order.status).toBe('NEW')
+      expect(order.paymentStatus).toBe('PAY_ON_PICKUP')
+      // The kitchen owns it now, so it is promised a time — the same promise a
+      // pay-at-pickup order gets, and the same one the webhook makes when money lands.
+      expect(order.quotedReadyAt).not.toBeNull()
+      // No intent was ever created, so nothing may claim one: the column is UNIQUE and
+      // the webhook proves an event belongs to an order by it.
+      expect(order.stripePaymentIntentId).toBeNull()
+      // Not cancelled. This is the whole difference from the 500 path.
+      expect(order.canceledAt).toBeNull()
+      expect(order.cancelReason).toBeNull()
+
+      // The audit row says what happened, in words a customer and a cook can both
+      // read. The raw Stripe error is not in it — that belongs in the log.
+      const events = await withLocation(loc.id, (tx) =>
+        tx.select().from(orderEvents).where(eq(orderEvents.orderId, body.orderId)))
+      const moved = events.find((e) => e.type === 'status_changed')
+      expect(moved).toBeDefined()
+      expect(moved!.payload).toMatchObject({ from: 'PENDING_PAYMENT', to: 'NEW' })
+      expect(String((moved!.payload as Record<string, unknown>).reason)).toMatch(/card payment/i)
+      expect(JSON.stringify(moved!.payload)).not.toMatch(/StripeAPIError|StripeConnectionError|api down/)
+
+      // Announced exactly as a pay-at-pickup order is, because that is now what it is:
+      // without this the ticket is never rendered and the owner is never texted.
+      expect(sendOrderCreated).toHaveBeenCalledTimes(1)
+      expect(sendOrderCreated).toHaveBeenCalledWith(body.orderId, loc.id)
+    })
+  }
+
+  it('does not fail over a card error — that is not Stripe being down', async () => {
+    // A decline cannot occur at intent creation under `automatic_payment_methods`, and
+    // if one ever surfaced here it would still be about a card. The existing contract
+    // stands: the order is cancelled, the answer is an opaque 500, and nothing about
+    // Stripe's internals reaches the body.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(new stripeErrors.StripeCardError({
+      message: 'Your card was declined: acct_secret', code: 'card_declined', decline_code: 'generic_decline',
+    }))
+
+    try {
+      const res = await post(cartFor(loc))
+      expect(res.status).toBe(500)
+      expect(JSON.stringify(await res.json())).not.toMatch(/acct_secret|card_declined/)
+      expect(sendOrderCreated).not.toHaveBeenCalled()
+
+      const [row] = await withLocation(loc.id, (tx) => tx.select().from(orders).where(eq(orders.status, 'CANCELED')))
+      expect(row).toBeDefined()
+      expect(row.paymentStatus).toBe('REQUIRES_PAYMENT')
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('does not fail over our own misconfiguration', async () => {
+    // A bad key or a missing permission is a deployment fault. Converted to
+    // pay-at-pickup it would turn every card order on the platform into an unpaid one
+    // and nobody would find out until the till was short.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(
+      new stripeErrors.StripeAuthenticationError({ message: 'Invalid API Key provided' }),
+    )
+
+    try {
+      const res = await post(cartFor(loc))
+      expect(res.status).toBe(500)
+      const [row] = await withLocation(loc.id, (tx) => tx.select().from(orders).where(eq(orders.status, 'CANCELED')))
+      expect(row).toBeDefined()
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('does not re-check the unpaid-order cap on a converted order', async () => {
+    // The customer asked to pay now. They are paying at the counter because *we* could
+    // not reach Stripe, so counting the result against their daily unpaid allowance
+    // would charge them for our outage — and would turn a Stripe incident into a
+    // second, self-inflicted refusal on the eleventh order of a busy evening.
+    const loc = await openRestaurant()
+    expect(cartFor(loc).contact.phone).toBe(CAP_PHONE)
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(new stripeErrors.StripeAPIError({ message: 'api down' }))
+
+    try {
+      const res = await post(cartFor(loc))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.paidAtPickup).toBe(true)
+      const order = await readOrder(loc.id, body.orderId)
+      expect(order.status).toBe('NEW')
+      expect(order.paymentStatus).toBe('PAY_ON_PICKUP')
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('answers 422 with the cap’s own sentence when a customer asks for an eleventh', async () => {
+    // The other half of the pair: the cap is the customer's to act on, so it travels
+    // the ordinary rejection path — a code a client can branch on and a sentence a
+    // customer can read. The checkout renders that message verbatim.
+    const loc = await openRestaurant({ stripeAccountId: null })
+    await seedUnpaidPickupOrders(loc.id, MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+
+    const res = await post(cartFor(loc, { payment: 'pay_on_pickup' }))
+    expect(res.status).toBe(422)
+    const body = await res.json()
+    expect(body.error).toBe('unpaid_order_cap')
+    expect(body.message).toContain(String(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY))
+    expect(body.message).toMatch(/call the restaurant/i)
+    // Refused before the INSERT: the ten seeded rows are still the whole story.
+    const rows = await withLocation(loc.id, (tx) => tx.select().from(orders))
+    expect(rows).toHaveLength(MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+  })
+
+  it('still answers 200 when the converted order cannot be announced', async () => {
+    // Same ruling as the pay-at-pickup branch, and for the same reason: the order is
+    // committed at NEW by the time this can fail, so a 500 would tell a customer their
+    // dinner did not happen when it did — and their retry is a second dinner.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(new stripeErrors.StripeConnectionError({ message: 'down' }))
+    sendOrderCreated.mockRejectedValueOnce(new Error('inngest is down'))
+
+    try {
+      const res = await post(cartFor(loc))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.paidAtPickup).toBe(true)
+      expect((await readOrder(loc.id, body.orderId)).status).toBe('NEW')
+    } finally {
+      error.mockRestore()
+    }
   })
 })

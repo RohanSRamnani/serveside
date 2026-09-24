@@ -50,6 +50,81 @@ export class StripeAccountMissingError extends Error {
   }
 }
 
+/**
+ * **Is this failure Stripe being down, rather than something about this order?**
+ *
+ * The one decision the checkout's pay-at-pickup failover hangs off, so it is written
+ * once, here, beside the call that throws these. `true` means: the customer did
+ * nothing wrong, the restaurant did nothing wrong, and the order should become a
+ * pay-at-pickup order rather than be refused.
+ *
+ * **Three types, and the list is deliberately short.** A connection failure is the
+ * SDK never reaching Stripe; an API error is how a Stripe 5xx arrives; a rate limit is
+ * their capacity rather than our request. Everything else the SDK can raise says
+ * something about *this* call — a bad key, an account we may not act for, a malformed
+ * request, a card — and every one of those is ours to fix or the customer's to act on.
+ *
+ * **The false positives are the expensive direction**, which is why it fails closed on
+ * anything it does not recognise. A misconfigured deployment classified as an outage
+ * turns every card order on the platform into an unpaid pickup order, and nobody finds
+ * out until the till is short. A genuine outage misclassified as our bug costs one
+ * order, loudly, on a screen that tells the customer to phone the restaurant.
+ *
+ * **Classified by `type`, not by `instanceof`**, and that is not a shortcut. Every
+ * `StripeError` subclass passes its own class name as `type` (see the SDK's
+ * `Error.js`), and `type` is part of its public surface. `instanceof` would be wrong
+ * twice over: the route's tests mock the `stripe` module whole, and two copies of the
+ * SDK in one process — a bundler, a transitive dependency — produce error objects that
+ * fail `instanceof` against the classes we hold while being exactly the same errors.
+ * `StripeError` also carries a `code` (`card_declined`), which shares a name with
+ * Node's errno and must never be consulted for a Stripe error; hence the two
+ * namespaces are separated rather than merged.
+ *
+ * **Card declines are not here and cannot be.** A decline happens at *confirm* time,
+ * in the browser, on the Payment Element — never at intent creation under
+ * `automatic_payment_methods`. Task 5's inline retry owns that path and never reaches
+ * this function.
+ */
+export function isStripeOutage(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const { type } = err as { type?: unknown }
+  // A Stripe error names itself, and its own name is the whole answer: nothing in the
+  // errno namespace below may promote one that this list does not contain.
+  if (typeof type === 'string' && type.startsWith('Stripe')) return OUTAGE_STRIPE_TYPES.has(type)
+  return isTransportFailure(err, 0)
+}
+
+/** The Stripe error types that mean "not us, not them, try later". */
+const OUTAGE_STRIPE_TYPES = new Set([
+  'StripeConnectionError',
+  'StripeAPIError',
+  'StripeRateLimitError',
+])
+
+/**
+ * The transport giving up under the SDK, reported as a plain Node error rather than
+ * wrapped in one of Stripe's. `fetch failed` is undici's, and the errnos are what its
+ * `cause` carries; the chain is walked because that is where the useful one lives.
+ *
+ * Bounded depth and an explicit list, for the reason above: an error we cannot name is
+ * not an outage. Nothing here matches an ordinary `Error` with a message about Stripe
+ * in it, which is exactly the shape a bug in our own code takes.
+ */
+function isTransportFailure(err: unknown, depth: number): boolean {
+  if (depth > 3 || typeof err !== 'object' || err === null) return false
+  const e = err as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown }
+  if (typeof e.code === 'string' && TRANSPORT_ERROR_CODES.has(e.code)) return true
+  if (e.name === 'TypeError' && e.message === 'fetch failed') return true
+  return isTransportFailure(e.cause, depth + 1)
+}
+
+/** Node/undici errnos for a connection that never opened, or closed under us. */
+const TRANSPORT_ERROR_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT',
+  'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EPROTO',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+])
+
 /** Only the fields the intent is built from — a whole order row satisfies it. */
 export type PayableOrder = { id: string; locationId: string; totalCents: number }
 export type PayeeLocation = { id: string; stripeAccountId: string | null }
