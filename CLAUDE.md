@@ -709,13 +709,19 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   off**: `sentryInitOptions` returns null and nothing is initialised; the browser only
   `import()`s the SDK when `NEXT_PUBLIC_SENTRY_DSN` is set. **Sentry 11 collects
   everything by default** — `sendDefaultPii` is gone and its `dataCollection` defaults
-  ship request bodies, cookies, query strings (CloudPRNT's carries the printer MAC) and
-  stack-frame locals — so `DATA_COLLECTION` (`src/lib/sentry-config.ts`) turns each off
-  by name and `beforeSend: scrubEvent` scrubs contact fields and client secrets from what
-  is left. Server code reports a real failure with **`reportError`** (`src/lib/report.ts`:
-  the same `console.error` line plus one Sentry event), not bare `console.error`;
-  uncaught route errors go through `onRequestError`, and an Inngest run that failed for
-  good through `SentryMiddleware` (final attempt only).
+  ship request bodies, cookies, query strings and stack-frame locals — so
+  `DATA_COLLECTION` (`src/lib/sentry-config.ts`) turns each off by name. **That only
+  covers the request itself.** Next's `request_path` (query included — CloudPRNT's
+  `?mac=&token=`), outgoing-request breadcrumb URLs (Inngest's event key is in the path),
+  console breadcrumbs and drizzle's error messages (which end in the query's params)
+  reach an event around it, and `scrubEvent` handles each; `sentry-pipeline.test.ts`
+  sends them through the real SDK. Server code reports a real failure with
+  **`reportError`** (`src/lib/report.ts`: the same `console.error` line plus one Sentry
+  event), not bare `console.error`; uncaught route errors go through `onRequestError`,
+  and an Inngest run that failed for good through `SentryMiddleware` (final attempt
+  only). **Nothing flushes for us** (no `withSentryConfig` wrappers) and a serverless
+  function can be suspended once it has answered, so `reportError` schedules
+  `after(() => Sentry.flush(SENTRY_FLUSH_MS))` and the middleware awaits the flush.
 - **Vitest 5 hides console output from passing tests here** (a non-TTY run gets its
   minimal reporter, `silent: 'passed-only'`), so "no warnings printed" means nothing
   without `--silent=false --reporter=default`. And a DB-backed test that overruns the 5s

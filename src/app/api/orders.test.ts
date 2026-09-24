@@ -72,7 +72,13 @@ const { captureException, captureMessage } = vi.hoisted(() => ({
   captureException: vi.fn(),
   captureMessage: vi.fn(),
 }))
-vi.mock('@sentry/nextjs', () => ({ captureException, captureMessage }))
+vi.mock('@sentry/nextjs', () => ({
+  captureException,
+  captureMessage,
+  // A client, as if a DSN were set — `reportError` captures nothing without one.
+  getClient: () => ({}),
+  flush: async () => true,
+}))
 
 const { POST, maxDuration } = await import('./orders/route')
 const { default: StatusPage } = await import('@/app/order/[location]/status/[orderId]/page')

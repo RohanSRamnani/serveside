@@ -5,19 +5,25 @@ import { scrubEvent } from './sentry-scrub'
 export type SentryOptions = NonNullable<Parameters<typeof init>[0]>
 
 /**
- * **What the SDK may collect on its own: almost nothing.**
+ * **What the SDK may collect on its own for a request: almost nothing.**
  *
  * Sentry 11 replaced `sendDefaultPii` with this option, and every category in it
  * defaults to **on** — checked in the installed SDK, not assumed
  * (`@sentry/core/build/cjs/utils/data-collection/resolveDataCollectionOptions.js`). Left
  * at the defaults it would ship the body of every checkout POST (a customer's name,
- * phone, email and notes), cookies, response headers, the query string — which on the
- * CloudPRNT route carries the printer's MAC, its whole credential — and the local
- * variables of every stack frame, where an `input.contact` sits in plain sight.
+ * phone, email and notes), cookies, request and response headers, the request's query
+ * string, and the local variables of every stack frame, where an `input.contact` sits in
+ * plain sight. So each is switched off by name. The two headers kept are what reading a
+ * browser error needs and nothing else. `frameContextLines` is left alone: it is our own
+ * source code around a frame, not anybody's data.
  *
- * So each is switched off by name. The two headers kept are what reading a browser
- * error needs and nothing else. `frameContextLines` is left alone: it is our own source
- * code around a frame, not anybody's data.
+ * **It is not the whole defence, and must not be read as one.** It governs what the SDK
+ * collects about the request itself, and several things reach an event around it: Next's
+ * `request_path` (query string included — CloudPRNT's carries the printer's MAC and job
+ * token) in `contexts.nextjs`, the URL paths of outgoing-request breadcrumbs (Inngest's
+ * event key is in one), console breadcrumbs, and error messages (drizzle's include the
+ * query's parameters). Those are `scrubEvent`'s job; see `sentry-scrub.ts`, and
+ * `sentry-pipeline.test.ts`, which sends all of them through the real SDK.
  */
 export const DATA_COLLECTION = {
   userInfo: false,
@@ -33,6 +39,16 @@ export const DATA_COLLECTION = {
 } satisfies SentryOptions['dataCollection']
 
 /**
+ * **How long a flush may take**, where the app flushes for itself: `reportError` (after
+ * the response, through Next's `after`) and `SentryMiddleware` (before an Inngest run
+ * answers). The SDK does not flush on its own here — its route wrappers come from
+ * `withSentryConfig`, which is not used — and a serverless function can be suspended
+ * once it has answered. Two seconds is ample for one or two small events and short
+ * enough not to matter to a function that is otherwise done.
+ */
+export const SENTRY_FLUSH_MS = 2_000
+
+/**
  * The one decision `src/instrumentation.ts` (server and edge) and
  * `src/instrumentation-client.ts` (browser) both make: how to start Sentry, or whether
  * to start it at all.
@@ -45,10 +61,11 @@ export const DATA_COLLECTION = {
  *
  * With one, it reports **errors and nothing personal**, in two layers:
  *
- * - {@link DATA_COLLECTION} — the SDK does not gather the data in the first place;
- * - `beforeSend: scrubEvent` — and whatever an event still carries (an error message
- *   naming a phone number, a log line with a client secret in it) is scrubbed on the way
- *   out. See `sentry-scrub.ts`.
+ * - {@link DATA_COLLECTION} — the SDK does not gather the request's own data in the
+ *   first place;
+ * - `beforeSend: scrubEvent` — and whatever an event still carries (a request path's
+ *   query, an outgoing request's URL, a log line, an error message) is scrubbed on the
+ *   way out. See `sentry-scrub.ts`.
  *
  * **No tracing** (`tracesSampleRate` left unset): errors only. A span per request would
  * ship the URL and timing of every customer's checkout for no alarm's benefit.

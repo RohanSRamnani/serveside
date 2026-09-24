@@ -11,6 +11,10 @@ import { scrubEvent, REDACTED } from './sentry-scrub'
  * gone out. So it is tested here on the event shapes Sentry actually builds, with no SDK.
  */
 const SECRET = 'pi_3Q0abcDEF123_secret_Zyx987wvU'
+const INNGEST_KEY = 'aSecretInngestEventKey_0123456789abcdefABCDEF-xyz'
+const MAC = '00:11:62:aa:bb:cc'
+const ENCODED_MAC = '00%3A11%3A62%3Aaa%3Abb%3Acc'
+const JOB_TOKEN = '11111111-1111-4111-8111-111111111111'
 
 describe('scrubEvent', () => {
   it('removes contact fields wherever the event carries them', () => {
@@ -104,6 +108,96 @@ describe('scrubEvent', () => {
       extra: { orderId: '11111111-1111-4111-8111-111111111111', totalCents: 4524, paid: false, refund: null },
     }
     expect(scrubEvent(event)).toEqual(event)
+  })
+
+  // --- Fix round 1: what DATA_COLLECTION cannot reach. Each shape below is the one the
+  // installed SDK actually builds — observed in-process, and asserted again end to end in
+  // `sentry-pipeline.test.ts`.
+
+  it('keeps only the origin of an outgoing request breadcrumb — Inngest puts its event key in the path', () => {
+    // `inngest.send` POSTs to `https://inn.gs/e/<INNGEST_EVENT_KEY>`, and the SDK's fetch
+    // breadcrumb keeps the whole path (only userinfo and the query are filtered). Every
+    // event captured later in the same request would carry the key.
+    const scrubbed = scrubEvent({
+      breadcrumbs: [{
+        type: 'http',
+        category: 'http',
+        data: { status_code: 200, url: `https://inn.gs/e/${INNGEST_KEY}`, 'http.request.method': 'POST' },
+      }, {
+        type: 'http',
+        category: 'http',
+        data: { status_code: 201, url: 'https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json', 'url.query': 'x=1' },
+      }],
+    })
+    expect(scrubbed.breadcrumbs[0].data).toEqual({ status_code: 200, url: 'https://inn.gs', 'http.request.method': 'POST' })
+    expect(scrubbed.breadcrumbs[1].data).toEqual({ status_code: 201, url: 'https://api.twilio.com' })
+    expect(JSON.stringify(scrubbed)).not.toContain(INNGEST_KEY)
+  })
+
+  it('keeps the path of a relative request — our own API — but never its query', () => {
+    const scrubbed = scrubEvent({
+      breadcrumbs: [{ type: 'http', category: 'fetch', data: { method: 'POST', url: '/api/orders?debug=1', status_code: 422 } }],
+    })
+    expect(scrubbed.breadcrumbs[0].data.url).toBe('/api/orders')
+  })
+
+  it('takes a printer serial out of a console breadcrumb — its message and its arguments', () => {
+    // `console.warn('[cloudprnt] printer', serial, 'reports', …)` on every poll becomes a
+    // breadcrumb, and a Star printer's serial is its MAC: the whole of its credential.
+    const scrubbed = scrubEvent({
+      breadcrumbs: [{
+        category: 'console',
+        level: 'warning',
+        message: `[cloudprnt] printer ${MAC} reports 200 OK`,
+        data: { arguments: ['[cloudprnt] printer', MAC, 'reports', '200 OK'], logger: 'console' },
+      }],
+    })
+    expect(scrubbed.breadcrumbs[0].message).toBe('[cloudprnt] printer [mac] reports 200 OK')
+    expect(scrubbed.breadcrumbs[0].data.arguments).toEqual(['[cloudprnt] printer', '[mac]', 'reports', '200 OK'])
+  })
+
+  it('strips the query from the request path Next hands onRequestError — CloudPRNT’s carries the MAC and the job token', () => {
+    // `captureRequestError` copies Next's `request.path` into `contexts.nextjs` unfiltered,
+    // and that path includes the query string; `urlQueryParams: false` never sees it.
+    const scrubbed = scrubEvent({
+      contexts: {
+        nextjs: {
+          request_path: `/api/printers/cloudprnt?mac=${ENCODED_MAC}&token=${JOB_TOKEN}`,
+          router_kind: 'App Router',
+          router_path: '/api/printers/cloudprnt',
+          route_type: 'route',
+        },
+      },
+      request: { url: `https://serveside.app/api/printers/cloudprnt?mac=${ENCODED_MAC}&token=${JOB_TOKEN}`, method: 'GET' },
+    })
+    expect(scrubbed.contexts.nextjs.request_path).toBe('/api/printers/cloudprnt')
+    expect(scrubbed.contexts.nextjs.router_path).toBe('/api/printers/cloudprnt')
+    expect(scrubbed.request.url).toBe('https://serveside.app/api/printers/cloudprnt')
+    expect(JSON.stringify(scrubbed)).not.toContain(JOB_TOKEN)
+  })
+
+  it('takes MACs out of free text in either spelling, and an event key out of a URL in a message', () => {
+    const scrubbed = scrubEvent({
+      message: `poll from ${MAC.toUpperCase()} and ${ENCODED_MAC}, then POST https://inn.gs/e/${INNGEST_KEY} failed`,
+    })
+    expect(scrubbed.message).toBe('poll from [mac] and [mac], then POST https://inn.gs/e/[inngest event key] failed')
+  })
+
+  it('keeps a failed query’s SQL and drops its parameters — the order INSERT’s are a customer’s details', () => {
+    // drizzle's `DrizzleQueryError` message is `Failed query: <sql>\nparams: <values>`, so
+    // a database blip on `createOrder` would put a name and the notes they typed into
+    // Sentry as the exception's value.
+    const failed = 'Failed query: insert into "orders" ("contact_name", "contact_phone", "notes") values ($1, $2, $3)'
+      + '\nparams: Rohan R,+15551234567,no peanuts — severe allergy'
+    const scrubbed = scrubEvent({
+      exception: { values: [{ type: 'DrizzleQueryError', value: failed }] },
+      extra: { log: `[POST /api/orders] unexpected failure: DrizzleQueryError: ${failed}` },
+    })
+    expect(scrubbed.exception.values[0].value).toBe(
+      'Failed query: insert into "orders" ("contact_name", "contact_phone", "notes") values ($1, $2, $3)'
+      + '\nparams: [redacted]',
+    )
+    expect(scrubbed.extra.log).not.toMatch(/Rohan|peanuts|15551234567/)
   })
 
   it('does not change the event it was handed, and survives a cycle', () => {
