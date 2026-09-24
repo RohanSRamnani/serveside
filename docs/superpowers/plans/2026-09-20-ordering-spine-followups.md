@@ -48,6 +48,31 @@ was deleted after merge per process — this file is the surviving record.
   sender refuse to send unless `VERCEL_ENV === 'production'` or the flag is
   explicitly off; the seed should also carry a test owner number for the dev
   branch. Until then: never place a browser order locally.
+- **Unannounced-order sweep (found in Plan 2 Task 8):** an order whose
+  `announce()` send failed or timed out is NEW with no print job and no owner
+  text, and the stale-order alert never fires for it — that alert is itself
+  started by `order/created`. Only the kitchen feed shows it. Add a cron that
+  finds NEW orders older than a few minutes with no `print_jobs` row, alerts
+  ops once (hourly cooldown) and re-announces.
+- **Stale PENDING_PAYMENT sweep (Plan 2 Task 7):** a Stripe that trickles bytes
+  can outlast the per-attempt timeout until `maxDuration` kills the route,
+  stranding an order at PENDING_PAYMENT with no intent; abandoned card
+  checkouts sit there too. Nothing moves them to CANCELED today.
+- **Canary retention (Plan 2 Task 8):** ~288 CANCELED orders a day accumulate
+  at the synthetic canary location, plus `canary_runs` rows. Prune both past a
+  window, the way `printer_probe_events` is pruned.
+- **Canary dead-man's switch (launch gate):** the canary cannot report its own
+  absence — Inngest down or the cron unregistered means silence. An external
+  heartbeat (the spec names Betterstack) the canary pings each run, alerting
+  when the pings stop. Rohan's account.
+- **Deploy ordering (Task 10):** migration 0022 must run BEFORE the code that
+  reads it deploys — every page selects `locations.synthetic`, and the Stripe
+  failover inserts into `payment_failovers` inside its transaction (a missing
+  table turns an outage into 500s instead of pay-at-pickup). Also confirm the
+  Vercel plan allows `maxDuration = 60` on `POST /api/orders`.
+- **Canary schedule (Rohan's call before Task 10):** each run is 3 Inngest
+  function runs / 7 steps — every 5 min ≈ 25.9k runs + 60.5k steps a month,
+  every 10 min half that. Pick against the Inngest plan's limits.
 - Measurement pass on the perf pile: `isOpenAt` round trips, checkout ~8
   in-tx round trips, heartbeat per-poll row update, O(locations) cron scans
   (the second SECURITY DEFINER, argued by name in `rls.test.ts`, is the
