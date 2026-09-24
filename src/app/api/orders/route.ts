@@ -8,6 +8,24 @@ import { createPaymentIntentFor, isStripeOutage, StripeAccountMissingError } fro
 import { sendOrderCreated } from '@/inngest/client'
 
 /**
+ * **Sixty seconds — longer than Stripe's worst case, with room for the rest.**
+ *
+ * A platform's default limit can be far shorter than the intent call's own worst case,
+ * `INTENT_WORST_CASE_MS` (25 s against a Stripe that never answers). Killed before that
+ * call gives up, the function never reaches the catch that converts the order to
+ * pay-at-pickup — and the order is left at PENDING_PAYMENT with no intent, the one
+ * state this route must never leave behind. Sixty is Stripe's worst case plus the order
+ * transaction before it, the conversion after it and the Inngest send, with margin. The
+ * deployment's plan has to permit it — check at deploy time rather than assume.
+ *
+ * **A bare literal, on purpose.** Next reads segment config out of the source text
+ * without running it, and anything else — `25 + 35`, a named constant — is not
+ * recognised and silently becomes the platform default. The test that checks this
+ * number against `INTENT_WORST_CASE_MS` also checks that it is still a literal.
+ */
+export const maxDuration = 60
+
+/**
  * Checkout. The one route in this plan a stranger can POST to.
  *
  * It does two things and delegates both: `createOrder` writes the order (and trusts

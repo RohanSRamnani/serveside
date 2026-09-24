@@ -102,6 +102,39 @@ export function statusPresentation(status: OrderStatus): StatusPresentation {
 }
 
 /**
+ * What a pay-at-pickup customer is told on this page: the money is owed at the counter.
+ *
+ * **This page is the screen a customer keeps** — the one open on their phone as they
+ * walk in — so it is where that has to be said. An ordinary pay-at-pickup order chose
+ * it; a card order that Stripe could not take was converted to it (the checkout's own
+ * sentence for that is on screen only until this page arrives). Both are
+ * `PAY_ON_PICKUP` on the row, and the row is all this page is told, so both get the
+ * line. "Card or cash" is the checkout's own promise for pay-at-pickup, repeated.
+ */
+export const PAY_AT_COUNTER_LINE = 'Pay at the counter when you pick up — card or cash.'
+
+/**
+ * While the food is still to be collected — and so, on a pay-at-pickup order, the money
+ * still to be handed over. **The same set as `KITCHEN_STATUSES`**, restated rather than
+ * imported because `order-status.ts` imports the database schema at runtime and this
+ * module is read by a client component; `status.test.tsx` pins the two equal.
+ */
+const STILL_TO_COLLECT: readonly OrderStatus[] = ['NEW', 'ACCEPTED', 'IN_KITCHEN', 'READY']
+
+/**
+ * The pay-at-the-counter line for this order, or `null`.
+ *
+ * Only for `PAY_ON_PICKUP`, and only while the food is still to collect: not once it is
+ * collected (paid, at the counter), declined or canceled (nothing to pay for) — "pay at
+ * the counter" beside "This order was declined" would send someone to queue for food
+ * that is not coming. Never for PAID or a card still being confirmed: asking a customer
+ * who paid online to pay again is the one wrong answer that costs them money.
+ */
+export function paymentNotice(status: OrderStatus, paymentStatus: PaymentStatus): string | null {
+  return paymentStatus === 'PAY_ON_PICKUP' && STILL_TO_COLLECT.includes(status) ? PAY_AT_COUNTER_LINE : null
+}
+
+/**
  * Statuses with nothing left to poll for. Not the same set as `KITCHEN_STATUSES`
  * (which is about the kitchen board, not this page) even though the two overlap:
  * REJECTED and CANCELED are terminal here exactly as they are there, and are simply

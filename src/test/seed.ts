@@ -220,6 +220,14 @@ export async function seedPaidOrder(locationId: string): Promise<SeededOrder> {
 }
 
 /**
+ * A pay-at-pickup order as `createOrder` writes one — and as the Stripe-outage
+ * failover leaves one: already NEW, nothing charged, the money owed at the counter.
+ */
+export async function seedPickupOrder(locationId: string): Promise<SeededOrder> {
+  return seedOrder(locationId, { paymentStatus: 'PAY_ON_PICKUP' })
+}
+
+/**
  * What a seeded unpaid-pickup order may vary. Everything else is fixed and cheap —
  * these rows exist to be *counted*, not read.
  */

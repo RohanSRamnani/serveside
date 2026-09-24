@@ -6,7 +6,7 @@ import { SHELL_CSS } from '../../shell-css'
 import { formatPhone, readyAtLabel } from '../../storefront-copy'
 import { useCart } from '../../cart-provider'
 import {
-  STRIP_STEPS, cartArrivalStep, clearedMarkerKey, shouldKeepPolling,
+  STRIP_STEPS, cartArrivalStep, clearedMarkerKey, paymentNotice, shouldKeepPolling,
   statusPresentation, type PaymentStatus, type StripStep,
 } from '../status-copy'
 
@@ -162,6 +162,7 @@ export default function StatusClient({ slug, orderId, location, initial }: Statu
       location={location}
       shortCode={payload.shortCode}
       status={payload.status}
+      paymentStatus={payload.paymentStatus}
       quotedReadyAt={payload.quotedReadyAt}
     />
   )
@@ -177,12 +178,18 @@ export type StatusViewProps = {
   location: StatusLocation
   shortCode: string
   status: OrderStatus
+  /**
+   * Required rather than optional: a caller that forgot it would silently drop the one
+   * line that tells a pay-at-pickup customer they owe money at the counter.
+   */
+  paymentStatus: PaymentStatus
   /** ISO, or `null` — see `statusPresentation`: no promise while unpaid, none once ended. */
   quotedReadyAt: string | null
 }
 
-export function StatusView({ location, shortCode, status, quotedReadyAt }: StatusViewProps) {
+export function StatusView({ location, shortCode, status, paymentStatus, quotedReadyAt }: StatusViewProps) {
   const presentation = statusPresentation(status)
+  const payLine = paymentNotice(status, paymentStatus)
   const readyLabel = quotedReadyAt !== null && !presentation.ended
     ? readyAtLabel(new Date(quotedReadyAt), location.timezone)
     : null
@@ -219,6 +226,7 @@ export function StatusView({ location, shortCode, status, quotedReadyAt }: Statu
       ) : null}
 
       {readyLabel ? <p className="ss-st-ready" data-ready="1">{readyLabel}</p> : null}
+      {payLine ? <p className="ss-st-pay" data-pay="1">{payLine}</p> : null}
 
       {presentation.ended ? (
         <a className="ss-st-call" data-call="1" href={`tel:${location.phoneE164}`}>
@@ -272,6 +280,7 @@ export const STATUS_CSS = `
 }
 .ss-st-step[data-active="1"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .ss-st-ready { margin-top: 14px; text-align: center; font-size: 14.5px; font-weight: 650; color: var(--diet-ink); }
+.ss-st-pay { margin-top: 10px; text-align: center; font-size: 15px; font-weight: 650; color: var(--ink); text-wrap: balance; }
 .ss-st-call {
   display: block; margin-top: 26px; padding: 14px 18px; min-height: 48px;
   border-radius: 12px; background: var(--accent); color: var(--accent-ink);

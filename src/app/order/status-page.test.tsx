@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { buildMenuSnapshot } from '@/domain/snapshot'
-import { seedLocationWithMenu, seedPaidOrder } from '@/test/seed'
+import { seedLocationWithMenu, seedPaidOrder, seedPickupOrder } from '@/test/seed'
 import { formatPhone } from './[location]/storefront-copy'
+import { PAY_AT_COUNTER_LINE } from './[location]/status/status-copy'
 import StatusPage from './[location]/status/[orderId]/page'
 
 /**
@@ -43,6 +44,28 @@ describe('/order/[location]/status/[orderId]', () => {
     // The phone came off the SAME `withLocation` read as the order — `storefrontView`
     // and the order select cannot disagree about which restaurant this is.
     expect(markup).toContain(formatPhone(loc.phoneE164))
+  })
+
+  it('tells a pay-at-pickup customer to pay at the counter — read off the row, on the server', async () => {
+    // The whole wiring, not just the view: `paymentStatus` comes out of the page's own
+    // scoped read, into `initial`, through the client component, into the markup of
+    // the first paint. A pay-at-pickup order and a Stripe-outage conversion are the
+    // same row, so this is the line both of them get.
+    const loc = await seedLocationWithMenu()
+    const { order } = await seedPickupOrder(loc.id)
+
+    const markup = await render(loc.storefrontSlug, order.id)
+    expect(markup).toMatch(/<p[^>]*data-pay="1"[^>]*>/)
+    expect(markup).toContain(PAY_AT_COUNTER_LINE)
+  })
+
+  it('does not ask a customer who paid online to pay again', async () => {
+    const loc = await seedLocationWithMenu()
+    const { order } = await seedPaidOrder(loc.id)
+
+    const markup = await render(loc.storefrontSlug, order.id)
+    expect(markup).not.toMatch(/<p[^>]*data-pay="1"/)
+    expect(markup).not.toContain(PAY_AT_COUNTER_LINE)
   })
 
   it('is a 404 for a malformed order id', async () => {

@@ -333,7 +333,15 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   never `instanceof`: the route's tests mock the `stripe` module whole, and two copies
   of the SDK in one process produce errors that fail `instanceof` while being the same
   errors. A **card decline** is not this: it happens at confirm time in the browser and
-  is Task 5's inline retry on the same intent.
+  is Task 5's inline retry on the same intent. **It only works if it happens in
+  seconds**: the SDK's defaults (80 s an attempt, two retries, timeouts retried) hold a
+  hung Stripe for about four minutes, so `createPaymentIntentFor` passes `timeout` and
+  `maxNetworkRetries` per request (`INTENT_WORST_CASE_MS`, 25 s) and the route exports
+  `maxDuration = 60` above it — killed first, the catch never runs and the order is
+  stranded at PENDING_PAYMENT. **The status page is what tells them to pay**: the
+  checkout's sentence is on screen only until it lands, so `paymentNotice`
+  (`status-copy.ts`) prints a pay-at-the-counter line for every `PAY_ON_PICKUP` order
+  still to collect — converted or chosen, the row is the same.
 - **Pay-at-pickup is capped at `MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY` (10) open
   orders per contact phone per location per day** — `createOrder`, inside the
   transaction, before the INSERT, `pay_on_pickup` only, rejecting `unpaid_order_cap`
@@ -540,6 +548,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   since Next 15, and a dynamic route ignores its segment's revalidate. So a page is
   always fresh — and gets no CDN staleness to survive a database blip with. Caching a
   DB-backed page means `unstable_cache` or a CDN header, not a segment config.
+- **Route segment config must be a bare literal** — `export const maxDuration = 60`,
+  never `20 + 40` or a named constant. Next reads it out of the source text without
+  running it (`extractExportedConstValue`), and anything else silently becomes the
+  platform default, the same trap as the proxy `matcher`. `orders.test.ts` pins it.
 - **Every export of a `'use client'` module is a client reference, re-exports
   included.** A server component that *calls* one gets "Attempted to call quoteLabel()
   from the server but quoteLabel is on the client" — a 500 on the whole page, and

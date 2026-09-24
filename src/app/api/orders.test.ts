@@ -8,6 +8,10 @@ import {
   CAP_PHONE, seedLocationWithMenu, seedBusinessHours, seedUnpaidPickupOrders, type SeededMenu,
 } from '@/test/seed'
 import { MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY } from '@/lib/order-limits'
+import { readFileSync } from 'node:fs'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { INTENT_MAX_NETWORK_RETRIES, INTENT_TIMEOUT_MS, INTENT_WORST_CASE_MS } from '@/lib/stripe'
+import { PAY_AT_COUNTER_LINE } from '@/app/order/[location]/status/status-copy'
 
 /**
  * The public write path, and the only route in this plan a stranger can POST to.
@@ -57,7 +61,8 @@ vi.mock('@/inngest/client', async (importOriginal) => ({
 }))
 vi.mock('@/lib/sms', () => ({ sendSms }))
 
-const { POST } = await import('./orders/route')
+const { POST, maxDuration } = await import('./orders/route')
+const { default: StatusPage } = await import('@/app/order/[location]/status/[orderId]/page')
 const { fanOut } = await import('@/inngest/order-created')
 
 /**
@@ -157,7 +162,20 @@ describe('POST /api/orders', () => {
     const [params, options] = paymentIntentsCreate.mock.calls[0]
     // The whole premise of the product: the charge is created ON the connected
     // account, so the restaurant is merchant of record and funds never touch us.
-    expect(options).toEqual({ stripeAccount: STRIPE_ACCOUNT })
+    //
+    // **Exact, like the params below**, and now three keys: the account, plus the
+    // bound on how long this one call may take. The SDK's defaults are an 80-second
+    // timeout and two retries, each retrying a timeout — four minutes against a Stripe
+    // that never answers, which is longer than a customer waits and possibly longer
+    // than the platform lets the route live. Killed first, the failover below never
+    // runs and the order is stranded at PENDING_PAYMENT with no intent.
+    // `toStrictEqual`, not `toEqual`: the latter reads a key set to `undefined` as a
+    // key that is absent, so a bound that silently went missing would still pass.
+    expect(options).toStrictEqual({
+      stripeAccount: STRIPE_ACCOUNT,
+      timeout: INTENT_TIMEOUT_MS,
+      maxNetworkRetries: INTENT_MAX_NETWORK_RETRIES,
+    })
     // **The exact key set, not field-by-field.** Checking the fields we care about
     // individually would stay green while someone added `transfer_data`,
     // `on_behalf_of` or `application_fee_amount` — each of which silently converts
@@ -526,6 +544,31 @@ describe('POST /api/orders — pay-at-pickup failover when Stripe is down', () =
     })
   }
 
+  it('lands the customer on a status page that says to pay at the counter', async () => {
+    // The checkout's sentence is on screen for a moment; the status page is the screen
+    // the customer keeps, and the one they will have open walking in. Somebody who
+    // chose Card, and whose order was converted because Stripe was down, has to read
+    // there that they owe money at the counter — or they find out in the queue.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(new stripeErrors.StripeAPIError({ message: 'api down' }))
+
+    let body: { orderId: string; paidAtPickup?: boolean }
+    try {
+      body = await (await post(cartFor(loc))).json()
+    } finally {
+      error.mockRestore()
+    }
+    expect(body.paidAtPickup).toBe(true)
+
+    const markup = renderToStaticMarkup(await StatusPage({
+      params: Promise.resolve({ location: loc.storefrontSlug, orderId: body.orderId }),
+      searchParams: Promise.resolve({}),
+    }))
+    expect(markup).toMatch(/<p[^>]*data-pay="1"[^>]*>/)
+    expect(markup).toContain(PAY_AT_COUNTER_LINE)
+  })
+
   it('does not fail over a card error — that is not Stripe being down', async () => {
     // A decline cannot occur at intent creation under `automatic_payment_methods`, and
     // if one ever surfaced here it would still be about a card. The existing contract
@@ -632,5 +675,45 @@ describe('POST /api/orders — pay-at-pickup failover when Stripe is down', () =
     } finally {
       error.mockRestore()
     }
+  })
+})
+
+/**
+ * **A Stripe that hangs must fail over in seconds, and the route must live long enough
+ * to do it.** Both halves are numbers, and the pair only means something together:
+ * a bounded intent call is useless if the platform kills the function first (the
+ * catch that converts the order never runs, and the order is stranded at
+ * PENDING_PAYMENT with no intent), and a generous `maxDuration` is useless if the SDK
+ * is still on its own four-minute default.
+ */
+describe('POST /api/orders — the time budget', () => {
+  /**
+   * What the rest of the route may need on the far side of a hung Stripe: the order
+   * transaction before it (a cold pool, a cold Neon compute), the conversion
+   * transaction after it, and the Inngest send. Generous on purpose; it is headroom,
+   * not a forecast.
+   */
+  const ROUTE_ALLOWANCE_MS = 15_000
+
+  it('caps the intent call at seconds, not the SDK’s minutes', () => {
+    // The customer is on a spinner for all of it. Half a minute is already long.
+    expect(INTENT_WORST_CASE_MS).toBeLessThanOrEqual(30_000)
+    // Below the SDK's own 80-second default per attempt, or this bounds nothing.
+    expect(INTENT_TIMEOUT_MS).toBeLessThan(80_000)
+  })
+
+  it('lets the route outlive Stripe’s worst case, with room for the rest of the request', () => {
+    expect(typeof maxDuration).toBe('number')
+    expect(maxDuration * 1000).toBeGreaterThan(INTENT_WORST_CASE_MS + ROUTE_ALLOWANCE_MS)
+  })
+
+  it('declares maxDuration as a bare numeric literal, because Next reads it without running it', () => {
+    // Next extracts segment config from the source text (`extractExportedConstValue`
+    // in `next/dist/build/analysis`), and anything that is not a literal — `20 + 40`,
+    // a named constant — is unrecognised and silently replaced by the platform
+    // default, which can be ten seconds. The value the test above checks would still
+    // be right; the deployed limit would not.
+    const source = readFileSync(new URL('./orders/route.ts', import.meta.url), 'utf8')
+    expect(source).toMatch(/^export const maxDuration = \d+$/m)
   })
 })

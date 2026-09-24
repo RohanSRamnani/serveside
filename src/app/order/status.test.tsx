@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { OrderStatus } from '@/domain/order-status'
+import { KITCHEN_STATUSES, type OrderStatus } from '@/domain/order-status'
 import { readyAtLabel } from './[location]/storefront-copy'
 import {
-  STRIP_STEPS, cartArrivalStep, clearedMarkerKey, isTerminalStatus,
-  shouldClearCartOnArrival, shouldKeepPolling, statusPresentation,
+  PAY_AT_COUNTER_LINE, STRIP_STEPS, cartArrivalStep, clearedMarkerKey, isTerminalStatus,
+  paymentNotice, shouldClearCartOnArrival, shouldKeepPolling, statusPresentation,
 } from './[location]/status/status-copy'
 import { StatusView } from './[location]/status/[orderId]/status-client'
 
@@ -214,6 +214,51 @@ describe('readyAtLabel', () => {
 // The markup.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Paying at the counter.
+// ---------------------------------------------------------------------------
+
+/**
+ * **The screen a customer keeps is this one**, so it is where "you owe money at the
+ * counter" has to be said. The checkout's own sentence for a Stripe-outage conversion
+ * is on screen only for the moment before this page arrives; an ordinary pay-at-pickup
+ * order never had a sentence at all. Both are `PAY_ON_PICKUP` on the row, and the row
+ * is all this page knows — so the line follows the row, whichever way the order got
+ * there.
+ */
+describe('paymentNotice', () => {
+  it('tells a pay-at-pickup customer to pay at the counter while the food is still to collect', () => {
+    for (const status of ['NEW', 'ACCEPTED', 'IN_KITCHEN', 'READY'] as const) {
+      expect(paymentNotice(status, 'PAY_ON_PICKUP'), status).toBe(PAY_AT_COUNTER_LINE)
+    }
+  })
+
+  it('stops asking once the order is over — collected, declined or canceled', () => {
+    // Collected means paid at the counter; declined and canceled mean there is nothing
+    // to pay for. "Pay at the counter" beside "This order was declined" would send
+    // somebody to queue for food that is not coming.
+    for (const status of ['COMPLETED', 'REJECTED', 'CANCELED'] as const) {
+      expect(paymentNotice(status, 'PAY_ON_PICKUP'), status).toBeNull()
+    }
+  })
+
+  it('never asks a customer who paid, or whose card is still being confirmed, to pay again', () => {
+    for (const status of ALL_STATUSES) {
+      for (const paymentStatus of ['PAID', 'REQUIRES_PAYMENT', 'REFUNDED'] as const) {
+        expect(paymentNotice(status, paymentStatus), `${status}/${paymentStatus}`).toBeNull()
+      }
+    }
+  })
+
+  it('asks for exactly as long as the kitchen still owes the food — the board’s own set', () => {
+    // Restated in `status-copy.ts` rather than imported, because that module is read by
+    // a client component and `order-status.ts` pulls the database schema in behind it.
+    // This is what keeps the copy equal to the original.
+    const asks = ALL_STATUSES.filter((status) => paymentNotice(status, 'PAY_ON_PICKUP') !== null)
+    expect(asks).toEqual([...KITCHEN_STATUSES])
+  })
+})
+
 describe('StatusView', () => {
   function render(over: Partial<Parameters<typeof StatusView>[0]> = {}): string {
     return renderToStaticMarkup(
@@ -221,11 +266,37 @@ describe('StatusView', () => {
         location={KASHI}
         shortCode="K7M2"
         status="NEW"
+        // PAID by default, so the pay-at-the-counter line is absent unless a test asks
+        // for it: its "counter" would otherwise satisfy the code-hint test below for
+        // the wrong reason.
+        paymentStatus="PAID"
         quotedReadyAt={null}
         {...over}
       />,
     )
   }
+
+  it('tells a pay-at-pickup customer to pay at the counter, on every screen before pickup', () => {
+    for (const status of ['NEW', 'ACCEPTED', 'READY'] as const) {
+      const markup = render({ status, paymentStatus: 'PAY_ON_PICKUP' })
+      // The element and the sentence, not the word: "counter" is already on this page
+      // in the code hint, so a bare match would pass with the line missing.
+      expect(markup, status).toMatch(/<p[^>]*data-pay="1"[^>]*>/)
+      expect(markup, status).toContain(PAY_AT_COUNTER_LINE)
+    }
+  })
+
+  it('says nothing about paying to a customer who paid by card, or is still paying', () => {
+    const cases = [
+      ['NEW', 'PAID'], ['ACCEPTED', 'PAID'], ['READY', 'PAID'],
+      ['PENDING_PAYMENT', 'REQUIRES_PAYMENT'],
+    ] as const
+    for (const [status, paymentStatus] of cases) {
+      const markup = render({ status, paymentStatus })
+      expect(markup, `${status}/${paymentStatus}`).not.toMatch(/<p[^>]*data-pay="1"/)
+      expect(markup, `${status}/${paymentStatus}`).not.toContain(PAY_AT_COUNTER_LINE)
+    }
+  })
 
   it('shows the short code enormous, with the counter hint', () => {
     const markup = render()

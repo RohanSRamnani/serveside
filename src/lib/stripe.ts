@@ -125,6 +125,54 @@ const TRANSPORT_ERROR_CODES = new Set([
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
 ])
 
+/**
+ * How long **one attempt** to open a PaymentIntent may take: ten seconds, against the
+ * SDK's default of eighty.
+ *
+ * A PaymentIntent is created while a customer watches a spinner, and a healthy Stripe
+ * answers in well under a second. The SDK's defaults — 80 seconds an attempt, two
+ * retries, and a timeout counts as retryable — add up to about four minutes against a
+ * Stripe that never answers. That is longer than anybody waits, and possibly longer
+ * than the platform lets the function live: killed first, the route never reaches the
+ * catch that converts the order to pay-at-pickup, and the order is stranded at
+ * PENDING_PAYMENT with no intent. Bounded here, a hung Stripe surfaces as a
+ * `StripeConnectionError` ("Request aborted due to timeout being reached"), which
+ * `isStripeOutage` counts, in seconds.
+ *
+ * Per request, not on the client, so it bounds the one call whose latency a customer
+ * sits through and nothing else we may later ask Stripe for.
+ */
+export const INTENT_TIMEOUT_MS = 10_000
+
+/**
+ * One retry, against the SDK's default of two — still enough to ride out the blip the
+ * SDK's retry exists for (a stale keep-alive socket on a frozen serverless instance).
+ * **Safe to retry at all because the SDK keys every POST**: a retry after an attempt
+ * that Stripe actually processed returns that same intent rather than a second one.
+ */
+export const INTENT_MAX_NETWORK_RETRIES = 1
+
+/** The SDK's own ceiling on one wait between attempts (`MAX_NETWORK_RETRY_DELAY_SEC`). */
+const SDK_MAX_RETRY_DELAY_MS = 5_000
+
+/**
+ * **The longest `createPaymentIntentFor` can take against a Stripe that never
+ * answers**: every attempt runs to its timeout, with the SDK's longest possible wait
+ * between them. Deliberately an overestimate — the SDK's first wait is really half a
+ * second — because this is what the route's `maxDuration` is checked against, and
+ * erring long there costs nothing.
+ *
+ * `Math.max(…, 1)` because the SDK retries a closed connection (ECONNRESET, EPIPE)
+ * once even with retries set to zero, so zero retries is still two attempts.
+ *
+ * Per attempt, the SDK's timeout is a **socket idle** timer: a Stripe that never
+ * answers trips it, but one that trickles a byte every few seconds would not. The
+ * route's `maxDuration` is the outer bound for that case.
+ */
+export const INTENT_WORST_CASE_MS =
+  (Math.max(INTENT_MAX_NETWORK_RETRIES, 1) + 1) * INTENT_TIMEOUT_MS
+  + Math.max(INTENT_MAX_NETWORK_RETRIES, 1) * SDK_MAX_RETRY_DELAY_MS
+
 /** Only the fields the intent is built from — a whole order row satisfies it. */
 export type PayableOrder = { id: string; locationId: string; totalCents: number }
 export type PayeeLocation = { id: string; stripeAccountId: string | null }
@@ -163,6 +211,10 @@ export async function createPaymentIntentFor(
     // THE mechanism. `stripeContext` is the SDK's newer spelling of the same header;
     // swap when it is no longer merely preferred.
     stripeAccount: location.stripeAccountId,
+    // The bound — see `INTENT_TIMEOUT_MS`. Without it, a hung Stripe holds this call
+    // for minutes and the failover arrives late or never.
+    timeout: INTENT_TIMEOUT_MS,
+    maxNetworkRetries: INTENT_MAX_NETWORK_RETRIES,
   })
 
   // A client secret is what the browser needs and the only thing we hand out. Stripe
