@@ -48,16 +48,6 @@ was deleted after merge per process — this file is the surviving record.
   sender refuse to send unless `VERCEL_ENV === 'production'` or the flag is
   explicitly off; the seed should also carry a test owner number for the dev
   branch. Until then: never place a browser order locally.
-- **Unannounced-order sweep (found in Plan 2 Task 8):** an order whose
-  `announce()` send failed or timed out is NEW with no print job and no owner
-  text, and the stale-order alert never fires for it — that alert is itself
-  started by `order/created`. Only the kitchen feed shows it. Add a cron that
-  finds NEW orders older than a few minutes with no `print_jobs` row, alerts
-  ops once (hourly cooldown) and re-announces.
-- **Stale PENDING_PAYMENT sweep (Plan 2 Task 7):** a Stripe that trickles bytes
-  can outlast the per-attempt timeout until `maxDuration` kills the route,
-  stranding an order at PENDING_PAYMENT with no intent; abandoned card
-  checkouts sit there too. Nothing moves them to CANCELED today.
 - **Canary retention (Plan 2 Task 8):** ~288 CANCELED orders a day accumulate
   at the synthetic canary location, plus `canary_runs` rows. Prune both past a
   window, the way `printer_probe_events` is pruned.
@@ -82,14 +72,18 @@ was deleted after merge per process — this file is the surviving record.
 
 - **Refunds**: rejecting/canceling a PAID order moves no money — dashboard
   refund flow per spec §4; owner refunds in Stripe manually until then.
-- **Abandoned-checkout cleanup**: no human path to PENDING_PAYMENT→CANCELED.
+- **Abandoned-checkout cleanup**: no human path to PENDING_PAYMENT→CANCELED —
+  and a Stripe that trickles bytes past the per-attempt timeout (Plan 2 Task 7)
+  strands an order there too, until `maxDuration` kills the route. A sweep.
 - **Menu editor MUST rebuild the snapshot on menu activation/deactivation**,
   plus a reconciliation sweep for stale-skip locations (unsnooze skip path
   logs `[unsnooze] rebuild skipped, snapshot now stale`).
 - **Un-announced-NEW sweep**: if Inngest ingest is down at order time, ticket
   + SMS + stale-alarm are all lost together (route logs-and-200s); the feed
-  still shows the order. A periodic sweep for NEW orders with no
-  `order/created` fan-out closes it.
+  still shows the order. Same for a send that times out (5 s bound, Plan 2
+  Task 8) — and the stale-order alert never fires for such an order, since it
+  is itself started by `order/created`. A periodic sweep for NEW orders with no
+  `print_jobs` row (alert ops once an hour, re-announce) closes it.
 - Voice/SMS channel callers exercise domain checks the HTTP path shadows
   (non-array modifierOptionIds etc.) — test there when voice lands.
 - Webhook: add an `intent.currency` conjunct next time the file is touched;
