@@ -182,7 +182,89 @@ export const printerProbeEvents = pgTable('printer_probe_events', {
   index('printer_probe_events_last_seen_idx').on(t.lastSeenAt),
 ])
 
+/** Where one canary run got to. `running` is a run that has not recorded its verdict yet — or died before it could. */
+export const canaryOutcome = pgEnum('canary_outcome', ['running', 'confirmed', 'failed'])
+
+/**
+ * One row per run of the synthetic canary (`src/inngest/canary.ts`): a one-cent order
+ * placed at the synthetic location through `createOrder`, announced the way the route
+ * announces one, and checked for a ticket in `print_jobs` a minute later.
+ *
+ * **Platform-global and exempt from RLS**, and the reason is the failure it has to be
+ * able to record. The run row is written *before* the canary location is looked up, so
+ * "there is no canary location" — never seeded, or seeded wrongly — is itself a run
+ * that failed, and two of those in a row page us like any other. A row that had to be
+ * scoped to the canary location could not exist in exactly the case where the canary is
+ * most broken. It is also not a restaurant's data: it holds ids, timestamps and our own
+ * failure text, and its readers are the canary itself and whoever is on call. Named in
+ * `src/repo/rls.test.ts` and CLAUDE.md with the other exemptions.
+ *
+ * - `inngestRunId` is UNIQUE because Inngest steps are at-least-once: the step that
+ *   places the order upserts on it, so a retried step lands on the same row and finds
+ *   the order it already placed instead of placing a second one. It is also the handle
+ *   that finds the run in the Inngest dashboard.
+ * - `printJobId` has **no foreign key, on purpose**: the run records the ticket it saw
+ *   and then deletes that ticket (a synthetic location has no printer, so a queued job
+ *   there would wait forever in `print_jobs_queued_idx`). The id is the evidence.
+ * - `alertedAt` is the "one text an hour" rule, in the `printer_probe_events` shape:
+ *   the run that texted us is stamped after the text went out, and the cooldown is
+ *   `max(alerted_at)`. Deliberately its own state, never shared with another alarm — a
+ *   canary text must not buy a Stripe outage an hour of silence.
+ */
+export const canaryRuns = pgTable('canary_runs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  inngestRunId: text('inngest_run_id').notNull().unique(),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  outcome: canaryOutcome('outcome').notNull().default('running'),
+  locationId: uuid('location_id').references(() => locations.id),
+  orderId: uuid('order_id').references(() => orders.id),
+  printJobId: uuid('print_job_id'),
+  failureReason: text('failure_reason'),
+  alertedAt: timestamp('alerted_at', { withTimezone: true }),
+}, (t) => [
+  /** "The runs before this one", newest first — the consecutive-failure question. */
+  index('canary_runs_started_idx').on(t.startedAt),
+  /** Partial: the cooldown's `max(alerted_at)` reads the handful of runs that ever texted. */
+  index('canary_runs_alerted_idx').on(t.alertedAt).where(sql`${t.alertedAt} is not null`),
+])
+
+/**
+ * Every card order that was converted to pay-at-pickup because Stripe could not be
+ * reached (`failOverToPickup` in `src/app/api/orders/route.ts`), one row each, written
+ * **inside the conversion's own transaction** — so a converted order without a row here
+ * cannot exist, and neither can a row for a conversion that rolled back.
+ *
+ * It exists for the alarm: a Stripe outage used to leave one `console.error` per
+ * converted order and nothing else. The route sends `payments/stripe-outage` after the
+ * commit, and `src/inngest/stripe-outage-alert.ts` texts `OPS_ALERT_E164` at most once an
+ * hour, in the `printer_probe_events` shape — the row that raised the text is stamped
+ * `alerted_at` after the send, and the cooldown is `max(alerted_at)`.
+ *
+ * **Platform-global and exempt from RLS**, because the question it answers is
+ * platform-wide: Stripe is one dependency for every restaurant, so one outage is one
+ * text an hour, not one per restaurant per hour — and a cooldown that could only see one
+ * location's rows would be exactly the second. Nothing in it is a restaurant's data
+ * beyond ids (no amounts, no customer, no error text). Named in `src/repo/rls.test.ts`
+ * and CLAUDE.md. `orderId` is UNIQUE: an order leaves PENDING_PAYMENT once, so it can
+ * be converted at most once.
+ */
+export const paymentFailovers = pgTable('payment_failovers', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orderId: uuid('order_id').notNull().unique().references(() => orders.id),
+  locationId: uuid('location_id').notNull().references(() => locations.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  alertedAt: timestamp('alerted_at', { withTimezone: true }),
+}, (t) => [
+  /** "How many in the last hour", for the text itself. */
+  index('payment_failovers_created_idx').on(t.createdAt),
+  /** Partial, like the canary's: the cooldown reads only rows that ever texted. */
+  index('payment_failovers_alerted_idx').on(t.alertedAt).where(sql`${t.alertedAt} is not null`),
+])
+
 export type WebhookEvent = typeof webhookEvents.$inferSelect
 export type Printer = typeof printers.$inferSelect
 export type PrintJob = typeof printJobs.$inferSelect
 export type PrinterProbeEvent = typeof printerProbeEvents.$inferSelect
+export type CanaryRun = typeof canaryRuns.$inferSelect
+export type PaymentFailover = typeof paymentFailovers.$inferSelect

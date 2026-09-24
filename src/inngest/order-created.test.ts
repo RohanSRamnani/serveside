@@ -256,6 +256,24 @@ describe('orderCreated fan-out', () => {
     expect(textsTo(locB.phoneE164)).toHaveLength(0)
     expect(failure(out)).toContain(order.id)
   })
+
+  it('queues the ticket but texts nobody for a synthetic location', async () => {
+    // The canary's orders go through this function for real — the ticket is the thing
+    // it checks for — and a synthetic location has no owner to tell. Its number is a
+    // fictional one, but the leg must not even try: nothing about a canary may ring a
+    // phone except the canary's own alarm.
+    const loc = await seedLocationWithMenu({
+      synthetic: true,
+      phoneE164: `+1555${String(1_000_000 + phones++)}`,
+    })
+    const { order } = await seedPaidOrder(loc.id)
+
+    const out = await fanOut(order.id, loc.id)
+
+    expect(failure(out)).toBe('')
+    expect(await jobsFor(loc.id, order.id)).toHaveLength(1)
+    expect(textsTo(loc.phoneE164)).toHaveLength(0)
+  })
 })
 
 /**

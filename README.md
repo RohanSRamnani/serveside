@@ -29,7 +29,10 @@ two independent legs: render the 32-column ticket and queue it for the printer t
 by polling, and text the owner. Independent because a jammed printer must not cost the
 text and a dead Twilio account must not cost the ticket. The kitchen works from
 `/feed/<location>` (Clerk-authed, polls every 5s, chimes); when nobody touches a `NEW`
-order for six minutes the restaurant is texted, and four minutes later we are.
+order for six minutes the restaurant is texted, and four minutes later we are. And every
+five minutes a **synthetic canary** (`src/inngest/canary.ts`) places a real one-cent
+order at a hidden location, announces it the way the route does and checks a ticket
+reached the print queue — two failures in a row text us.
 
 - Spec: `docs/superpowers/specs/2026-09-07-restaurant-ordering-backend-design.md`
 - Plan: `docs/superpowers/plans/2026-09-20-ordering-spine.md`
@@ -46,6 +49,7 @@ ENV_FILE=.env.local npm run db:migrate
 ENV_FILE=.env.local npm run db:app-user   # moves the owner to MIGRATION_DATABASE_URL,
                                           # points DATABASE_URL at app_user
 npm run seed:kashi                        # the pilot restaurant, with its real menu
+npm run seed:canary                       # the canary's hidden, synthetic location
 ```
 
 `db:app-user` is not optional. RLS does not bind a table's owner and the Neon owner also
@@ -96,6 +100,7 @@ symptom. Inngest needs no account or keys locally.
 | `npm run db:generate` / `db:migrate` | drizzle-kit. `ENV_FILE=.env.local` for `main` |
 | `npm run db:app-user` | once per branch, after the first migrate |
 | `npm run seed:kashi` | the pilot restaurant. `-- --hours=always-open` for the dev grid |
+| `npm run seed:canary` | the canary's synthetic location. Once per database, production included, before the canary's first tick |
 | `npm run spine:proof` | the end-to-end proof above |
 
 Never `drizzle-kit push`: it would "correct" every policy, grant, trigger and role, none
@@ -115,7 +120,9 @@ moment of use rather than at boot, so an unset key fails the one feature that ne
 | `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | `src/lib/stripe-browser.ts`, `.../checkout/checkout-form.tsx` | the Payment Element. The **platform** publishable key; blank hides the Card option. Inlined at **build** time |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_E164` | `src/lib/sms.ts` | the owner's order SMS and every alert |
 | `FEED_URL` | `src/inngest/order-created.ts` | the link in that SMS |
-| `OPS_ALERT_E164` | `src/inngest/{stale-order-alert,printer-heartbeat,provenance-refused}.ts` | our escalation number, in E.164 |
+| `OPS_ALERT_E164` | `src/inngest/{stale-order-alert,printer-heartbeat,provenance-refused,canary,stripe-outage-alert}.ts` | our escalation number, in E.164 |
+| `SENTRY_DSN` | `src/instrumentation.ts` | server errors to Sentry. **Blank means off** — nothing is initialised |
+| `NEXT_PUBLIC_SENTRY_DSN` | `src/instrumentation-client.ts` | browser errors to Sentry; set it to the same DSN. Blank ships no Sentry code at all. Inlined at **build** time |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | `@clerk/nextjs` (`src/proxy.ts`, `src/lib/authz.ts`) | the kitchen feed. Clerk **Organizations must be on** |
 | `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY` | the Inngest SDK | cloud only; `inngest-cli dev` needs neither |
 | `ENV_FILE` | `drizzle.config.ts`, `scripts/*` | which env file a script loads. drizzle-kit defaults to `.env.test`, the seed and proof to `.env.local` |
@@ -130,9 +137,10 @@ whatever the keys say.
 
 ## Tenancy, in one rule
 
-If it belongs to a restaurant, it goes through `withLocation`. The five tables exempt
+If it belongs to a restaurant, it goes through `withLocation`. The seven tables exempt
 from RLS are `organizations`, `locations` and `memberships` (the tenancy root — there is
 nothing to scope to until a location exists), `webhook_events` (written before anything
-knows whose event it is) and `printer_probe_events` (rows that exist *because* the serial
-belongs to nobody). Adding a sixth needs an argument in `CLAUDE.md` and a line in the
-catalog assertion in `src/repo/rls.test.ts`.
+knows whose event it is), `printer_probe_events` (rows that exist *because* the serial
+belongs to nobody), and the two platform alarms' ledgers, `canary_runs` and
+`payment_failovers` (each answers a platform-wide question). Adding an eighth needs an
+argument in `CLAUDE.md` and a line in the catalog assertion in `src/repo/rls.test.ts`.

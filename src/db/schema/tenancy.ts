@@ -61,6 +61,26 @@ export const locations = pgTable('locations', {
   deliveryEnabled: boolean('delivery_enabled').notNull().default(false),
   stripeAccountId: text('stripe_account_id'),
   status: text('status').notNull().default('active'),
+  /**
+   * **A location that exists to be ordered from by our own machinery and by nobody
+   * else** — today exactly one, the synthetic canary (`scripts/seed-canary.ts`), which
+   * places a one-cent order every few minutes to prove the order → ticket path works.
+   *
+   * It takes orders like any restaurant (that is the point: `createOrder`, the fan-out
+   * and the print queue run for real), and it is **invisible to people**:
+   *
+   * - every path that texts an owner skips it — the fan-out's SMS leg, the stale-order
+   *   escalation (which returns before its first sleep) and the printer heartbeat;
+   * - the storefront answers it with the ordinary 404 (`resolveStorefrontSlug`);
+   * - it has no Clerk org, so no kitchen feed can open it.
+   *
+   * A flag rather than a missing phone, on purpose. `phone_e164` stays NOT NULL: a real
+   * restaurant created without one would silently never be texted about an order, and
+   * "every order is texted to you as well" is a promise the product makes. So the
+   * canary carries a fictional, unroutable number (area code 555, 555-01xx) and this
+   * column is the one thing every owner-facing path checks by name.
+   */
+  synthetic: boolean('synthetic').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   /**

@@ -73,8 +73,18 @@ describe('RLS tenancy', () => {
     // there is no tenant to scope to, not merely one not yet read. The table has no
     // `location_id`, holds nothing of any restaurant's, and nothing in it can become a
     // printer. Its reader is a platform-wide cron, which has no scope either.
+    //
+    // `canary_runs` and `payment_failovers` (0022) are the two platform alarms' own
+    // ledgers, and both answer a platform-wide question. A canary run row is written
+    // before the canary location is looked up, so "there is no canary location" can be
+    // a recorded failure — scoped to that location it could not exist in exactly that
+    // case. A Stripe outage is one dependency for every restaurant, so its "one text an
+    // hour" has to see every restaurant's conversions at once. Both hold ids and our
+    // own timestamps, nothing of a customer's. Argued at each table in
+    // `src/db/schema/platform.ts`.
     expect(byName.filter((r) => !r.rls).map((r) => r.table)).toEqual([
-      'locations', 'memberships', 'organizations', 'printer_probe_events', 'webhook_events',
+      'canary_runs', 'locations', 'memberships', 'organizations', 'payment_failovers',
+      'printer_probe_events', 'webhook_events',
     ])
   })
 

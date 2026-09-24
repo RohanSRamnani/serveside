@@ -8,6 +8,7 @@ import {
 } from '@/domain/order-status'
 import { toFeedOrder, type FeedOrder } from '@/domain/feed'
 import { requireLocationAccess, deniedResponse } from '@/lib/authz'
+import { reportError } from '@/lib/report'
 
 /**
  * Every button on the kitchen tablet — Accept, Ready, Complete, Reject — is this one
@@ -127,7 +128,7 @@ export async function POST(req: Request, ctx: RouteContext<'/api/orders/[id]/tra
       return { kind: 'moved', order: toFeedOrder(moved) }
     })
   } catch (err) {
-    console.error('[POST /api/orders/:id/transition] failed for order', id, err)
+    reportError('[POST /api/orders/:id/transition] failed for order', id, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 

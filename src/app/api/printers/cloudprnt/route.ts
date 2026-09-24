@@ -3,6 +3,7 @@ import { db } from '@/db/client'
 import { printers, printJobs } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
 import { recordProbe } from '@/domain/printer-probes'
+import { reportError } from '@/lib/report'
 
 /**
  * Star CloudPRNT. The kitchen printer polls **us**.
@@ -279,7 +280,7 @@ async function noteProbe(serial: string): Promise<void> {
   try {
     await recordProbe(serial)
   } catch (err) {
-    console.error('[cloudprnt] could not record an unprovisioned serial', serial, err)
+    reportError('[cloudprnt] could not record an unprovisioned serial', serial, err)
   }
 }
 

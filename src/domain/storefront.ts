@@ -1,9 +1,10 @@
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { locations, menuSnapshots } from '@/db/schema'
 import type { SnapshotCategory } from '@/db/schema'
 import { withLocation, type ScopedTx } from '@/repo/scoped'
 import { isOpenAt, type OpenState } from './hours'
+import { reportError } from '@/lib/report'
 
 /**
  * What a customer's phone is handed when they open a restaurant's menu.
@@ -175,6 +176,11 @@ const STOREFRONT_SLUG = /^[A-Za-z0-9_-]{1,64}$/
  * wrong menu might never get one. `limit(2)` rather than `limit(1)` because the
  * second row is the whole question.
  *
+ * **A synthetic location is nobody's storefront** (`locations.synthetic` — the canary).
+ * It has a real, orderable, pinned menu, because the canary orders from it; it answers
+ * every public page and endpoint with the same miss as a slug nobody owns, because this
+ * lookup is where all of them start. `storefrontView` refuses one by id as well.
+ *
  * `locations` carries no RLS — there is nothing to scope to until we know which
  * location this is — so the stateless driver reads it. Everything after this point
  * is ordinary `withLocation` code.
@@ -186,12 +192,12 @@ export async function resolveStorefrontSlug(slug: string): Promise<string | null
   const rows = await db()
     .select({ id: locations.id })
     .from(locations)
-    .where(eq(locations.storefrontSlug, slug))
+    .where(and(eq(locations.storefrontSlug, slug), eq(locations.synthetic, false)))
     .limit(2)
 
   if (rows.length === 0) return null
   if (rows.length > 1) {
-    console.error(
+    reportError(
       '[storefront] storefront slug', slug, 'names more than one location;',
       'refusing to guess. locations_storefront_slug_unique should have made this',
       'impossible — check that the constraint is still on the table.',
@@ -221,17 +227,21 @@ export async function storefrontView(locationId: string, tx?: ScopedTx): Promise
     where: eq(locations.id, locationId),
     columns: {
       name: true, storefrontSlug: true, timezone: true, phoneE164: true, address: true,
-      prepTimeMinutes: true, taxRatePer100k: true, stripeAccountId: true,
+      prepTimeMinutes: true, taxRatePer100k: true, stripeAccountId: true, synthetic: true,
     },
   })
   // A caller asking about a location that does not exist has a bug; answering "no
   // menu" would hide it behind a plausible-looking refusal. The public route never
   // gets here — it resolves the slug first, and an unresolved slug is a 404.
   if (!row) throw new Error(`Unknown location ${locationId}`)
+  // A synthetic location has no storefront. Every public caller already got a miss
+  // from `resolveStorefrontSlug`; this is for one that arrives holding the id, and it
+  // is the refusal every caller already answers with the ordinary 404.
+  if (row.synthetic) throw new NoMenuError(locationId)
 
   // Named `slug` in the payload and read from `storefront_slug`: the customer-facing
   // view has exactly one slug, and it is the public one. See `StorefrontLocation.slug`.
-  const { storefrontSlug, ...rest } = row
+  const { storefrontSlug, synthetic: _synthetic, ...rest } = row
   const location: StorefrontLocation = { ...rest, slug: storefrontSlug }
 
   if (!tx) return withLocation(locationId, (scoped) => read(locationId, location, scoped))

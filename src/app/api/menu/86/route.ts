@@ -3,6 +3,7 @@ import { nextLocalHour } from '@/domain/hours'
 import { requireLocationAccess, deniedResponse } from '@/lib/authz'
 import { menuRepo, type EightySixTarget, type EightySixed } from '@/repo/menu-repo'
 import { withLocation, isUuid, type ScopedTx } from '@/repo/scoped'
+import { reportError } from '@/lib/report'
 
 /**
  * The 86 button — two taps, "until tomorrow", and it puts itself back.
@@ -117,7 +118,7 @@ async function handle(req: Request, direction: 'sold-out' | 'back-on-sale'): Pro
     }
     // Opaque: the body of a 500 is the one place a table name or another tenant's id
     // leaks to whoever asked.
-    console.error('[/api/menu/86] failed for location', access.location.id, err)
+    reportError('[/api/menu/86] failed for location', access.location.id, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 

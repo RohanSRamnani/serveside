@@ -1,11 +1,12 @@
 import { eq } from 'drizzle-orm'
 import { db } from '@/db/client'
-import { locations, orders, orderEvents } from '@/db/schema'
+import { locations, orders, orderEvents, paymentFailovers } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { quotedReadyAtFrom, transition } from '@/domain/order-status'
 import { createOrder, OrderRejectedError, type CreateOrderInput, type CreateOrderResult } from '@/domain/create-order'
 import { createPaymentIntentFor, isStripeOutage, StripeAccountMissingError } from '@/lib/stripe'
-import { sendOrderCreated } from '@/inngest/client'
+import { sendOrderCreated, sendStripeOutage } from '@/inngest/client'
+import { reportError } from '@/lib/report'
 
 /**
  * **Sixty seconds — longer than Stripe's worst case, with room for the rest.**
@@ -115,16 +116,24 @@ export async function POST(req: Request): Promise<Response> {
      * below, because converting *those* would sell food on the strength of our own bug.
      */
     if (isStripeOutage(err)) {
-      console.error(
+      // **Every conversion is a Sentry event** — the Stripe error itself, with the order
+      // it cost us a card payment on.
+      reportError(
         '[POST /api/orders] Stripe could not open an intent for order', order.orderId,
         '— converting it to pay-at-pickup:', err,
       )
       const converted = await failOverToPickup(input.locationId, order)
       if (converted) {
         // After the commit and exactly as the pay-at-pickup branch does it: the order
-        // is NEW now, so the ticket and the owner's text are owed. Best-effort, for the
-        // reason `announce` gives — the order is committed either way.
-        await announce(converted, input.locationId)
+        // is NEW now, so the ticket and the owner's text are owed. And the conversion is
+        // news for us: `raiseStripeOutage` hands it to the alarm, which texts ops once
+        // an hour while Stripe stays down. Both best-effort, for the reason `announce`
+        // gives — the order is committed either way — and both bounded, so together
+        // they cost at most one send's time limit, not two.
+        await Promise.all([
+          announce(converted, input.locationId),
+          raiseStripeOutage(converted.orderId, input.locationId),
+        ])
         return Response.json(
           { orderId: order.orderId, shortCode: order.shortCode, paidAtPickup: true },
           { status: 200 },
@@ -136,7 +145,7 @@ export async function POST(req: Request): Promise<Response> {
       // ends it if it is still ours to end, and the customer is told plainly that
       // nothing was ordered rather than being sent to a status page for an order that
       // is not on any kitchen's board.
-      console.error('[POST /api/orders] pay-at-pickup failover did not convert order', order.orderId)
+      reportError('[POST /api/orders] pay-at-pickup failover did not convert order', order.orderId)
     }
 
     // The order is already committed at PENDING_PAYMENT, and without an intent it can
@@ -148,7 +157,7 @@ export async function POST(req: Request): Promise<Response> {
     if (err instanceof StripeAccountMissingError) {
       return Response.json({ error: err.code, message: err.message }, { status: 503 })
     }
-    console.error('[POST /api/orders] payment setup failed for order', order.orderId, err)
+    reportError('[POST /api/orders] payment setup failed for order', order.orderId, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 }
@@ -178,6 +187,13 @@ export async function POST(req: Request): Promise<Response> {
  * yet. A throw in here is caught, logged and reported as "did not convert": the caller
  * then falls back to cancelling, because the one state that must never survive this
  * function is PENDING_PAYMENT with no intent.
+ *
+ * **It also writes the conversion down** — a `payment_failovers` row, in this same
+ * transaction, which is what the Stripe-outage alarm counts and stamps. In the same
+ * transaction so the two cannot disagree: no converted order without its row, and no
+ * row for a conversion that rolled back. The table is platform-wide and not under RLS
+ * (see it in `src/db/schema/platform.ts`), so writing it inside a location's scope
+ * changes nothing about who can see it.
  */
 async function failOverToPickup(
   locationId: string,
@@ -214,11 +230,29 @@ async function failOverToPickup(
         payload: { ...event.payload, reason: CARD_UNAVAILABLE_REASON },
       })
 
+      await tx.insert(paymentFailovers).values({ orderId: order.id, locationId })
+
       return { ...placed, status: next }
     })
   } catch (err) {
-    console.error('[POST /api/orders] could not convert order', placed.orderId, 'to pay-at-pickup:', err)
+    reportError('[POST /api/orders] could not convert order', placed.orderId, 'to pay-at-pickup:', err)
     return null
+  }
+}
+
+/**
+ * Tells the Stripe-outage alarm (`src/inngest/stripe-outage-alert.ts`) about a
+ * conversion that has just committed. Ids only, keyed on the order.
+ *
+ * **Best-effort**, like `announce`: the order is committed and the customer's answer
+ * does not depend on whether our pager could be reached. A failure here is itself
+ * reported — the conversion that triggered it already reached Sentry on its own.
+ */
+async function raiseStripeOutage(orderId: string, locationId: string): Promise<void> {
+  try {
+    await sendStripeOutage(orderId, locationId)
+  } catch (err) {
+    reportError('[POST /api/orders] could not raise the Stripe outage alarm for order', orderId, err)
   }
 }
 
@@ -245,19 +279,27 @@ const CARD_UNAVAILABLE_REASON =
  * there is announced for free, and one that parks at PENDING_PAYMENT cannot leak a
  * ticket for food nobody has paid for.
  *
- * **Failure is logged, not returned.** The order is already committed at NEW by the
- * time this can fail, so a 500 would tell a customer their dinner did not happen when
- * it did — and their retry is a second dinner. Degraded rather than silent: the
- * kitchen feed reads `orders`, so the order is on the board either way. Safe to leave
- * best-effort because `sendOrderCreated` is idempotent per order, so a later re-fire
- * (by hand, or by a future sweep) cannot print a second ticket.
+ * **Failure is logged and reported, not returned.** The order is already committed at
+ * NEW by the time this can fail, so a 500 would tell a customer their dinner did not
+ * happen when it did — and their retry is a second dinner. Degraded rather than silent:
+ * the kitchen feed reads `orders`, so the order is on the board either way, and every
+ * failure is a Sentry event naming the order. Safe to leave best-effort because
+ * `sendOrderCreated` is idempotent per order, so a later re-fire (by hand, or by a
+ * future sweep) cannot print a second ticket.
+ *
+ * **A hang is a failure too.** `sendOrderCreated` gives up after
+ * `INNGEST_SEND_TIMEOUT_MS`; without that bound a hung Inngest got this function killed
+ * at `maxDuration`, and the customer was told nothing was ordered for an order that
+ * exists. Note what does *not* catch an order whose announce failed: the stale-order
+ * alarm rides this same event, so it never hears of it either. Only the feed shows it
+ * — which is why the failure is reported.
  */
 async function announce(order: CreateOrderResult, locationId: string): Promise<void> {
   if (order.status !== 'NEW') return
   try {
     await sendOrderCreated(order.orderId, locationId)
   } catch (err) {
-    console.error(
+    reportError(
       '[POST /api/orders] order', order.orderId, 'is NEW but could not be announced —',
       'no ticket and no SMS; it is on the kitchen feed only:', err,
     )
@@ -314,7 +356,7 @@ function rejection(err: unknown): Response {
   if (err instanceof OrderRejectedError) {
     return Response.json({ error: err.code, message: err.message }, { status: 422 })
   }
-  console.error('[POST /api/orders] unexpected failure:', err)
+  reportError('[POST /api/orders] unexpected failure:', err)
   return Response.json({ error: 'server_error' }, { status: 500 })
 }
 
@@ -351,6 +393,6 @@ async function abandon(locationId: string, orderId: string, cause: unknown): Pro
   } catch (err) {
     // Swallowed on purpose: the caller is already returning the real failure, and a
     // second one thrown from cleanup would replace it with a worse message.
-    console.error('[POST /api/orders] could not cancel unpayable order', orderId, err, '(original cause:', cause, ')')
+    reportError('[POST /api/orders] could not cancel unpayable order', orderId, err, '(original cause:', cause, ')')
   }
 }

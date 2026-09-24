@@ -67,7 +67,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   while the customer URL has to read `/order/kashi`. A second Kashi shop reads
   `kashi-livingston`. The constraint makes the two-match refusal unreachable; it stays
   in the route as defence in depth. Handed an internal slug the route finds nothing and
-  answers its ordinary miss, which is correct. The view also publishes
+  answers its ordinary miss, which is correct — and so is a **synthetic** location (the
+  canary): `resolveStorefrontSlug` filters `synthetic = false`, and every public page
+  and endpoint starts there. The view also publishes
   `taxRatePer100k` — display-only, so a cart can show a tax line before there is an
   order to ask about; what is charged is still recomputed by `POST /api/orders`.
   It also publishes **`stripeAccountId`** (nullable) — not a leak: a connected
@@ -308,7 +310,9 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   leg skips when a job for the order already exists, and a `pg_advisory_xact_lock` on
   the order id makes that check-then-insert safe — Inngest steps are *at-least-once* and
   can genuinely run twice, concurrently. The SMS leg is deliberately **not** deduped: a
-  duplicate text is a nuisance, a duplicate ticket is food.
+  duplicate text is a nuisance, a duplicate ticket is food. It sends nothing for a
+  `synthetic` location — the canary's orders run this fan-out for real, because the
+  ticket is what the canary checks for.
 - **`renderTicket` (`src/domain/ticket.ts`) runs once, at fan-out, and its output is
   stored verbatim** in `print_jobs.payload` — same reasoning as `orders.menu_snapshot_id`:
   a reprint must reproduce the ticket that printed, not re-render against a menu that
@@ -341,7 +345,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   stranded at PENDING_PAYMENT. **The status page is what tells them to pay**: the
   checkout's sentence is on screen only until it lands, so `paymentNotice`
   (`status-copy.ts`) prints a pay-at-the-counter line for every `PAY_ON_PICKUP` order
-  still to collect — converted or chosen, the row is the same.
+  still to collect — converted or chosen, the row is the same. **Every conversion is
+  news for us**: a Sentry event (`reportError`), a `payment_failovers` row written in
+  the conversion's own transaction, and a `payments/stripe-outage` event (ids only)
+  that `stripe-outage-alert` turns into at most one ops text an hour, platform-wide.
 - **Pay-at-pickup is capped at `MAX_OPEN_UNPAID_ORDERS_PER_PHONE_PER_DAY` (10) open
   orders per contact phone per location per day** — `createOrder`, inside the
   transaction, before the INSERT, `pay_on_pickup` only, rejecting `unpaid_order_cap`
@@ -358,14 +365,20 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - **Every path that reaches NEW must send `order/created`, and there are three.** The
   Stripe webhook after the flip, `POST /api/orders` for a pay-at-pickup order, which
   `createOrder` writes straight to NEW, and the Stripe-outage failover in that same
-  route. The second was missing until Task 14:
+  route (the canary is a fourth sender, for its own synthetic order, the same way).
+  The second was missing until Task 14:
   those orders were never rendered, never queued for a printer and never texted about —
   they existed only on the kitchen feed. The route gates on the **status `createOrder`
   returned**, not the payment mode, and a failure there is logged and still answers
   200: the order is already committed, and a 500 would make the customer's retry a
-  second dinner. Safe because `sendOrderCreated` is idempotent per order.
+  second dinner. Safe because `sendOrderCreated` is idempotent per order. **Every
+  Inngest send is bounded** (`INNGEST_SEND_TIMEOUT_MS`, 5s, `src/inngest/client.ts`): a
+  hung one used to get the route killed at `maxDuration` after the commit, telling the
+  customer nothing was ordered. A failed announce is a Sentry event, and the stale-order
+  alarm does **not** catch it — that rides the same event, so it never hears of the
+  order either; only the feed shows it.
 - **The alarms page the RESTAURANT first and us second, and never for a closed
-  restaurant.** Three functions, all in `src/inngest/`:
+  restaurant.** Five functions, all in `src/inngest/`:
   - `stale-order-alert` rides `order/created` alongside the fan-out (two functions, one
     event). `step.sleep` 6m → still NEW and `isOpenAt` → text the owner "tap Accept";
     4m more → still NEW and open → text `OPS_ALERT_E164`. Accepting cancels it by
@@ -389,12 +402,26 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
     anything that raised no alarm at all, which stamps nothing.
   - `provenance-refused-alert` on `payments/provenance-refused` — ops only; see the
     Stripe provenance rule above.
-  Its second leg owns `printer_probe_events` (`src/domain/printer-probes.ts`, shared
+  - `stripe-outage-alert` on `payments/stripe-outage` — ops only, at most once an hour
+    **platform-wide** (`max(payment_failovers.alerted_at)`), sends then stamps,
+    `concurrency: 1` so a burst of conversions is one text.
+  - `synthetic-canary-order`, cron `CANARY_SCHEDULE` (one constant; changing it changes
+    the Inngest bill): a one-cent order at the synthetic location through `createOrder`
+    and `sendOrderCreated`, then a `print_jobs` check. Its `clean-up` step runs whatever
+    the check did and sweeps **every** open order and queued job at that location, which
+    is why it is `singleton: skip`. Two failures in a row text ops, once an hour.
+
+  The heartbeat's second leg owns `printer_probe_events` (`src/domain/printer-probes.ts`, shared
   with the poll route): >20 distinct unknown serials in 10 minutes texts ops once an
   hour, and the same leg prunes rows older than 24h. **The route stops recording new
   serials once the window is over threshold**, so the count is a floor ("at least N")
   and the table cannot be grown at will by a stranger. Both legs run under
   `Promise.allSettled`, so one restaurant's database trouble cannot hide a sweep.
+  **`locations.synthetic` is how a location opts out of people**: the fan-out's SMS leg,
+  the stale-order alarm (which returns *before its first sleep*) and the heartbeat all
+  skip it, and the storefront 404s it. A flag, not a nullable phone — `phone_e164` stays
+  NOT NULL so a real restaurant can never silently lose its owner texts; the canary's
+  number is fictional (`+1 555 555-0100`).
 - **`withLocation` is scoping, not authorization, and the check that is authorization
   is `requireLocationAccess` (`src/lib/authz.ts`).** It runs *before* a scope opens and
   resolves one chain: the Clerk session's active org → `organizations.clerk_org_id` →
@@ -498,6 +525,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   orderable. `ENV_FILE=.env.test` seeds the test branch; `-- --hours=always-open` posts
   an around-the-clock **dev** grid (never a restaurant's) so the proof and the suite are
   not stuck behind opening time. Plain `npm run seed:kashi` puts the real hours back.
+- `npm run seed:canary` — the canary's synthetic location (org `serveside-canary`, no
+  Clerk org, open around the clock, one $0.01 dish). Once per database — **production
+  included, before the canary's first tick**, or every run fails "not seeded" and pages
+  us. Runs as `app_user`, not the owner. Re-runnable.
 - `npm run spine:proof` — the end-to-end proof: a real pay-on-pickup order through
   `createOrder`, the real `fanOut` driven with an inline `step`, then it polls
   `print_jobs` and prints the rendered ticket, ending `SPINE OK`. Needs `DATABASE_URL`
@@ -603,14 +634,18 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   transaction on that pooled backend has set it. Policies use
   `nullif(current_setting(...), '')::uuid` for that reason; the bare cast raises
   22P02 on every unscoped query instead of quietly matching nothing.
-- **Exempt from RLS, on purpose and only these five**: `organizations`, `locations`,
+- **Exempt from RLS, on purpose and only these seven**: `organizations`, `locations`,
   `memberships` — the tenancy root, with nothing to scope to until a location exists —
   `webhook_events`, which must be written before anything knows whose event it is
   (the tenant is inside the payload, and scoping to a location read out of an
   unverified body would be scoping to whatever the caller claimed), and
   `printer_probe_events`, whose rows exist *because* `printer_lookup` placed the serial
-  with nobody: there is no tenant to scope to at all. `memberships` is the one worth
-  revisiting; it maps Clerk user ids to orgs.
+  with nobody: there is no tenant to scope to at all — and the two platform alarms'
+  ledgers, `canary_runs` (written before the canary location is looked up, so "not
+  seeded" is a recorded failure) and `payment_failovers` (one Stripe outage is one text
+  an hour for the platform, so its cooldown must see every restaurant). Both hold ids
+  only; `app_user` has SELECT/INSERT/UPDATE and no DELETE. `memberships` is the one
+  worth revisiting; it maps Clerk user ids to orgs.
 - A migration that adds a CHECK validates rows already on the `test` branch, and
   nothing ever deletes them — a RED run that wrote the now-illegal row blocks the
   migration. Delete the offending rows, then migrate.
@@ -620,7 +655,8 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   column and this should follow the cart.
 - Test seeders live in `src/test/seed.ts` (`seedLocation`, `seedLocationWithMenu`,
   `seedBusinessHours`, `seedPaidOrder`, `seedCardOrder`, `seedTicketOrder`,
-  `seedPrinter`, `seedPrintJob`, `linkClerkOrg`, `quietProbeWindow`) — import them;
+  `seedPrinter`, `seedPrintJob`, `linkClerkOrg`, `quietProbeWindow`, `quietCanary`,
+  `quietFailoverAlerts`, `inngestRunId`) — import them;
   don't re-inline a seeder per test file. `seedCardOrder` is the PENDING_PAYMENT /
   REQUIRES_PAYMENT order the Stripe webhook flips; `seedPaidOrder` is the one already at
   NEW / PAID. Slugs must stay unique: nothing tears the test branch down, and `Date.now()`
@@ -629,7 +665,10 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   would only pass on that weekday. **Any test that touches `printer_probe_events` calls
   `quietProbeWindow()` first** — that table is platform-global with nothing to scope to,
   so one file's leftover probes change another file's answers (both the burst count and
-  the route's recording cap read the same ten-minute window).
+  the route's recording cap read the same ten-minute window). `canary_runs` and
+  `payment_failovers` are platform-global the same way: an alarm test starts with
+  `quietCanary()` / `quietFailoverAlerts()`. A canary test seeds its own location with
+  `seedCanary({ orgSlug })` from `scripts/seed-canary.ts`.
 - **Inngest 4 is not the API you remember.** It is
   `createFunction({ id, triggers: { event } }, handler)` — one options object, two
   arguments. The v3 three-argument form throws at import, and `EventSchemas` is gone
@@ -665,9 +704,26 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   `next/server`, which is what keeps that possible. Tests mock the Stripe SDK whole
   (`vi.mock('stripe', ...)` over `vi.hoisted` fns) — no network, and `constructEvent`
   is the seam for a valid vs. forged signature.
+- **Sentry is `src/instrumentation.ts` + `src/instrumentation-client.ts`**, the SDK's
+  current Next 16 files (its build calls `sentry.*.config.ts` deprecated). **Blank DSN =
+  off**: `sentryInitOptions` returns null and nothing is initialised; the browser only
+  `import()`s the SDK when `NEXT_PUBLIC_SENTRY_DSN` is set. **Sentry 11 collects
+  everything by default** — `sendDefaultPii` is gone and its `dataCollection` defaults
+  ship request bodies, cookies, query strings (CloudPRNT's carries the printer MAC) and
+  stack-frame locals — so `DATA_COLLECTION` (`src/lib/sentry-config.ts`) turns each off
+  by name and `beforeSend: scrubEvent` scrubs contact fields and client secrets from what
+  is left. Server code reports a real failure with **`reportError`** (`src/lib/report.ts`:
+  the same `console.error` line plus one Sentry event), not bare `console.error`;
+  uncaught route errors go through `onRequestError`, and an Inngest run that failed for
+  good through `SentryMiddleware` (final attempt only).
+- **Vitest 5 hides console output from passing tests here** (a non-TTY run gets its
+  minimal reporter, `silent: 'passed-only'`), so "no warnings printed" means nothing
+  without `--silent=false --reporter=default`. And a DB-backed test that overruns the 5s
+  default **keeps running after it is failed**, its late calls landing in the next
+  test's mocks — give multi-run tests a timeout (`canary.test.ts` sets one per block).
 - **`scripts/seed-kashi.ts` is the one code path that connects as the owner**, and it
   says why: seeding writes a location's menu before there is a tenant to scope to, so
   `withLocation` would refuse it. It opens its own transaction and sets the GUC itself
   (`ownerScope`), reads `MIGRATION_DATABASE_URL`, and refuses to run as a role RLS
-  binds. Nothing else may copy it — `spine:proof` deliberately goes through the ordinary
-  `app_user` path, which is what keeps the exemption to one file.
+  binds. Nothing else may copy it — `spine:proof` and `seed:canary` deliberately go
+  through the ordinary `app_user` path, which is what keeps the exemption to one file.

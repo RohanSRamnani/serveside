@@ -48,6 +48,7 @@ import { createOrder, OrderRejectedError, type CreateOrderInput, type CreateOrde
 import { fanOut } from '@/inngest/order-created'
 import { inngest } from '@/inngest/client'
 import { formatCents } from '@/lib/money'
+import { syntheticPhone } from '@/lib/synthetic-phone'
 import { KASHI, REAL_HOURS } from './seed-kashi'
 
 /** The restaurant the proof orders from, unless `--location=<uuid>` names another. */
@@ -235,19 +236,10 @@ export type ProofResult = {
 }
 
 /**
- * **A different fake customer every run**, in the 555 area code, which the NANP never
- * assigns — so it is E.164-shaped (`assertInputShape` insists) and cannot ring anyone.
- *
- * It used to be one fixed number, and the unpaid-order cap is what makes that wrong:
- * a proof leaves its order **open** at NEW forever, and nothing tears the test branch
- * or a dev database down, so the eleventh run of the day against one location was
- * refused `unpaid_order_cap` — the proof failing for the one reason that is not a bug.
- * Ten proofs on one number genuinely *is* ten unpaid dinners on one phone; they are
- * separate fake customers, so they get separate fake numbers.
+ * **A different fake customer every run** — `syntheticPhone`, shared with the canary,
+ * which has the same problem for the same reason. See it for why.
  */
-export function proofPhone(): string {
-  return `+1555${String(Date.now()).slice(-7)}`
-}
+export const proofPhone = syntheticPhone
 
 /**
  * Place, fan out, wait for the ticket. The whole spine, minus HTTP.

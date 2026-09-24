@@ -4,7 +4,7 @@ import { menuItems, menuSnapshots, orderPauses } from '@/db/schema'
 import type { MenuSnapshotPayload } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { buildMenuSnapshot } from '@/domain/snapshot'
-import { storefrontView, NoMenuError } from './storefront'
+import { storefrontView, resolveStorefrontSlug, NoMenuError } from './storefront'
 import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
 
 /**
@@ -197,6 +197,18 @@ describe('storefrontView', () => {
 
     await expect(storefrontView(loc.id)).rejects.toBeInstanceOf(NoMenuError)
     expect(await snapshots(loc.id)).toHaveLength(0)
+  })
+
+  it('does not exist for a synthetic location — not by slug, and not by id', async () => {
+    // The canary has a real pinned menu; it is still nobody's storefront. The slug
+    // lookup every public page and endpoint starts from finds nothing, and a caller
+    // that somehow already holds the id gets the same refusal as a menu never pinned.
+    const loc = await seedLocationWithMenu({ synthetic: true, phoneE164: '+15555550100' })
+    await seedBusinessHours(loc.id)
+    await buildMenuSnapshot(loc.id)
+
+    expect(await resolveStorefrontSlug(loc.storefrontSlug)).toBeNull()
+    await expect(storefrontView(loc.id)).rejects.toBeInstanceOf(NoMenuError)
   })
 
   it('shows one restaurant its own menu and never the one next door', async () => {

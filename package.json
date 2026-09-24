@@ -12,11 +12,13 @@
     "db:migrate": "drizzle-kit migrate",
     "db:app-user": "node scripts/create-app-user.mjs",
     "seed:kashi": "tsx scripts/seed-kashi.ts",
+    "seed:canary": "tsx scripts/seed-canary.ts",
     "spine:proof": "tsx scripts/place-test-order.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.9.4",
     "@neondatabase/serverless": "^1.1.0",
+    "@sentry/nextjs": "^11.0.0",
     "@stripe/react-stripe-js": "^6.11.0",
     "@stripe/stripe-js": "^9.17.0",
     "drizzle-orm": "^0.45.2",

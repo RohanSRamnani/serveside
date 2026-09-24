@@ -160,6 +160,14 @@ describe('GET /api/storefront/[location]', () => {
     expect(names).not.toContain('Next Door Curry')
   })
 
+  it('is the ordinary 404 for a synthetic location, pinned menu and all', async () => {
+    // The canary is a real location with a real, orderable, pinned menu — and nothing a
+    // customer can find. Its slug answers exactly like a slug nobody owns: no body, no
+    // cache, no hint that anything is there.
+    const canary = await storefront({ synthetic: true, phoneE164: '+15555550100' })
+    await expectAnonymousMiss(await get(canary.storefrontSlug), 'synthetic location')
+  })
+
   it('writes nothing — a stranger cannot make us pin a menu by asking for one', async () => {
     // The read-only rule at the HTTP boundary. `getOrBuildCurrentSnapshot` exists and
     // is one import away, and used here it would let anyone on the internet write a

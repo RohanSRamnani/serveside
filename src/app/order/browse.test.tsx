@@ -751,6 +751,15 @@ describe('/order/[location]', () => {
     await expect(render(loc.slug)).rejects.toThrow(/NEXT_HTTP_ERROR_FALLBACK;404/)
   })
 
+  it('is a 404 for a synthetic location, even with a menu pinned', async () => {
+    // The canary takes orders through `createOrder` and has a menu to take them from,
+    // but no customer may reach it: the same `notFound()` as a slug nobody owns.
+    const loc = await seedLocationWithMenu({ synthetic: true, phoneE164: '+15555550100' })
+    await seedBusinessHours(loc.id)
+    await buildMenuSnapshot(loc.id)
+    await expect(render(loc.storefrontSlug)).rejects.toThrow(/NEXT_HTTP_ERROR_FALLBACK;404/)
+  })
+
   it('is a 404 for a real restaurant that has not pinned a menu yet', async () => {
     // Same answer as "no such restaurant", on purpose: told apart, the page becomes
     // a way to ask which restaurants exist. The reason is logged, not rendered.

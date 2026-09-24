@@ -393,12 +393,18 @@ async function assess(locationId: string, now: Date): Promise<Due | null> {
     )
     if (lastAlertAt && now.getTime() - lastAlertAt.getTime() < ALERT_COOLDOWN_MS) return null
 
-    const [location] = await tx.select({ name: locations.name, phoneE164: locations.phoneE164 })
+    const [location] = await tx
+      .select({ name: locations.name, phoneE164: locations.phoneE164, synthetic: locations.synthetic })
       .from(locations).where(eq(locations.id, locationId)).limit(1)
     // `locations` is the tenancy root and carries no RLS, so this is a real absence,
     // and a printer row could not exist without it. Thrown rather than skipped: it is
     // a broken invariant, not a quiet restaurant.
     if (!location) throw new Error(`printer heartbeat: location ${locationId} does not exist`)
+    // **A synthetic location (the canary) is never alerted about**, owner or ops. It has
+    // no printer today, so the "no printer" return above already covers it — this is
+    // the check on the flag itself, so a printer row added to it by mistake still rings
+    // nobody. No stamp either: nothing was raised.
+    if (location.synthetic) return null
 
     // The longest-silent unit is the one worth naming; with nothing silent, the alert
     // is about stuck tickets and any printer at the location is the one to name.

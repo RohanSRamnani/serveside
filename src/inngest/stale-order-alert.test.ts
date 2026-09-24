@@ -194,6 +194,30 @@ describe('the stale-order alarm', () => {
     expect(textsTo(OPS_PHONE)).toHaveLength(0)
   })
 
+  it('pages nobody about an order at a synthetic location, and does not even start waiting', async () => {
+    // The canary's orders ride `order/created` like everyone's, so this alarm runs for
+    // every one of them — 288 a day. A synthetic location has no owner to tell, and if
+    // the canary ever failed to cancel its order this must not fall through to *us*
+    // once per order. It returns before the first sleep, so it also costs no timer.
+    const loc = await seedLocationWithMenu({ name: 'Canary', synthetic: true, phoneE164: '+15555550100' })
+    await seedBusinessHours(loc.id)
+    const { order } = await seedPaidOrder(loc.id)
+    const waited: string[] = []
+
+    const result = await escalateStaleOrder({ orderId: order.id, locationId: loc.id }, plainStep(waited))
+
+    expect(result).toEqual({ orderId: order.id, outcome: 'synthetic' })
+    expect(waited).toEqual([])
+    expect(textsTo(loc.phoneE164)).toHaveLength(0)
+    expect(textsTo(OPS_PHONE)).toHaveLength(0)
+
+    // And through the harness: the registered function never asked for a sleep at all.
+    const out = await escalate(order.id, loc.id)
+    expect(failure(out)).toBe('')
+    expect(out.result).toEqual({ orderId: order.id, outcome: 'synthetic' })
+    expect(out.ctx.step.sleep).not.toHaveBeenCalled()
+  })
+
   it('says nothing about an order that is not in the location the event names', async () => {
     // Tenancy by RLS rather than by a WHERE clause: opened against the wrong location
     // the order is simply not there. Texting on the strength of an unreadable order

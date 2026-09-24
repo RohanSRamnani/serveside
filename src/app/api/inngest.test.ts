@@ -55,6 +55,8 @@ describe('/api/inngest', () => {
       'printer-heartbeat',
       'provenance-refused-alert',
       'stale-order-alert',
+      'stripe-outage-alert',
+      'synthetic-canary-order',
       'unsnooze-expired-86s',
     ])
   })
@@ -76,5 +78,14 @@ describe('/api/inngest', () => {
 
     expect(printerHeartbeat.opts.triggers).toEqual([{ cron: HEARTBEAT_CRON }])
     expect(provenanceRefused.opts.triggers).toEqual([{ event: PROVENANCE_REFUSED }])
+  })
+
+  it('runs the canary on its schedule and the Stripe-outage alarm on the event the route sends', async () => {
+    const { STRIPE_OUTAGE } = await import('@/inngest/client')
+    const { canary, CANARY_SCHEDULE } = await import('@/inngest/canary')
+    const { stripeOutageAlert } = await import('@/inngest/stripe-outage-alert')
+
+    expect(canary.opts.triggers).toEqual([{ cron: CANARY_SCHEDULE }])
+    expect(stripeOutageAlert.opts.triggers).toEqual([{ event: STRIPE_OUTAGE }])
   })
 })

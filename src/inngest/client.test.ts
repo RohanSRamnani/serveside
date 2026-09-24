@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { inngest, sendOrderCreated, ORDER_CREATED } from './client'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import {
+  inngest, sendOrderCreated, sendProvenanceRefused, sendStripeOutage,
+  ORDER_CREATED, STRIPE_OUTAGE, INNGEST_SEND_TIMEOUT_MS,
+} from './client'
+import { SentryMiddleware } from './sentry-middleware'
 
 /**
  * `sendOrderCreated` is three lines, and every one of them is an obligation the
@@ -73,5 +77,76 @@ describe('sendOrderCreated', () => {
     await expect(
       sendOrderCreated('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'),
     ).rejects.toThrow('inngest is down')
+  })
+})
+
+/**
+ * **Every send is bounded**, and the bound lives here rather than at each caller.
+ *
+ * `POST /api/orders` sends after the order has committed and has `maxDuration = 60`: a
+ * send that hangs gets the function killed, and the customer is told nothing was
+ * ordered for an order that exists — so they order again. Bounded, a hang becomes the
+ * ordinary thrown failure every caller already handles: the route logs it and answers
+ * 200, the Stripe webhook releases its claim and answers 5xx so Stripe retries into the
+ * re-fire path, and the canary records it as a failure.
+ */
+describe('the bounded send', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('is a few seconds — well inside the order route’s budget', () => {
+    expect(INNGEST_SEND_TIMEOUT_MS).toBe(5_000)
+  })
+
+  it('turns a send that never answers into a thrown failure', async () => {
+    vi.useFakeTimers()
+    send.mockImplementation(() => new Promise(() => {}))
+
+    const hung = sendOrderCreated('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222')
+    const settled = expect(hung).rejects.toThrow(/order\/created.*did not settle within 5000ms/)
+    await vi.advanceTimersByTimeAsync(INNGEST_SEND_TIMEOUT_MS)
+    await settled
+  })
+
+  it('bounds the provenance alarm and the Stripe-outage alarm the same way', async () => {
+    vi.useFakeTimers()
+    send.mockImplementation(() => new Promise(() => {}))
+
+    const provenance = sendProvenanceRefused({
+      orderId: '11111111-1111-4111-8111-111111111111',
+      locationId: '22222222-2222-4222-8222-222222222222',
+      reason: 'account_mismatch',
+    }, 'evt_1')
+    const outage = sendStripeOutage('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222')
+    const both = Promise.all([
+      expect(provenance).rejects.toThrow(/did not settle/),
+      expect(outage).rejects.toThrow(/did not settle/),
+    ])
+    await vi.advanceTimersByTimeAsync(INNGEST_SEND_TIMEOUT_MS)
+    await both
+  })
+})
+
+describe('sendStripeOutage', () => {
+  it('sends ids only, keyed on the order so one conversion is one event', async () => {
+    await sendStripeOutage('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222')
+
+    expect(send).toHaveBeenCalledWith({
+      name: STRIPE_OUTAGE,
+      data: {
+        orderId: '11111111-1111-4111-8111-111111111111',
+        locationId: '22222222-2222-4222-8222-222222222222',
+      },
+      id: 'stripe-outage-11111111-1111-4111-8111-111111111111',
+    })
+  })
+})
+
+describe('the client', () => {
+  it('reports every failed run to Sentry through its middleware', () => {
+    // Inngest catches a function's errors itself and reports them to the orchestrator,
+    // so Next's `onRequestError` never sees them. The middleware is how they reach us.
+    expect(inngest.middleware).toContain(SentryMiddleware)
   })
 })

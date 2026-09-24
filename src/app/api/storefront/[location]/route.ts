@@ -1,5 +1,6 @@
 import { withLocation } from '@/repo/scoped'
 import { storefrontView, NoMenuError, resolveStorefrontSlug } from '@/domain/storefront'
+import { reportError } from '@/lib/report'
 
 /**
  * The menu, to anyone who asks. No session, no key, nothing to prove — a customer
@@ -72,7 +73,7 @@ export async function GET(
     // Opaque, and 500 rather than a miss: a database that is down must not be
     // reported to a customer as "this restaurant does not exist", and must not be
     // cached as one either.
-    console.error('[GET /api/storefront] failed for', slug, err)
+    reportError('[GET /api/storefront] failed for', slug, err)
     return serverError()
   }
 }

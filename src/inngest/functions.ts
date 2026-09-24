@@ -4,6 +4,8 @@ import { unsnooze } from './unsnooze'
 import { staleOrderAlert } from './stale-order-alert'
 import { printerHeartbeat } from './printer-heartbeat'
 import { provenanceRefused } from './provenance-refused'
+import { canary } from './canary'
+import { stripeOutageAlert } from './stripe-outage-alert'
 
 /**
  * Every Inngest function this app serves.
@@ -16,9 +18,10 @@ import { provenanceRefused } from './provenance-refused'
  * It lives here rather than inline in `src/app/api/inngest/route.ts` so a test can
  * read it. A route module may only export the handlers Next knows about.
  *
- * **Three of these five are alarms**, which makes the point above sharper rather than
+ * **Five of these seven are alarms**, which makes the point above sharper rather than
  * softer: an unregistered alarm is indistinguishable from an alarm that has nothing to
- * report. `src/app/api/inngest.test.ts` pins this list by name for that reason.
+ * report — and the canary, the one that proves the others' path still works, is a cron
+ * with no event to go missing. `src/app/api/inngest.test.ts` pins this list by name.
  */
 export const functions: InngestFunction.Any[] = [
   orderCreated,
@@ -26,4 +29,6 @@ export const functions: InngestFunction.Any[] = [
   unsnooze,
   printerHeartbeat,
   provenanceRefused,
+  canary,
+  stripeOutageAlert,
 ]

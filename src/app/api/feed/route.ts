@@ -1,5 +1,6 @@
 import { requireLocationAccess, deniedResponse } from '@/lib/authz'
 import { readFeed } from '@/domain/feed'
+import { reportError } from '@/lib/report'
 
 /**
  * The kitchen board. One tablet, one restaurant, polled every five seconds for as
@@ -43,7 +44,7 @@ export async function GET(req: Request): Promise<Response> {
   } catch (err) {
     // Opaque: the body of a 500 is the one place a connection string, a table name or
     // another tenant's id leaks to whoever asked.
-    console.error('[GET /api/feed] failed for location', access.location.id, err)
+    reportError('[GET /api/feed] failed for location', access.location.id, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 }

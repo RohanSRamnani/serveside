@@ -7,6 +7,7 @@ import { quotedReadyAtFrom, transition } from '@/domain/order-status'
 import { stripe } from '@/lib/stripe'
 import { env } from '@/lib/env'
 import { sendOrderCreated, sendProvenanceRefused, type ProvenanceRefusal } from '@/inngest/client'
+import { reportError } from '@/lib/report'
 
 /**
  * Where a card order becomes the kitchen's problem.
@@ -65,7 +66,7 @@ export async function POST(req: Request): Promise<Response> {
     client = stripe()
     signingSecret = env('STRIPE_WEBHOOK_SECRET')
   } catch (err) {
-    console.error('[stripe webhook] MISCONFIGURED — cannot verify any delivery:', err)
+    reportError('[stripe webhook] MISCONFIGURED — cannot verify any delivery:', err)
     return Response.json({ error: 'webhook_misconfigured' }, { status: 500 })
   }
 
@@ -93,7 +94,7 @@ export async function POST(req: Request): Promise<Response> {
     // already NEW and holds this intent, which is the `re-fired` branch below: it is
     // how a fan-out that failed here (the most likely reason to be in this catch)
     // eventually reaches a kitchen.
-    console.error('[stripe webhook] handling failed, releasing claim:', event.id, err)
+    reportError('[stripe webhook] handling failed, releasing claim:', event.id, err)
     await release(event.id)
     return Response.json({ error: 'handler_failed' }, { status: 500 })
   }
@@ -122,7 +123,7 @@ async function release(externalId: string): Promise<void> {
   try {
     await db().delete(webhookEvents).where(eq(webhookEvents.externalId, externalId))
   } catch (err) {
-    console.error('[stripe webhook] could not release claim on', externalId, err)
+    reportError('[stripe webhook] could not release claim on', externalId, err)
   }
 }
 
@@ -185,7 +186,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
   // Shape-checked before they reach a query: a malformed uuid is a 22P02 that poisons
   // the transaction, and `withLocation` refuses one outright.
   if (!isUuid(orderId) || !isUuid(locationId)) {
-    console.error('[stripe webhook] succeeded intent without usable metadata:', intent.id, intent.metadata)
+    reportError('[stripe webhook] succeeded intent without usable metadata:', intent.id, intent.metadata)
     return
   }
 
@@ -202,7 +203,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     // RLS filters rather than raising, so an order belonging to another location reads
     // as "not there" — which is exactly the right answer, and not a 500.
     if (!order) {
-      console.error('[stripe webhook] no order', orderId, 'in location', locationId, 'for intent', intent.id)
+      reportError('[stripe webhook] no order', orderId, 'in location', locationId, 'for intent', intent.id)
       return { outcome: 'nothing-to-do' }
     }
     // `locations` is not under RLS, and is read on `tx` so the prep time that makes the
@@ -228,7 +229,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     // connected account instead, `account` is absent and every flip becomes a no-op —
     // loudly logged, per the config-fault discipline at the top of this file.
     if (event.account !== location.stripeAccountId) {
-      console.error(
+      reportError(
         '[stripe webhook] intent', intent.id, 'originated on account', event.account,
         'but location', locationId, 'banks with', location.stripeAccountId, '— refusing to flip',
       )
@@ -242,7 +243,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     // 2. The amount paid must be the amount owed. Cheap, and it is the check that
     //    turns "wrong payment" into "no payment" rather than a free dinner.
     if (intent.amount !== order.totalCents) {
-      console.error(
+      reportError(
         '[stripe webhook] intent', intent.id, 'paid', intent.amount,
         'but order', orderId, 'totals', order.totalCents, '— refusing to flip',
       )
@@ -258,7 +259,7 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
     //    and is logged; paging an ops phone for it would be paging ourselves about a
     //    customer who tapped Pay twice.
     if (order.stripePaymentIntentId && order.stripePaymentIntentId !== intent.id) {
-      console.error(
+      reportError(
         '[stripe webhook] order', orderId, 'holds intent', order.stripePaymentIntentId,
         'but the event is about', intent.id, '— refusing to flip',
       )

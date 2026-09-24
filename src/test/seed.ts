@@ -12,7 +12,7 @@ import { db } from '@/db/client'
 import {
   organizations, locations, menus, menuCategories, menuItems,
   modifierGroups, modifierOptions, itemModifierGroups, businessHours, orders, orderEvents,
-  printers, printJobs,
+  printers, printJobs, canaryRuns,
 } from '@/db/schema'
 import type { Location, Order, OrderItem, Printer, PrintJob } from '@/db/schema'
 import { eq, sql } from 'drizzle-orm'
@@ -311,6 +311,47 @@ export async function quietProbeWindow(): Promise<void> {
   await db().execute(sql`
     update printer_probe_events
     set last_seen_at = now() - interval '2 hours', alerted_at = null`)
+}
+
+/**
+ * Puts the canary's alarm history back to "healthy, and nobody has been texted lately".
+ *
+ * `canary_runs` is **platform-global** like `printer_probe_events`, and the canary's
+ * alarm reads it globally: "was the run before this one a failure" and "has anything
+ * texted in the last hour". Every test that ever ran a canary left rows behind, so an
+ * alerting test starts here:
+ *
+ * - every stamped alert is aged two hours back, so the cooldown is clear;
+ * - one finished `confirmed` run is written as the newest, so the next failure is the
+ *   *first* in a row, not the second.
+ *
+ * UPDATE and INSERT only — `app_user` has no DELETE on the table, and nothing needs it.
+ * Safe because the suite is serial.
+ */
+export async function quietCanary(): Promise<void> {
+  await db().execute(sql`
+    update canary_runs set alerted_at = alerted_at - interval '2 hours'
+    where alerted_at is not null and alerted_at > now() - interval '2 hours'`)
+  await db().insert(canaryRuns).values({
+    inngestRunId: unique('test-healthy-run'),
+    outcome: 'confirmed',
+    finishedAt: new Date(),
+  })
+}
+
+/**
+ * Clears the Stripe-outage alarm's cooldown: every stamped `payment_failovers` row is
+ * aged two hours back. Platform-global for the same reason `canary_runs` is.
+ */
+export async function quietFailoverAlerts(): Promise<void> {
+  await db().execute(sql`
+    update payment_failovers set alerted_at = alerted_at - interval '2 hours'
+    where alerted_at is not null and alerted_at > now() - interval '2 hours'`)
+}
+
+/** An Inngest run id shaped like a real one, unique per call. */
+export function inngestRunId(): string {
+  return unique('01JTESTRUN')
 }
 
 /** A MAC in Star's OUI (`00:11:62`), unique per call. */

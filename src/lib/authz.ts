@@ -109,6 +109,9 @@ export async function requireLocationAccess(locationSlug: string | null | undefi
       deliveryEnabled: locations.deliveryEnabled,
       stripeAccountId: locations.stripeAccountId,
       status: locations.status,
+      // Carried for the same reason, and never true here in practice: a synthetic
+      // location (the canary) has no Clerk org, so no session can resolve it.
+      synthetic: locations.synthetic,
       createdAt: locations.createdAt,
     })
     .from(locations)

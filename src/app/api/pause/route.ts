@@ -2,6 +2,7 @@ import { and, eq, gt } from 'drizzle-orm'
 import { orderPauses } from '@/db/schema'
 import { requireLocationAccess, deniedResponse } from '@/lib/authz'
 import { withLocation } from '@/repo/scoped'
+import { reportError } from '@/lib/report'
 
 /**
  * "We're slammed — stop taking orders." One tap, with a length on it.
@@ -64,7 +65,7 @@ export async function POST(req: Request): Promise<Response> {
       createdBy: access.userId,
     }))
   } catch (err) {
-    console.error('[POST /api/pause] failed for location', access.location.id, err)
+    reportError('[POST /api/pause] failed for location', access.location.id, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 
@@ -93,7 +94,7 @@ export async function DELETE(req: Request): Promise<Response> {
       .returning({ id: orderPauses.id }))
     return Response.json({ paused: false, resumed: resumed.length })
   } catch (err) {
-    console.error('[DELETE /api/pause] failed for location', access.location.id, err)
+    reportError('[DELETE /api/pause] failed for location', access.location.id, err)
     return Response.json({ error: 'server_error' }, { status: 500 })
   }
 }

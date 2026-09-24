@@ -172,18 +172,24 @@ async function queuePrintJob(
  * nuisance; a duplicate ticket is food. Gating the text on the print job's existence
  * would couple the two legs — the one thing this function may not do.
  *
+ * **Nobody is texted for a synthetic location** (`locations.synthetic` — the canary).
+ * Its orders run this fan-out for real, because the ticket the other leg queues is what
+ * the canary checks for; there is simply no owner to tell. Checked here, inside the leg,
+ * rather than by skipping the step, so the fan-out's shape is the same for every order.
+ *
  * Returns nothing: step output is stored by Inngest, and a phone number in it is our
  * customer's restaurant sitting in a third party's dashboard for no reason.
  */
 async function smsOwner(orderId: string, locationId: string): Promise<void> {
-  const { shortCode, totalCents, phoneE164 } = await withLocation(locationId, async (tx) => {
+  const { shortCode, totalCents, phoneE164, synthetic } = await withLocation(locationId, async (tx) => {
     // The lines are not needed here, so this is the cheap read — `getById`, not
     // `getWithItems`.
     const order = await ordersRepo(tx).getById(orderId)
     if (!order) throw missing(orderId, locationId)
-    const { phoneE164 } = await locationFor(tx, locationId)
-    return { shortCode: order.shortCode, totalCents: order.totalCents, phoneE164 }
+    const { phoneE164, synthetic } = await locationFor(tx, locationId)
+    return { shortCode: order.shortCode, totalCents: order.totalCents, phoneE164, synthetic }
   })
+  if (synthetic) return
 
   // `formatCents`, never `totalCents / 100`: money is integer cents in this repo and
   // a float divide is a second, lossy opinion on a number that was already exact.
@@ -196,15 +202,20 @@ async function smsOwner(orderId: string, locationId: string): Promise<void> {
 }
 
 /**
- * The two things the fan-out needs from the location itself: the wall clock a ticket
- * prints in, and the phone a text goes to. Neither is on the order row.
+ * What the fan-out needs from the location itself: the wall clock a ticket prints in,
+ * the phone a text goes to, and whether there is anybody behind that phone at all
+ * (`synthetic`). None of it is on the order row.
  *
  * `locations` is not under RLS, but this reads it on the scoped `tx` anyway, so the
  * timezone a ticket is stamped with and the order it was rendered from come out of one
  * consistent view of the database.
  */
-async function locationFor(tx: ScopedTx, locationId: string): Promise<{ timezone: string; phoneE164: string }> {
-  const [location] = await tx.select({ timezone: locations.timezone, phoneE164: locations.phoneE164 })
+async function locationFor(
+  tx: ScopedTx,
+  locationId: string,
+): Promise<{ timezone: string; phoneE164: string; synthetic: boolean }> {
+  const [location] = await tx
+    .select({ timezone: locations.timezone, phoneE164: locations.phoneE164, synthetic: locations.synthetic })
     .from(locations).where(eq(locations.id, locationId)).limit(1)
   if (!location) throw new NonRetriableError(`order/created names location ${locationId}, which does not exist`)
   return location

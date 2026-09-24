@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
 import type { GetStepTools } from 'inngest'
 import type { inngest as inngestClient } from '@/inngest/client'
-import { orders, orderEvents, menus, printJobs } from '@/db/schema'
+import { orders, orderEvents, menus, printJobs, paymentFailovers } from '@/db/schema'
+import { db } from '@/db/client'
 import { withLocation } from '@/repo/scoped'
 import {
   CAP_PHONE, seedLocationWithMenu, seedBusinessHours, seedUnpaidPickupOrders, type SeededMenu,
@@ -51,15 +52,27 @@ vi.mock('stripe', () => ({
  * same module, and a factory exporting only `sendOrderCreated` would take the client
  * away from it.
  */
-const { sendOrderCreated, sendSms } = vi.hoisted(() => ({
+const { sendOrderCreated, sendStripeOutage, sendSms } = vi.hoisted(() => ({
   sendOrderCreated: vi.fn(),
+  sendStripeOutage: vi.fn(),
   sendSms: vi.fn(),
 }))
 vi.mock('@/inngest/client', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/inngest/client')>(),
   sendOrderCreated,
+  sendStripeOutage,
 }))
 vi.mock('@/lib/sms', () => ({ sendSms }))
+
+/**
+ * Sentry, mocked at the SDK boundary so a test can see what this route reports. The real
+ * SDK is never initialised in the suite (no DSN), so unmocked these would be no-ops.
+ */
+const { captureException, captureMessage } = vi.hoisted(() => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}))
+vi.mock('@sentry/nextjs', () => ({ captureException, captureMessage }))
 
 const { POST, maxDuration } = await import('./orders/route')
 const { default: StatusPage } = await import('@/app/order/[location]/status/[orderId]/page')
@@ -134,6 +147,7 @@ beforeEach(() => {
     id: currentIntentId, client_secret: `${currentIntentId}_secret_abc`,
   })
   sendOrderCreated.mockResolvedValue(['01JEVENTID'])
+  sendStripeOutage.mockResolvedValue(['01JOUTAGEID'])
   sendSms.mockResolvedValue(undefined)
   vi.stubEnv('FEED_URL', 'https://serveside.test/feed')
 })
@@ -277,6 +291,59 @@ describe('POST /api/orders', () => {
       const { orderId } = await res.json()
       expect((await readOrder(loc.id, orderId)).status).toBe('NEW')
       expect(error.mock.calls.flat().join(' ')).toMatch(/inngest is down/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('answers 200 within the send bound when the announcement hangs, and says which order', async () => {
+    // A hung Inngest send used to be awaited with no limit, and the route has
+    // `maxDuration = 60`: killed mid-send, the customer is told nothing was ordered for
+    // an order that is already on the kitchen's board — so they order it again. The
+    // real, bounded `sendOrderCreated` runs here against a send that never answers.
+    const loc = await openRestaurant({ stripeAccountId: null })
+    const actual = await vi.importActual<typeof import('@/inngest/client')>('@/inngest/client')
+    sendOrderCreated.mockImplementation(actual.sendOrderCreated)
+    const hung = vi.spyOn(actual.inngest, 'send').mockImplementation(() => new Promise(() => {}))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      const started = Date.now()
+      const res = await post(cartFor(loc, { payment: 'pay_on_pickup' }))
+      const elapsed = Date.now() - started
+
+      expect(res.status).toBe(200)
+      const { orderId } = await res.json()
+      // It really did wait on the hung send, and gave up at the bound — not at the
+      // platform's kill.
+      expect(hung).toHaveBeenCalled()
+      expect(elapsed).toBeGreaterThanOrEqual(actual.INNGEST_SEND_TIMEOUT_MS)
+      expect(elapsed).toBeLessThan(actual.INNGEST_SEND_TIMEOUT_MS + 15_000)
+      expect((await readOrder(loc.id, orderId)).status).toBe('NEW')
+
+      const logged = error.mock.calls.flat().map(String).join(' ')
+      expect(logged).toContain(orderId)
+      expect(logged).toMatch(/could not be announced/)
+      expect(logged).toMatch(/did not settle within 5000ms/)
+    } finally {
+      hung.mockRestore()
+      error.mockRestore()
+    }
+  }, 30_000)
+
+  it('sends every failed announcement to Sentry, not only to the log', async () => {
+    const loc = await openRestaurant({ stripeAccountId: null })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const cause = new Error('inngest is down')
+    sendOrderCreated.mockRejectedValueOnce(cause)
+
+    try {
+      const res = await post(cartFor(loc, { payment: 'pay_on_pickup' }))
+      expect(res.status).toBe(200)
+      const { orderId } = await res.json()
+      expect(captureException).toHaveBeenCalledWith(cause, {
+        extra: { log: expect.stringContaining(orderId) },
+      })
     } finally {
       error.mockRestore()
     }
@@ -544,6 +611,65 @@ describe('POST /api/orders — pay-at-pickup failover when Stripe is down', () =
     })
   }
 
+  it('writes the conversion down for the outage alarm, raises it, and reports it to Sentry', async () => {
+    // Until now a Stripe outage left one `console.error` per converted order and nothing
+    // else. Every conversion now leaves a `payment_failovers` row (written in the
+    // conversion's own transaction), sends the alarm its ids, and is one Sentry event.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const cause = new stripeErrors.StripeAPIError({ message: 'api down', statusCode: 503 })
+    paymentIntentsCreate.mockRejectedValueOnce(cause)
+
+    let body: { orderId: string; paidAtPickup?: boolean }
+    try {
+      body = await (await post(cartFor(loc))).json()
+    } finally {
+      error.mockRestore()
+    }
+    expect(body.paidAtPickup).toBe(true)
+
+    const [failover] = await db().select().from(paymentFailovers)
+      .where(eq(paymentFailovers.orderId, body.orderId))
+    expect(failover).toMatchObject({ orderId: body.orderId, locationId: loc.id, alertedAt: null })
+
+    // Ids only — an event payload lives in Inngest's dashboard.
+    expect(sendStripeOutage).toHaveBeenCalledTimes(1)
+    expect(sendStripeOutage).toHaveBeenCalledWith(body.orderId, loc.id)
+
+    expect(captureException).toHaveBeenCalledWith(cause, {
+      extra: { log: expect.stringContaining(body.orderId) },
+    })
+  })
+
+  it('still answers 200 when the outage alarm cannot be raised', async () => {
+    // Best-effort, like the announcement beside it: the order is committed and the
+    // customer's answer does not depend on whether our pager could be reached.
+    const loc = await openRestaurant()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    paymentIntentsCreate.mockRejectedValueOnce(new stripeErrors.StripeConnectionError({ message: 'down' }))
+    sendStripeOutage.mockRejectedValueOnce(new Error('inngest is down'))
+
+    try {
+      const res = await post(cartFor(loc))
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.paidAtPickup).toBe(true)
+      expect(sendOrderCreated).toHaveBeenCalledWith(body.orderId, loc.id)
+      expect(error.mock.calls.flat().map(String).join(' ')).toMatch(/outage alarm/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('writes no conversion row for a card order that went through', async () => {
+    const loc = await openRestaurant()
+    const res = await post(cartFor(loc))
+    expect(res.status).toBe(200)
+    const { orderId } = await res.json()
+    expect(await db().select().from(paymentFailovers).where(eq(paymentFailovers.orderId, orderId))).toEqual([])
+    expect(sendStripeOutage).not.toHaveBeenCalled()
+  })
+
   it('lands the customer on a status page that says to pay at the counter', async () => {
     // The checkout's sentence is on screen for a moment; the status page is the screen
     // the customer keeps, and the one they will have open walking in. Somebody who
@@ -705,6 +831,13 @@ describe('POST /api/orders — the time budget', () => {
   it('lets the route outlive Stripe’s worst case, with room for the rest of the request', () => {
     expect(typeof maxDuration).toBe('number')
     expect(maxDuration * 1000).toBeGreaterThan(INTENT_WORST_CASE_MS + ROUTE_ALLOWANCE_MS)
+  })
+
+  it('bounds the Inngest sends inside that allowance', async () => {
+    // The announcement and the outage alarm go out together after a conversion, so
+    // their shared bound is one slice of the allowance, not two.
+    const { INNGEST_SEND_TIMEOUT_MS } = await vi.importActual<typeof import('@/inngest/client')>('@/inngest/client')
+    expect(INNGEST_SEND_TIMEOUT_MS).toBeLessThan(ROUTE_ALLOWANCE_MS)
   })
 
   it('declares maxDuration as a bare numeric literal, because Next reads it without running it', () => {

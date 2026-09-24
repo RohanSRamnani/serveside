@@ -2,6 +2,7 @@ import { and, eq } from 'drizzle-orm'
 import { orders } from '@/db/schema'
 import { isUuid, withLocation } from '@/repo/scoped'
 import { resolveStorefrontSlug } from '@/domain/storefront'
+import { reportError } from '@/lib/report'
 
 /**
  * `GET /api/orders/[id]/status?location=<storefront slug>` — the one thing a
@@ -93,7 +94,7 @@ export async function GET(
     // Opaque, and 500 rather than a miss: a database that is down must not be
     // reported to a customer as "this order does not exist", and must not be
     // cached as one either.
-    console.error('[GET /api/orders/:id/status] failed for', id, err)
+    reportError('[GET /api/orders/:id/status] failed for', id, err)
     return serverError()
   }
 }

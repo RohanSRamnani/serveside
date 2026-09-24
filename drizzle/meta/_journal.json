@@ -155,6 +155,13 @@
       "when": 1790118720198,
       "tag": "0021_order_sms_consent",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790219373953,
+      "tag": "0022_synthetic_canary_and_payment_failovers",
+      "breakpoints": true
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { NonRetriableError, type GetStepTools } from 'inngest'
 import { eq } from 'drizzle-orm'
+import { db } from '@/db/client'
 import { locations } from '@/db/schema'
 import { withLocation, isUuid } from '@/repo/scoped'
 import { ordersRepo } from '@/repo/orders-repo'
@@ -68,9 +69,10 @@ const OPS_MINUTES = 10
 
 /**
  * What one escalation came to. `no-longer-new` is the ordinary ending: somebody
- * tapped Accept.
+ * tapped Accept. `synthetic` is an order at a location nobody runs (the canary's), which
+ * is never escalated at all.
  */
-export type StaleOrderOutcome = 'no-longer-new' | 'closed' | 'gone' | 'owner-paged' | 'ops-paged'
+export type StaleOrderOutcome = 'no-longer-new' | 'closed' | 'gone' | 'owner-paged' | 'ops-paged' | 'synthetic'
 
 export type StaleOrderResult = { orderId: string; outcome: StaleOrderOutcome }
 
@@ -98,6 +100,15 @@ export async function escalateStaleOrder(
 ): Promise<StaleOrderResult> {
   const { orderId, locationId } = staleTarget(data)
 
+  // **A synthetic location is never escalated, and we find out before the first sleep.**
+  // The canary's orders ride `order/created` like everyone's — 288 a day — and there is
+  // no owner to text; worse, if the canary ever failed to cancel one, the second leg
+  // would page *us* once per order, every five minutes. Returning here also costs no
+  // timer and no step. It is a plain read rather than a step on purpose: a step would
+  // be one more Inngest execution for every real order to save none, and the flag does
+  // not change under a running escalation, so a re-read on each resumption is safe.
+  if (await isSynthetic(locationId)) return { orderId, outcome: 'synthetic' }
+
   await step.sleep('wait-for-accept', ACCEPT_GRACE)
   const first = await step.run('page-the-restaurant', () => page(orderId, locationId, 'owner'))
   // Anything but a page means the alarm is over: accepted, cancelled, closed, or an
@@ -107,6 +118,17 @@ export async function escalateStaleOrder(
 
   await step.sleep('wait-for-ops', OPS_ESCALATION)
   return { orderId, outcome: await step.run('page-ops', () => page(orderId, locationId, 'ops')) }
+}
+
+/**
+ * Whether this location is one nobody runs. A location that does not exist is not
+ * synthetic: the legs below then find the order `gone`, which is the answer for that.
+ * `locations` is the tenancy root and carries no RLS, so the stateless driver reads it.
+ */
+async function isSynthetic(locationId: string): Promise<boolean> {
+  const [location] = await db().select({ synthetic: locations.synthetic })
+    .from(locations).where(eq(locations.id, locationId)).limit(1)
+  return location?.synthetic ?? false
 }
 
 /**
