@@ -1,4 +1,5 @@
 import { env } from '@/lib/env'
+import { outboundLive } from '@/lib/outbound'
 
 /**
  * One text message, over Twilio's REST API.
@@ -33,6 +34,13 @@ const E164 = /^\+[1-9]\d{1,14}$/
 
 export async function sendSms(to: string, body: string): Promise<void> {
   if (!E164.test(to)) throw new Error(`sendSms: not an E.164 number: ${JSON.stringify(to)}`)
+
+  // After the E.164 check, so dev still catches a bad number. Last 4 digits only: a
+  // dev log is not a place for a restaurant owner's phone number.
+  if (!outboundLive('sms')) {
+    console.log(`[sms:dry-run] to=${to.slice(-4)} body=${body.slice(0, 40)}`)
+    return
+  }
 
   const accountSid = env('TWILIO_ACCOUNT_SID')
   const authToken = env('TWILIO_AUTH_TOKEN')

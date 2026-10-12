@@ -90,7 +90,7 @@ export async function POST(req: Request): Promise<Response> {
   try {
     const location = await readLocation(input.locationId)
     const { clientSecret, paymentIntentId } = await createPaymentIntentFor(
-      { id: order.orderId, locationId: input.locationId, totalCents: order.totalCents },
+      { id: order.orderId, locationId: input.locationId, totalCents: order.totalCents, contactEmail: input.contact.email },
       location,
     )
     // Written back immediately: it is how the webhook proves the event it is handed

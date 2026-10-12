@@ -174,7 +174,7 @@ export const INTENT_WORST_CASE_MS =
   + Math.max(INTENT_MAX_NETWORK_RETRIES, 1) * SDK_MAX_RETRY_DELAY_MS
 
 /** Only the fields the intent is built from — a whole order row satisfies it. */
-export type PayableOrder = { id: string; locationId: string; totalCents: number }
+export type PayableOrder = { id: string; locationId: string; totalCents: number; contactEmail?: string | null }
 export type PayeeLocation = { id: string; stripeAccountId: string | null }
 
 /**
@@ -207,6 +207,9 @@ export async function createPaymentIntentFor(
     currency: 'usd',
     automatic_payment_methods: { enabled: true },
     metadata: { orderId: order.id, locationId: order.locationId },
+    // Stripe's own receipt, sent from the restaurant's account (this is a direct
+    // charge). Only when the diner gave an address; omitted, Stripe sends nothing.
+    ...(order.contactEmail ? { receipt_email: order.contactEmail } : {}),
   }, {
     // THE mechanism. `stripeContext` is the SDK's newer spelling of the same header;
     // swap when it is no longer merely preferred.

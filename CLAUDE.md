@@ -95,9 +95,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   on the way back in; `shouldPersist(store, slug)` is the one decision about whether a
   write is safe, and it is tested. `cart-drawer.tsx` is the cart opened — lines with
   steppers (at qty 1 the minus *removes*), subtotal/tax/**estimated total**, and the
-  Checkout button, which is enabled exactly when `view.open.open` is true and
-  otherwise disabled beside `closedNotice`'s own sentence, handed down rather than
-  rewritten. Its CSS ships beside it (`CART_CSS`) and is concatenated into
+  Checkout button, which is enabled exactly when `orderingNotice` returns null and
+  otherwise disabled beside its sentence, handed down rather than rewritten.
+  `orderingNotice` asks `view.mode` first (`demo` · `off` = `status` not `active` or
+  `pickup_enabled` false · `live`), then the clock via `closedNotice`, which prints
+  the resume time from `view.pausedUntil`. A demo also disables Add to order. Its CSS ships beside it (`CART_CSS`) and is concatenated into
   `browse.tsx`'s one `<style>` — see Gotchas. **Both panels share
   `useDismissablePanel`** (Escape + the scroll lock), and the lock is
   **reference-counted** (`panel-lock.ts`, pure and tested): a save/restore pair per
@@ -144,7 +146,7 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
   into 334.999…. `Cart.hydrated` exists for this page: the cart is read from
   `localStorage` in an effect, so "no dishes" and "not read yet" have to be different
   renders or a real cart flashes "your order is empty". `shell-css.ts` (the `.ss`
-  tokens) and `storefront-copy.ts` (`closedNotice`, `formatServiceWindows`,
+  tokens) and `storefront-copy.ts` (`orderingNotice`, `closedNotice`, `formatServiceWindows`,
   `formatPhone`, `quoteLabel`, the hrefs) are shared by both pages so one shut kitchen
   is one sentence — and `storefront-copy.ts` carries no `'use client'` **because the
   page calls `quoteLabel` on the server**; see Gotchas.
@@ -557,9 +559,29 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - `.env.local` is the Neon `main` branch, `.env.test` is the `test` branch. Both are
   gitignored — do not commit `.env.test` even though the Next docs say to; it holds a
   live connection string. `TWILIO_*` are deliberately **absent** from `.env.test`,
-  unlike the Stripe placeholders: the suite mocks `sendSms`, so a test that reaches the
-  real one has forgotten to — and with no credentials that is a loud `env()` throw
-  instead of a text message sent from CI.
+  unlike the Stripe placeholders. Off production a real `sendSms` is a logged dry run
+  anyway (`outboundLive`, below), so the suite cannot text anyone; a test that wants
+  the Twilio call sets `OUTBOUND_FORCE_LIVE_SMS=1`.
+- **Outbound: SMS and email send only in production.** `outboundLive(channel)`
+  (`src/lib/outbound.ts`) is true when `VERCEL_ENV=production`, or that channel's own
+  flag is `1` (`OUTBOUND_FORCE_LIVE_SMS`, `OUTBOUND_FORCE_LIVE_EMAIL` — separate, so an
+  email test never texts an owner). Otherwise `sendSms` logs `[sms:dry-run]` (last 4
+  digits) and `sendEmail` (`src/lib/email.ts`, Resend: `RESEND_API_KEY`,
+  `EMAIL_FROM_ADDRESS`) logs `[email:dry-run]` with the **full text body** — that is how
+  you read a login code locally. Both still throw on a real failure so Inngest retries.
+- **Storefront pages are noindexed unless they are an active restaurant on its own
+  address** (`storefrontIndexable`: `status = 'active'` + the `x-tenant-custom-host`
+  header, which only the host-routing proxy may set). `next.config.ts` also sends
+  `X-Robots-Tag: noindex, nofollow` on `/order/*` (config headers match the path as
+  it arrived, before the proxy). A demo's menu must never be found on our address.
+- `createOrder` refuses `pickup_enabled = false` with
+  `LocationInactiveError(id, 'ordering_off')` (422, like any rejection) — the switch
+  stops orders at the API, not just in the page. The webhook refuses a non-`usd`
+  intent like a wrong amount, and pages `payment_succeeded_unmatched` when money
+  lands on an order that does not hold it as PAID. Card intents carry `receipt_email`
+  when the diner gave one (Stripe's receipt, from the restaurant's own account).
+- Migration 0023 adds the order-line/event indexes and two range CHECKs
+  (`locations_tax_rate_range` 0-25000; `orders_money_cap` < $1M per money column).
 - `vitest.config.mts`, not `.ts`: this package is CommonJS and Vite's native config
   loader rejects ESM syntax in a `.ts` config.
 - `@types/node` stays on `^22` (Node 22, and vitest 5 peer-requires it). The Next

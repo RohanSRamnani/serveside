@@ -38,7 +38,7 @@ export type CartDrawerViewProps = {
   /** From `StorefrontView.location` — published for exactly this. */
   taxRatePer100k: number
   /**
-   * `closedNotice(...)` **verbatim**, or `null` when the restaurant is open.
+   * `orderingNotice(...)` **verbatim**, or `null` when the restaurant can take an order.
    *
    * Handed down rather than worked out here: the header already tells the customer
    * why the kitchen is shut, and two sentences for one fact drift apart. The one

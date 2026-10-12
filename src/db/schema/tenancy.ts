@@ -1,5 +1,5 @@
-import { pgTable, uuid, text, integer, boolean, timestamp, pgEnum, primaryKey, unique } from 'drizzle-orm/pg-core'
-import { relations } from 'drizzle-orm'
+import { pgTable, uuid, text, integer, boolean, timestamp, pgEnum, primaryKey, unique, check } from 'drizzle-orm/pg-core'
+import { relations, sql } from 'drizzle-orm'
 
 export const membershipRole = pgEnum('membership_role', ['owner', 'manager', 'staff'])
 
@@ -101,6 +101,9 @@ export const locations = pgTable('locations', {
    * rows were given one.
    */
   unique('locations_storefront_slug_unique').on(t.storefrontSlug),
+  // 0 to 25%: no US rate is near the top, so anything above is a unit slip (a
+  // percentage typed as per-100k, or the old bps value multiplied twice).
+  check('locations_tax_rate_range', sql`${t.taxRatePer100k} BETWEEN 0 AND 25000`),
 ])
 
 export const memberships = pgTable('memberships', {

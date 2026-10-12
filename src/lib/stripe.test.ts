@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import Stripe from 'stripe'
-import { isStripeOutage, StripeAccountMissingError } from './stripe'
+import { createPaymentIntentFor, isStripeOutage, stripe, StripeAccountMissingError } from './stripe'
 
 /**
  * **What counts as Stripe being down**, which is the whole of the decision the
@@ -107,5 +107,30 @@ describe('isStripeOutage — not an outage', () => {
     expect(isStripeOutage(new Stripe.errors.StripeInvalidRequestError(raw({
       code: 'ECONNRESET',
     })))).toBe(false)
+  })
+})
+
+describe('createPaymentIntentFor — the receipt', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  /** The real client, with only the network call replaced, so the params are the ones sent. */
+  function spyCreate() {
+    return vi.spyOn(stripe().paymentIntents, 'create')
+      .mockResolvedValue({ id: 'pi_1', client_secret: 'pi_1_secret' } as never)
+  }
+  const location = { id: 'loc-1', stripeAccountId: 'acct_1' }
+  const order = { id: 'ord-1', locationId: 'loc-1', totalCents: 4524 }
+
+  it('asks Stripe for a receipt to the diner\'s address when there is one', async () => {
+    const create = spyCreate()
+    await createPaymentIntentFor({ ...order, contactEmail: 'diner@example.com' }, location)
+    expect(create.mock.calls[0][0]).toMatchObject({ receipt_email: 'diner@example.com' })
+  })
+
+  it('sends no receipt_email at all when the diner gave none', async () => {
+    const create = spyCreate()
+    await createPaymentIntentFor({ ...order, contactEmail: null }, location)
+    await createPaymentIntentFor(order, location)
+    for (const [params] of create.mock.calls) expect(params).not.toHaveProperty('receipt_email')
   })
 })

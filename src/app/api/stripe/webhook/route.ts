@@ -241,10 +241,11 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
       return { outcome: 'nothing-to-do', refused: 'account_mismatch' }
     }
     // 2. The amount paid must be the amount owed. Cheap, and it is the check that
-    //    turns "wrong payment" into "no payment" rather than a free dinner.
-    if (intent.amount !== order.totalCents) {
+    //    turns "wrong payment" into "no payment" rather than a free dinner. In
+    //    dollars: `totalCents` is US cents, and 4524 yen is not $45.24.
+    if (intent.amount !== order.totalCents || intent.currency !== 'usd') {
       reportError(
-        '[stripe webhook] intent', intent.id, 'paid', intent.amount,
+        '[stripe webhook] intent', intent.id, 'paid', intent.amount, intent.currency,
         'but order', orderId, 'totals', order.totalCents, '— refusing to flip',
       )
       return { outcome: 'nothing-to-do', refused: 'amount_mismatch' }
@@ -310,6 +311,18 @@ async function onPaymentSucceeded(event: Stripe.PaymentIntentSucceededEvent): Pr
           '[stripe webhook] order', orderId, 'was flipped for intent', intent.id,
           flip ? `${Math.round(age / 3_600_000)}h ago` : 'by something that left no payment_succeeded event',
           '— too late to re-announce: past the dedupe window this would text the owner again',
+        )
+        return { outcome: 'nothing-to-do' }
+      }
+      // **payment_succeeded_unmatched**: money landed that this order never recorded —
+      // it was cancelled or rejected while the customer paid, or failed over to the
+      // counter and will be charged again there. Still a 200 (no retry changes it), but
+      // a person has to refund or reconcile it, so it pages rather than logs.
+      if (order.stripePaymentIntentId !== intent.id
+        || (order.paymentStatus !== 'PAID' && order.paymentStatus !== 'REFUNDED')) {
+        reportError(
+          '[stripe webhook] payment_succeeded_unmatched: intent', intent.id, 'paid', intent.amount,
+          'but order', orderId, 'is', order.status, order.paymentStatus, '— needs a refund or reconciling',
         )
         return { outcome: 'nothing-to-do' }
       }

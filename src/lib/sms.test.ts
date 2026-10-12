@@ -35,6 +35,9 @@ beforeEach(() => {
   vi.stubEnv('TWILIO_ACCOUNT_SID', ACCOUNT_SID)
   vi.stubEnv('TWILIO_AUTH_TOKEN', AUTH_TOKEN)
   vi.stubEnv('TWILIO_FROM_E164', FROM)
+  // Off production every send is a dry run; these tests are about the live request.
+  vi.stubEnv('VERCEL_ENV', 'development')
+  vi.stubEnv('OUTBOUND_FORCE_LIVE_SMS', '1')
   vi.stubGlobal('fetch', fetchSpy())
 })
 
@@ -101,5 +104,23 @@ describe('sendSms', () => {
     vi.stubEnv('TWILIO_AUTH_TOKEN', '')
     await expect(sendSms('+15551234567', 'hi')).rejects.toThrow(/TWILIO_AUTH_TOKEN/)
     expect(captured).toHaveLength(0)
+  })
+
+  it('off production, logs the message instead of sending it', async () => {
+    // Dev and preview read a database of real owners' phones. A seeded order there
+    // must never text one.
+    vi.stubEnv('OUTBOUND_FORCE_LIVE_SMS', '')
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await sendSms('+15551234567', 'New order K7M2 — $45.24. Open the feed to accept it.')
+
+    expect(captured).toHaveLength(0)
+    expect(log).toHaveBeenCalledWith('[sms:dry-run] to=4567 body=New order K7M2 — $45.24. Open the feed t')
+    log.mockRestore()
+  })
+
+  it('still refuses a bad number in a dry run', async () => {
+    vi.stubEnv('OUTBOUND_FORCE_LIVE_SMS', '')
+    await expect(sendSms('555-123-4567', 'hi')).rejects.toThrow(/E\.164/)
   })
 })

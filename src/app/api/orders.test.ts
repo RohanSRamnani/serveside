@@ -203,8 +203,10 @@ describe('POST /api/orders', () => {
     // our balance, and undoes the entire premise above. This assertion is what makes
     // that a failing test rather than a quiet change of business model.
     expect(Object.keys(params).sort()).toEqual(
-      ['amount', 'automatic_payment_methods', 'currency', 'metadata'],
+      ['amount', 'automatic_payment_methods', 'currency', 'metadata', 'receipt_email'],
     )
+    // Stripe's receipt, from the restaurant's own account, to the address the diner gave.
+    expect(params.receipt_email).toBe('rohan@example.com')
     expect(params).not.toHaveProperty('transfer_data')
     expect(params).not.toHaveProperty('on_behalf_of')
     expect(params).not.toHaveProperty('application_fee_amount')
@@ -367,6 +369,21 @@ describe('POST /api/orders', () => {
     // branches on, and it is stable across refactors of the message.
     expect(body.error).toBe('menu_unavailable')
     expect(typeof body.message).toBe('string')
+  })
+
+  it('asks Stripe for no receipt when the diner gave no email', async () => {
+    const loc = await openRestaurant()
+    const res = await post(cartFor(loc, { contact: { name: 'Rohan R', phone: '+15551234567', email: null } }))
+    expect(res.status).toBe(200)
+    expect(paymentIntentsCreate.mock.calls[0][0]).not.toHaveProperty('receipt_email')
+  })
+
+  it('answers 422 location_inactive when the owner has switched online ordering off', async () => {
+    const loc = await openRestaurant({ pickupEnabled: false })
+    const res = await post(cartFor(loc))
+    expect(res.status).toBe(422)
+    expect((await res.json()).error).toBe('location_inactive')
+    expect(paymentIntentsCreate).not.toHaveBeenCalled()
   })
 
   it('answers 422 for a malformed cart without touching the database', async () => {

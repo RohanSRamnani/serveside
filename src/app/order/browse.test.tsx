@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { eq } from 'drizzle-orm'
 import { menuItems } from '@/db/schema'
@@ -7,7 +7,8 @@ import { withLocation } from '@/repo/scoped'
 import { buildMenuSnapshot } from '@/domain/snapshot'
 import type { StorefrontView } from '@/domain/storefront'
 import { seedLocation, seedLocationWithMenu, seedBusinessHours } from '@/test/seed'
-import OrderPage from './[location]/page'
+import OrderPage, { generateMetadata } from './[location]/page'
+import { orderingNotice } from './[location]/storefront-copy'
 import { cartSubtotalCents, cartTotals } from '@/lib/cart'
 import { formatCents } from '@/lib/money'
 import { MAX_TEXT_FIELD_LENGTH } from '@/lib/order-limits'
@@ -17,6 +18,11 @@ import Browse, {
   toggleOption,
 } from './[location]/browse'
 import { CartDrawerView } from './[location]/cart-drawer'
+
+/** The request's headers, as `generateMetadata` reads them. Empty is a platform host. */
+const requestHeaders = vi.hoisted(() => ({ current: new Headers() }))
+vi.mock('next/headers', () => ({ headers: async () => requestHeaders.current }))
+
 import {
   addToLines, parseStoredLines, removeAt, sameLine, setLineQty, shouldPersist, storageKey,
   type CartLine,
@@ -105,7 +111,9 @@ function view(over: Partial<StorefrontView> = {}): StorefrontView {
       // object. See `StorefrontLocation`: it is public by construction.
       stripeAccountId: 'acct_test_kashi',
     },
+    mode: 'live',
     open: { open: true },
+    pausedUntil: null,
     snapshotVersion: 7,
     categories,
     ...over,
@@ -699,6 +707,52 @@ function checkoutButton(markup: string): string {
   return match[0]
 }
 
+describe('a storefront that cannot take orders says so', () => {
+  it('shows a demo as a demo, and nothing can be added or checked out', () => {
+    const demo = view({ mode: 'demo' })
+    const markup = browse({ mode: 'demo' })
+    expect(orderingNotice(demo, LUNCH_AND_DINNER)).toBe("A demo built for Kashi. Ordering isn't switched on yet.")
+    expect(markup).toContain('A demo built for Kashi.')
+    // "Open now" beside "ordering isn't on" is two answers to one question.
+    expect(markup).not.toContain('Open now')
+
+    const sheet = renderToStaticMarkup(
+      <DishSheetView
+        item={item({ modifierGroups: [] })} selected={[]} qty={1} notes=""
+        addOff="Ordering isn’t switched on yet"
+        onToggle={() => {}} onQty={() => {}} onNotes={() => {}} onAdd={() => {}} onClose={() => {}}
+      />,
+    )
+    expect(/<button[^>]*data-add="1"[^>]*>/.exec(sheet)![0]).toContain('disabled')
+
+    const drawer = renderToStaticMarkup(
+      <CartDrawerView
+        lines={[{ menuItemId: 'itm-naan', name: 'Garlic Naan', unitPriceCents: 500, qty: 1, modifierOptionIds: [], modifierNames: [], modifierDeltaCents: 0 }]}
+        taxRatePer100k={8875} closedReason={orderingNotice(demo, LUNCH_AND_DINNER)}
+        onQty={() => {}} onRemove={() => {}} onCheckout={() => {}} onClose={() => {}}
+      />,
+    )
+    expect(checkoutButton(drawer)).toContain('disabled')
+  })
+
+  it('says ordering is off for an inactive restaurant or one with pickup switched off', () => {
+    // Both are `mode: 'off'` (see `storefrontMode`); open hours do not switch it back on.
+    expect(orderingNotice(view({ mode: 'off' }), LUNCH_AND_DINNER)).toBe('Online ordering is off right now.')
+    expect(browse({ mode: 'off' })).toContain('Online ordering is off right now.')
+  })
+
+  it('says when a paused kitchen takes orders again, on the restaurant’s clock', () => {
+    const paused = { open: { open: false, reason: 'paused' as const }, pausedUntil: '2026-10-12T23:30:00.000Z' }
+    expect(orderingNotice(view(paused), LUNCH_AND_DINNER)).toBe(
+      'Not taking orders right now — the kitchen is slammed. Taking orders again at 7:30 PM.',
+    )
+    // Same instant, a restaurant three hours west: the zone is the location's, never the server's.
+    const west = view(paused)
+    west.location = { ...west.location, timezone: 'America/Los_Angeles' }
+    expect(orderingNotice(west, LUNCH_AND_DINNER)).toMatch(/again at 4:30 PM\.$/)
+  })
+})
+
 describe('/order/[location]', () => {
   function render(slug: string): Promise<string> {
     return OrderPage({
@@ -738,6 +792,32 @@ describe('/order/[location]', () => {
     const markup = await render(loc.storefrontSlug)
     expect(markup).toContain('Lamb Rogan Josh')
     expect(markup).toContain('Sold out today')
+  })
+
+  function metadataFor(slug: string) {
+    return generateMetadata({ params: Promise.resolve({ location: slug }), searchParams: Promise.resolve({}) })
+  }
+
+  it('never lets a demo be indexed, even on a custom host', async () => {
+    const loc = await seedLocationWithMenu({ status: 'demo' })
+    requestHeaders.current = new Headers({ 'x-tenant-custom-host': 'order.example.com' })
+    try {
+      expect((await metadataFor(loc.storefrontSlug)).robots).toEqual({ index: false, follow: false })
+    } finally {
+      requestHeaders.current = new Headers()
+    }
+  })
+
+  it('noindexes an active restaurant on a platform host', async () => {
+    const loc = await seedLocationWithMenu()
+    expect((await metadataFor(loc.storefrontSlug)).robots).toEqual({ index: false, follow: false })
+  })
+
+  it('shows a demo’s banner from the database row', async () => {
+    const loc = await seedLocationWithMenu({ status: 'demo' })
+    await seedBusinessHours(loc.id)
+    await buildMenuSnapshot(loc.id)
+    expect(await render(loc.storefrontSlug)).toContain(`A demo built for ${loc.name}.`)
   })
 
   it('is a 404 for a slug nobody owns', async () => {

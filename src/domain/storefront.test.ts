@@ -4,7 +4,7 @@ import { menuItems, menuSnapshots, orderPauses } from '@/db/schema'
 import type { MenuSnapshotPayload } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
 import { buildMenuSnapshot } from '@/domain/snapshot'
-import { storefrontView, resolveStorefrontSlug, NoMenuError } from './storefront'
+import { storefrontView, resolveStorefrontSlug, storefrontIndexable, NoMenuError } from './storefront'
 import { seedLocationWithMenu, seedBusinessHours, type SeededMenu } from '@/test/seed'
 
 /**
@@ -228,5 +228,39 @@ describe('storefrontView', () => {
     const view = await withLocation(loc.id, (tx) => storefrontView(loc.id, tx))
     expect(view.snapshotVersion).toBeGreaterThan(0)
     expect(view.open).toEqual({ open: true })
+  })
+})
+
+describe('whether a storefront can take orders', () => {
+  it('is live for an active restaurant with pickup on, and says nothing about a pause', async () => {
+    const view = await storefrontView((await storefront()).id)
+    expect(view.mode).toBe('live')
+    expect(view.pausedUntil).toBeNull()
+  })
+
+  it('is a demo for a demo, and off when inactive or pickup is switched off', async () => {
+    expect((await storefrontView((await storefront({ status: 'demo' })).id)).mode).toBe('demo')
+    expect((await storefrontView((await storefront({ status: 'inactive' })).id)).mode).toBe('off')
+    expect((await storefrontView((await storefront({ pickupEnabled: false })).id)).mode).toBe('off')
+  })
+
+  it('carries when a pause ends — the latest live row, since any one of them keeps it paused', async () => {
+    const loc = await storefront()
+    const later = new Date(Date.now() + 45 * 60_000)
+    await withLocation(loc.id, (tx) => tx.insert(orderPauses).values([
+      { locationId: loc.id, until: new Date(Date.now() + 15 * 60_000) },
+      { locationId: loc.id, until: later },
+    ]))
+    expect((await storefrontView(loc.id)).pausedUntil).toBe(later.toISOString())
+  })
+})
+
+describe('storefrontIndexable', () => {
+  it('indexes only an active restaurant on its own address', () => {
+    expect(storefrontIndexable('active', true)).toBe(true)
+    expect(storefrontIndexable('active', false)).toBe(false)
+    expect(storefrontIndexable('demo', true)).toBe(false)
+    expect(storefrontIndexable('demo', false)).toBe(false)
+    expect(storefrontIndexable('inactive', true)).toBe(false)
   })
 })

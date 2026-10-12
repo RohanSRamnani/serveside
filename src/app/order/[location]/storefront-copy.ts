@@ -1,4 +1,5 @@
 import type { OpenState, ServiceWindow } from '@/domain/hours'
+import type { StorefrontView } from '@/domain/storefront'
 
 /**
  * The sentences and the links the storefront's pages share.
@@ -147,11 +148,35 @@ export function formatServiceWindows(windows: readonly ServiceWindow[]): string 
  * later today. Flattening them into "closed" throws away the only part of this the
  * customer can act on.
  */
-export function closedNotice(open: OpenState, todayHours: readonly ServiceWindow[]): string | null {
+export function closedNotice(
+  open: OpenState,
+  todayHours: readonly ServiceWindow[],
+  resume?: { until: string; timezone: string } | null,
+): string | null {
   if (open.open) return null
   if (open.reason === 'paused') {
-    return 'Not taking orders right now — the kitchen is slammed. Try again in a little while.'
+    const next = resume
+      ? `Taking orders again at ${wallClockTime(new Date(resume.until), resume.timezone)}.`
+      : 'Try again in a little while.'
+    return `Not taking orders right now — the kitchen is slammed. ${next}`
   }
   if (open.reason === 'holiday' || todayHours.length === 0) return 'Closed today.'
   return `Closed right now. Today: ${formatServiceWindows(todayHours)}.`
+}
+
+/**
+ * Why this storefront cannot take an order right now, or `null` when it can. The one
+ * sentence the menu's header, its Checkout button and the checkout page all use.
+ *
+ * A demo or a switched-off restaurant says so before the clock is asked: "closed right
+ * now" on a demo would promise an opening that is never coming.
+ */
+export function orderingNotice(
+  view: Pick<StorefrontView, 'mode' | 'open' | 'pausedUntil' | 'location'>,
+  todayHours: readonly ServiceWindow[],
+): string | null {
+  if (view.mode === 'demo') return `A demo built for ${view.location.name}. Ordering isn't switched on yet.`
+  if (view.mode === 'off') return 'Online ordering is off right now.'
+  const resume = view.pausedUntil ? { until: view.pausedUntil, timezone: view.location.timezone } : null
+  return closedNotice(view.open, todayHours, resume)
 }

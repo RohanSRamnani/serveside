@@ -9,11 +9,10 @@ import { cartSubtotalCents, cartTotals, lineTotalCents } from '@/lib/cart'
 import { formatCents, roundHalfUp, totalCentsFor } from '@/lib/money'
 import { MAX_TEXT_FIELD_LENGTH, MAX_TIP_CENTS } from '@/lib/order-limits'
 import type { CreateOrderInput } from '@/domain/create-order'
-import type { OpenState, ServiceWindow } from '@/domain/hours'
 import type { StorefrontLocation } from '@/domain/storefront'
 import { useCart, type CartLine } from '../cart-provider'
 import { SHELL_CSS } from '../shell-css'
-import { closedNotice, formatPhone, menuHref, quoteLabel, statusHref } from '../storefront-copy'
+import { formatPhone, menuHref, quoteLabel, statusHref } from '../storefront-copy'
 
 /**
  * Checkout: a name, a phone number, a tip, a consent box and a payment mode.
@@ -471,8 +470,8 @@ export type CheckoutFormProps = {
   /** Resolved from the slug on the server — the view deliberately publishes no id. */
   locationId: string
   location: StorefrontLocation
-  open: OpenState
-  todayHours: ServiceWindow[]
+  /** `orderingNotice(...)`, worked out on the server, or null when an order can be taken. */
+  closedReason: string | null
   /**
    * The quote as the **server** rendered it.
    *
@@ -505,7 +504,7 @@ function blankForm(): CheckoutFormState {
 
 type PlacedCardOrder = { orderId: string; shortCode: string; clientSecret: string }
 
-export function CheckoutForm({ locationId, location, open, todayHours, initialQuote }: CheckoutFormProps) {
+export function CheckoutForm({ locationId, location, closedReason, initialQuote }: CheckoutFormProps) {
   const cart = useCart()
   const router = useRouter()
   const [form, setForm] = useState<CheckoutFormState>(blankForm)
@@ -668,7 +667,7 @@ export function CheckoutForm({ locationId, location, open, todayHours, initialQu
       location={location}
       lines={cart.lines}
       hydrated={cart.hydrated}
-      closedReason={closedNotice(open, todayHours)}
+      closedReason={closedReason}
       cardAvailable={cardAvailable}
       quote={quote}
       form={form}
@@ -686,7 +685,7 @@ export type CheckoutFormViewProps = {
   lines: readonly CartLine[]
   /** Whether the cart has been read from storage yet — see `Cart.hydrated`. */
   hydrated: boolean
-  /** `closedNotice(...)` verbatim, or null. Handed down so it is one sentence. */
+  /** `orderingNotice(...)` verbatim, or null. Handed down so it is one sentence. */
   closedReason: string | null
   cardAvailable: boolean
   quote: string

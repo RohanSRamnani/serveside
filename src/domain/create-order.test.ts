@@ -600,6 +600,22 @@ describe('createOrder — server-side validation', () => {
     expect(await orderCount(loc.id)).toBe(0)
   })
 
+  it('reads a null contact email or line note as absent, not as a wrong type', async () => {
+    const loc = await openRestaurant()
+    // A JSON body cannot carry `undefined`, so a blank optional field arrives as
+    // `null`. That is "not given", and the order goes through with NULL columns.
+    const result = await createOrder(planOrder(loc, {
+      contact: { name: 'Rohan R', phone: '+15551234567', email: null as unknown as string },
+      items: [{
+        menuItemId: item(loc, 'Butter Chicken').id, qty: 1,
+        modifierOptionIds: [option(loc, 'Hot').id], notes: null as unknown as string,
+      }],
+    }))
+    const { order, items } = await readOrder(loc.id, result.orderId)
+    expect(order.contactEmail).toBeNull()
+    expect(items[0].notes).toBeNull()
+  })
+
   it('refuses a contact email or line note past the length cap', async () => {
     const loc = await openRestaurant()
     const tooLong = 'x'.repeat(501)
@@ -800,6 +816,16 @@ describe('createOrder — when the restaurant cannot take it', () => {
     const loc = await openRestaurant({ status: 'suspended' })
     // A suspended restaurant can be open by the clock and still must not take money.
     await expect(createOrder(planOrder(loc))).rejects.toThrow(LocationInactiveError)
+    expect(await orderCount(loc.id)).toBe(0)
+  })
+
+  it('refuses when the owner has switched online ordering off', async () => {
+    const loc = await openRestaurant({ pickupEnabled: false })
+    // Open by the clock, trading, and still not taking orders: the switch must stop
+    // the write, not just hide the button, or the voice agent sells right through it.
+    await expect(createOrder(planOrder(loc))).rejects.toThrow(LocationInactiveError)
+    await expect(createOrder(planOrder(loc, { payment: 'pay_on_pickup' })))
+      .rejects.toMatchObject({ code: 'location_inactive', status: 'ordering_off' })
     expect(await orderCount(loc.id)).toBe(0)
   })
 

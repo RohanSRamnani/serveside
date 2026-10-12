@@ -1,10 +1,11 @@
 import type { Metadata } from 'next'
+import { headers } from 'next/headers'
 import { notFound } from 'next/navigation'
 import { eq } from 'drizzle-orm'
 import { db } from '@/db/client'
 import { locations } from '@/db/schema'
 import { withLocation } from '@/repo/scoped'
-import { NoMenuError, resolveStorefrontSlug, storefrontView } from '@/domain/storefront'
+import { NoMenuError, resolveStorefrontSlug, storefrontIndexable, storefrontView } from '@/domain/storefront'
 import { todayServiceWindows, type ServiceWindow } from '@/domain/hours'
 import type { StorefrontView } from '@/domain/storefront'
 import Browse from './browse'
@@ -65,7 +66,7 @@ export async function generateMetadata(
   const locationId = await resolveStorefrontSlug(slug)
   // A miss gets no name in its title bar either: `notFound()` here would render the
   // 404 before the page could, which is the same answer by a less obvious route.
-  if (!locationId) return { title: 'Order online' }
+  if (!locationId) return { title: 'Order online', robots: NOINDEX }
 
   /**
    * Deliberately its own small read rather than the page's whole view. `locations`
@@ -75,17 +76,21 @@ export async function generateMetadata(
    */
   const row = await db().query.locations.findFirst({
     where: eq(locations.id, locationId),
-    columns: { name: true, address: true },
+    columns: { name: true, address: true, status: true },
   })
-  if (!row) return { title: 'Order online' }
+  if (!row) return { title: 'Order online', robots: NOINDEX }
+  const customHost = (await headers()).has('x-tenant-custom-host')
 
   return {
     title: row.name,
     description: `Order pickup from ${row.name} — ${row.address}. Real-time menu, straight to the kitchen.`,
-    // A customer's menu is the one page on this platform that *wants* to be found.
-    robots: { index: true, follow: true },
+    // A customer's menu wants to be found — on the restaurant's own address, and only
+    // once it is real. `next.config.ts` sends the matching X-Robots-Tag on /order/*.
+    robots: storefrontIndexable(row.status, customHost) ? { index: true, follow: true } : NOINDEX,
   }
 }
+
+const NOINDEX = { index: false, follow: false }
 
 export default async function OrderPage({ params }: PageProps<'/order/[location]'>) {
   const { location: slug } = await params

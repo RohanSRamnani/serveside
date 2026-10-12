@@ -14,7 +14,7 @@ import { CartProvider } from '../cart-provider'
  * server but quoteLabel is on the client" — a 500 on the whole page. Found exactly
  * that way, in the browser, after a typecheck that could not see it.
  */
-import { quoteLabel } from '../storefront-copy'
+import { orderingNotice, quoteLabel } from '../storefront-copy'
 import { CheckoutForm } from './checkout-form'
 
 /**
@@ -78,8 +78,7 @@ export default async function CheckoutPage({ params }: PageProps<'/order/[locati
       <CheckoutForm
         locationId={locationId}
         location={view.location}
-        open={view.open}
-        todayHours={todayHours}
+        closedReason={orderingNotice(view, todayHours)}
         /**
          * Quoted on the server so the first client render matches the HTML byte for
          * byte — two `new Date()` calls a second apart is a hydration mismatch, and

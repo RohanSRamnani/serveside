@@ -1,6 +1,6 @@
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, gt, max } from 'drizzle-orm'
 import { db } from '@/db/client'
-import { locations, menuSnapshots } from '@/db/schema'
+import { locations, menuSnapshots, orderPauses } from '@/db/schema'
 import type { SnapshotCategory } from '@/db/schema'
 import { withLocation, type ScopedTx } from '@/repo/scoped'
 import { isOpenAt, type OpenState } from './hours'
@@ -96,10 +96,43 @@ export type StorefrontLocation = {
   stripeAccountId: string | null
 }
 
+/**
+ * Whether this storefront can take an order at all, before the clock is asked.
+ *
+ * `demo` is a menu we built for a restaurant that has not signed (`locations.status
+ * = 'demo'`); `off` is a real restaurant with online ordering switched off
+ * (`status = 'inactive'`, or `pickup_enabled = false`). Neither takes an order —
+ * `createOrder` refuses them — so the page must not offer one. Any status this does
+ * not know is `off`: a page that says "closed" by mistake costs a phone call, one
+ * that offers checkout by mistake costs a dinner nobody cooks.
+ */
+export type StorefrontMode = 'live' | 'demo' | 'off'
+
+export function storefrontMode(status: string, pickupEnabled: boolean): StorefrontMode {
+  if (status === 'demo') return 'demo'
+  return status === 'active' && pickupEnabled ? 'live' : 'off'
+}
+
+/**
+ * May a search engine index this storefront page? Only an active restaurant on its
+ * **own** address. A demo is never indexed (a real restaurant's menu must not turn
+ * up in Google on a Serveside address), and nor is any page on a platform host.
+ *
+ * `customHost` is whether the request carries `x-tenant-custom-host`, which only the
+ * host-routing proxy sets, after stripping every inbound `x-tenant-*` header. Until
+ * custom domains exist nothing sets it, so every storefront page is noindexed.
+ */
+export function storefrontIndexable(status: string, customHost: boolean): boolean {
+  return status === 'active' && customHost
+}
+
 export type StorefrontView = {
   location: StorefrontLocation
+  mode: StorefrontMode
   /** From `isOpenAt` verbatim — `paused` and `closed_hours` are two different sentences. */
   open: OpenState
+  /** When a pause ends (ISO instant), or null when not paused. The latest live row wins. */
+  pausedUntil: string | null
   /**
    * Which pin this menu is. Not decoration: it is how a support conversation about
    * "the website said £12" is settled, and how a client can tell a stale CDN copy
@@ -228,6 +261,7 @@ export async function storefrontView(locationId: string, tx?: ScopedTx): Promise
     columns: {
       name: true, storefrontSlug: true, timezone: true, phoneE164: true, address: true,
       prepTimeMinutes: true, taxRatePer100k: true, stripeAccountId: true, synthetic: true,
+      status: true, pickupEnabled: true,
     },
   })
   // A caller asking about a location that does not exist has a bug; answering "no
@@ -241,17 +275,19 @@ export async function storefrontView(locationId: string, tx?: ScopedTx): Promise
 
   // Named `slug` in the payload and read from `storefront_slug`: the customer-facing
   // view has exactly one slug, and it is the public one. See `StorefrontLocation.slug`.
-  const { storefrontSlug, synthetic: _synthetic, ...rest } = row
+  const { storefrontSlug, synthetic: _synthetic, status, pickupEnabled, ...rest } = row
   const location: StorefrontLocation = { ...rest, slug: storefrontSlug }
+  const mode = storefrontMode(status, pickupEnabled)
 
-  if (!tx) return withLocation(locationId, (scoped) => read(locationId, location, scoped))
-  return read(locationId, location, tx)
+  if (!tx) return withLocation(locationId, (scoped) => read(locationId, location, mode, scoped))
+  return read(locationId, location, mode, tx)
 }
 
 /** The two scoped reads: the pinned menu, and whether the doors are open right now. */
 async function read(
   locationId: string,
   location: StorefrontLocation,
+  mode: StorefrontMode,
   tx: ScopedTx,
 ): Promise<StorefrontView> {
   // **Ordered by version, not `createdAt`** — version is the thing that is unique and
@@ -271,10 +307,23 @@ async function read(
     .limit(1)
   if (!pinned) throw new NoMenuError(locationId)
 
+  // On the same `tx`, so "open" and "this menu" are one instant of the database.
+  const now = new Date()
+  const open = await isOpenAt(locationId, now, tx)
+  // `isOpenAt` says paused if *any* row has `until > now`, so the resume time is the
+  // latest of them, not the first found.
+  let pausedUntil: string | null = null
+  if (open.reason === 'paused') {
+    const [pause] = await tx.select({ until: max(orderPauses.until) }).from(orderPauses)
+      .where(and(eq(orderPauses.locationId, locationId), gt(orderPauses.until, now)))
+    pausedUntil = pause?.until?.toISOString() ?? null
+  }
+
   return {
     location,
-    // On the same `tx`, so "open" and "this menu" are one instant of the database.
-    open: await isOpenAt(locationId, new Date(), tx),
+    mode,
+    open,
+    pausedUntil,
     snapshotVersion: pinned.version,
     categories: pinned.payload.categories,
   }

@@ -10,7 +10,7 @@ import type { StorefrontView } from '@/domain/storefront'
 import { CART_CSS, CartDrawer } from './cart-drawer'
 import { CartProvider, cartCount, useCart, type CartLine } from './cart-provider'
 import { SHELL_CSS } from './shell-css'
-import { checkoutHref, closedNotice, formatPhone, formatServiceWindows } from './storefront-copy'
+import { checkoutHref, formatPhone, formatServiceWindows, orderingNotice } from './storefront-copy'
 import { useDismissablePanel } from './use-dismissable-panel'
 
 /**
@@ -256,12 +256,14 @@ function Menu({ view, todayHours }: BrowseProps) {
   const railRef = useActiveChipInView(active)
   /**
    * **One sentence, two places.** The header prints it and the drawer's Checkout
-   * button is disabled with it. `closedNotice` is the only thing that knows that a
-   * pause, a holiday and the weekly grid are three different next moves for the
-   * customer, and a second copy of that wording in the drawer would be the copy that
-   * drifts.
+   * button is disabled with it. `orderingNotice` is the only thing that knows that a
+   * demo, a switched-off restaurant, a pause, a holiday and the weekly grid are
+   * different next moves for the customer, and a second copy of that wording in the
+   * drawer would be the copy that drifts.
    */
-  const notice = closedNotice(open, todayHours)
+  const notice = orderingNotice(view, todayHours)
+  // A demo takes no order at all, so nothing may go into a cart either.
+  const addOff = view.mode === 'demo' ? 'Ordering isn’t switched on yet' : null
 
   const add = useCallback((line: CartLine) => {
     cart.addLine(line)
@@ -280,8 +282,8 @@ function Menu({ view, todayHours }: BrowseProps) {
    * and the prep time. `checkoutHref` is shared with the checkout page's own tests so
    * the two cannot disagree about where this goes.
    *
-   * The button is enabled exactly when the restaurant is open — `cart-drawer.tsx`
-   * decides that from `closedNotice`, and it is unchanged.
+   * The button is enabled exactly when the restaurant can take an order — `cart-drawer.tsx`
+   * decides that from `orderingNotice`.
    */
   const checkout = useCallback(() => {
     window.location.assign(checkoutHref(location.slug))
@@ -338,9 +340,12 @@ function Menu({ view, todayHours }: BrowseProps) {
         <header className="ss-head">
           <div className="ss-head-top">
             <h1 className="ss-name">{location.name}</h1>
-            <span className="ss-status" data-open={open.open ? 'true' : 'false'}>
-              {open.open ? 'Open now' : 'Closed now'}
-            </span>
+            {/* Open or closed is only news when the restaurant takes orders here at all. */}
+            {view.mode === 'live' ? (
+              <span className="ss-status" data-open={open.open ? 'true' : 'false'}>
+                {open.open ? 'Open now' : 'Closed now'}
+              </span>
+            ) : null}
           </div>
           <p className="ss-meta">
             Pickup · ready in about {location.prepTimeMinutes} min
@@ -427,7 +432,7 @@ function Menu({ view, todayHours }: BrowseProps) {
       ) : null}
 
       {openDish ? (
-        <DishSheet item={openDish} onAdd={add} onClose={closeDish} />
+        <DishSheet item={openDish} addOff={addOff} onAdd={add} onClose={closeDish} />
       ) : null}
     </div>
   )
@@ -558,12 +563,15 @@ export type DishSheetViewProps = {
   onToggle: (group: SnapshotModifierGroup, optionId: string) => void
   onQty: (qty: number) => void
   onNotes: (notes: string) => void
+  /** Why nothing can be added at all (a demo), or null. Wins over the dish's own reason. */
+  addOff?: string | null
   onAdd: () => void
   onClose: () => void
 }
 
-function DishSheet({ item, onAdd, onClose }: {
+function DishSheet({ item, addOff, onAdd, onClose }: {
   item: SnapshotItem
+  addOff: string | null
   onAdd: (line: CartLine) => void
   onClose: () => void
 }) {
@@ -601,6 +609,7 @@ function DishSheet({ item, onAdd, onClose }: {
       onToggle={(group, optionId) => setSelected((prev) => toggleOption(group, prev, optionId))}
       onQty={(next) => setQty(Math.max(1, Math.min(MAX_QTY_PER_STEPPER, next)))}
       onNotes={setNotes}
+      addOff={addOff}
       onAdd={add}
       onClose={onClose}
     />
@@ -608,9 +617,9 @@ function DishSheet({ item, onAdd, onClose }: {
 }
 
 export function DishSheetView({
-  item, selected, qty, notes, onToggle, onQty, onNotes, onAdd, onClose,
+  item, selected, qty, notes, addOff = null, onToggle, onQty, onNotes, onAdd, onClose,
 }: DishSheetViewProps) {
-  const blocked = addBlockedReason(item, selected)
+  const blocked = addOff ?? addBlockedReason(item, selected)
   const unit = dishUnitPriceCents(item, selected)
   const pills = tagPills(item.tags)
   const sheetRef = useRef<HTMLDivElement>(null)

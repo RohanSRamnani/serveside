@@ -147,6 +147,12 @@ export const orders = pgTable('orders', {
     ${t.subtotalCents} >= 0 AND ${t.taxCents} >= 0 AND ${t.tipCents} >= 0
     AND ${t.deliveryFeeCents} >= 0 AND ${t.discountCents} >= 0 AND ${t.totalCents} >= 0
   `),
+  // And none of them reaches one million dollars: no pickup order is that big, so a
+  // value that is must be a unit mix-up (dollars read as cents, or a doubled total).
+  check('orders_money_cap', sql`
+    ${t.subtotalCents} < 100000000 AND ${t.taxCents} < 100000000 AND ${t.tipCents} < 100000000
+    AND ${t.deliveryFeeCents} < 100000000 AND ${t.discountCents} < 100000000 AND ${t.totalCents} < 100000000
+  `),
   /**
    * The two indexes the kitchen feed polls on, every five seconds, per tablet,
    * forever. Both lead with `location_id` because every query does — the RLS policy
@@ -192,6 +198,9 @@ export const orderItems = pgTable('order_items', {
   // printed ticket and a charge.
   check('order_items_qty_positive', sql`${t.qty} > 0`),
   check('order_items_money_non_negative', sql`${t.unitPriceCents} >= 0 AND ${t.lineTotalCents} >= 0`),
+  // Every ticket and receipt loads its lines by order; best-seller reports group by item.
+  index('order_items_order_idx').on(t.orderId),
+  index('order_items_menu_item_idx').on(t.menuItemId),
 ]).enableRLS()
 
 /**
@@ -240,7 +249,7 @@ export const orderEvents = pgTable('order_events', {
   actor: text('actor').notNull(),
   payload: jsonb('payload').$type<OrderEventPayload>().notNull().default({}),
   at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
-}).enableRLS()
+}, (t) => [index('order_events_order_idx').on(t.orderId)]).enableRLS()
 
 export type Order = typeof orders.$inferSelect
 export type NewOrder = typeof orders.$inferInsert

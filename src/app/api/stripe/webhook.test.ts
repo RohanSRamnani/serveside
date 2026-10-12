@@ -21,7 +21,8 @@ import { seedLocationWithMenu, seedCardOrder, seedPaidOrder } from '@/test/seed'
  * The Stripe SDK is mocked whole: no network, and `constructEvent` is the seam that
  * lets a test be a valid or an invalid signature without holding a signing secret.
  */
-const { constructEvent, paymentIntentsCreate, sendOrderCreated, sendProvenanceRefused } = vi.hoisted(() => ({
+const { constructEvent, paymentIntentsCreate, sendOrderCreated, sendProvenanceRefused, reportError } = vi.hoisted(() => ({
+  reportError: vi.fn(),
   constructEvent: vi.fn(),
   paymentIntentsCreate: vi.fn(),
   sendOrderCreated: vi.fn(),
@@ -36,6 +37,7 @@ vi.mock('stripe', () => ({
 }))
 
 vi.mock('@/inngest/client', () => ({ sendOrderCreated, sendProvenanceRefused }))
+vi.mock('@/lib/report', () => ({ reportError }))
 
 const { POST } = await import('./webhook/route')
 
@@ -70,6 +72,7 @@ function succeededEvent(over: {
   orderId?: string
   locationId?: string
   amount?: number
+  currency?: string
 }) {
   return {
     id: over.id ?? `evt_test_${Date.now()}_${eventCounter++}`,
@@ -80,7 +83,7 @@ function succeededEvent(over: {
         id: over.paymentIntentId ?? 'pi_test_1',
         object: 'payment_intent',
         amount: over.amount ?? ORDER_TOTAL_CENTS,
-        currency: 'usd',
+        currency: over.currency ?? 'usd',
         status: 'succeeded',
         metadata: { orderId: over.orderId ?? '', locationId: over.locationId ?? '' },
       },
@@ -556,6 +559,57 @@ describe('POST /api/stripe/webhook', () => {
       { orderId: order.id, locationId: loc.id, reason: 'amount_mismatch' },
       event.id,
     )
+  })
+
+  it('will not flip an order paid the right number in the wrong currency', async () => {
+    // `totalCents` is US cents. 4524 yen matches the number and is about $30 short.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+
+    const event = succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!, currency: 'jpy',
+    })
+    expect((await deliver(event)).status).toBe(200)
+
+    const untouched = await readOrder(loc.id, order.id)
+    expect(untouched.status).toBe('PENDING_PAYMENT')
+    expect(untouched.paymentStatus).toBe('REQUIRES_PAYMENT')
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+    expect(sendProvenanceRefused).toHaveBeenCalledWith(
+      { orderId: order.id, locationId: loc.id, reason: 'amount_mismatch' },
+      event.id,
+    )
+  })
+
+  it('pages when money lands on an order that was cancelled while the customer paid', async () => {
+    // payment_succeeded_unmatched: the diner is charged and nobody is cooking. Still a
+    // 200 — no retry changes it — but a person has to refund it, so it is not a log line.
+    const loc = await restaurant()
+    const { order } = await seedCardOrder(loc.id)
+    await withLocation(loc.id, (tx) =>
+      tx.update(orders).set({ status: 'CANCELED', canceledAt: new Date() }).where(eq(orders.id, order.id)))
+
+    const res = await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(res.status).toBe(200)
+    expect(sendOrderCreated).not.toHaveBeenCalled()
+    expect(reportError).toHaveBeenCalledTimes(1)
+    expect(reportError.mock.calls[0][0]).toContain('payment_succeeded_unmatched')
+  })
+
+  it('does not page for a late duplicate about money the order already recorded', async () => {
+    // The control: CANCELED, but PAID against this very intent — the money is on file
+    // and its refund is a known job, not a surprise.
+    const loc = await restaurant()
+    const order = await alreadyFlipped(loc.id, 1)
+    await withLocation(loc.id, (tx) =>
+      tx.update(orders).set({ status: 'CANCELED', canceledAt: new Date() }).where(eq(orders.id, order.id)))
+
+    await deliver(succeededEvent({
+      orderId: order.id, locationId: loc.id, paymentIntentId: order.stripePaymentIntentId!,
+    }))
+    expect(reportError).not.toHaveBeenCalled()
   })
 
   it('says nothing about provenance when the money is the order\'s own', async () => {

@@ -272,6 +272,11 @@ export async function createOrder(input: CreateOrderInput): Promise<CreateOrderR
     // Trading status first: a suspended restaurant can be open by the clock and
     // still must not take money.
     if (location.status !== 'active') throw new LocationInactiveError(input.locationId, location.status)
+    // The owner's "online ordering off" switch. Refused here, not just hidden in the
+    // storefront: the voice and SMS agents, and any stale checkout tab, call this
+    // directly. Same rejection as a non-trading location — to the customer both are
+    // "this restaurant is not taking orders online".
+    if (!location.pickupEnabled) throw new LocationInactiveError(input.locationId, 'ordering_off')
 
     // Inside the transaction and on our `tx`, so the hours the check reads are the
     // hours that hold while the order is written — and so it does not open a second
@@ -383,6 +388,7 @@ async function readLocation(tx: ScopedTx, locationId: string) {
       // the same row as the tax rate so one transaction answers every question it has
       // about this location.
       timezone: locations.timezone,
+      pickupEnabled: locations.pickupEnabled,
     })
     .from(locations)
     .where(eq(locations.id, locationId))
@@ -546,7 +552,9 @@ function assertInputShape(input: CreateOrderInput): void {
   // Lower stakes than channel — `contact_email` is a nullable text column, so
   // there is no constraint for a wrong-typed value to violate — but still a value
   // the client fully controls reaching storage with no shape check at all today.
-  if (input.contact.email !== undefined) {
+  // `!= null`, not `!== undefined`: a JSON body has no `undefined`, so an empty field
+  // arrives as `null`, which means "absent" and is stored as NULL — not a 422.
+  if (input.contact.email != null) {
     if (typeof input.contact.email !== 'string') {
       throw new InvalidOrderInputError('Contact email must be a string when present')
     }
@@ -584,8 +592,8 @@ function assertInputShape(input: CreateOrderInput): void {
       seen.add(optionId)
     }
     // Same as the email check above: `notes` is a nullable text column with
-    // nothing to stop a non-string value reaching it unchecked.
-    if (line.notes !== undefined) {
+    // nothing to stop a non-string value reaching it unchecked. `null` is absent, too.
+    if (line.notes != null) {
       if (typeof line.notes !== 'string') {
         throw new InvalidOrderInputError('Line notes must be a string when present')
       }
