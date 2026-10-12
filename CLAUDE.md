@@ -8,6 +8,11 @@ Stripe takes the money. Next 16 App Router + Neon Postgres via Drizzle.
 - Spec: `docs/superpowers/specs/2026-09-07-restaurant-ordering-backend-design.md`
 - Plan in flight: `docs/superpowers/plans/2026-09-20-ordering-spine.md`
 - `README.md` — what this is, the architecture, the env table, the local loop.
+- **`site/` is serveside.co** — a separate Next app and Vercel project (root directory
+  `site`), with its own `package.json`, `node_modules`, tests and `site/README.md`. It
+  never imports from `src/`, and the engine's `tsconfig.json` and `vitest.config.mts`
+  exclude it. Run it with `npm --prefix site …`. A marketing deploy can never break
+  ordering.
 
 ## Non-negotiable rules
 

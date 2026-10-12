@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --radius: 0.625rem;
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  body { @apply bg-background text-foreground; }
+  /* No CSS smooth-scroll: it silently breaks fragment-link navigation in some
+     Chromium builds. scroll-padding-top keeps anchored sections clear of the
+     sticky nav. */
+  html { @apply font-sans; scroll-padding-top: 5rem; }
+}
+
+.reveal-item {
+  opacity: 0; transform: translateY(32px);
+  transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1), transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal-item.revealed { opacity: 1; transform: translateY(0); }
+
+.stagger-children > * { opacity: 0; animation: fade-in-up 0.5s ease-out both; }
+.stagger-children > *:nth-child(1) { animation-delay: 0ms; }
+.stagger-children > *:nth-child(2) { animation-delay: 100ms; }
+.stagger-children > *:nth-child(3) { animation-delay: 200ms; }
+.stagger-children > *:nth-child(4) { animation-delay: 300ms; }
+.stagger-children > *:nth-child(5) { animation-delay: 400ms; }
+.stagger-children > *:nth-child(6) { animation-delay: 500ms; }
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* Preset typography: the page wrapper sets these vars from the style preset */
+[data-client-site] {
+  font-family: var(--font-body, var(--font-sans));
+  overflow-x: clip; /* reveal-left/right pre-transforms must not widen the page */
+}
+[data-client-site] :is(h1, h2, h3) {
+  font-family: var(--font-heading, inherit);
+}
+
+/* ---- Agency-grade motion + structure utilities ---- */
+
+/* Extend stagger to cover larger grids */
+.stagger-children > *:nth-child(7) { animation-delay: 600ms; }
+.stagger-children > *:nth-child(8) { animation-delay: 700ms; }
+.stagger-children > *:nth-child(9) { animation-delay: 800ms; }
+
+/* Respect reduced-motion for everything above */
+@media (prefers-reduced-motion: reduce) {
+  .reveal-item, .stagger-children > * {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    filter: none !important;
+  }
+}
+
+/* ============================================================
+   Craft layer — the motion vocabulary shared by every client site.
+   Reference build: agentcy.co (see .claude/skills/motion-craft).
+   Rules: everything is subtle, everything is interruptible, and
+   everything collapses cleanly under prefers-reduced-motion.
+   ============================================================ */
+
+/* --- Film grain. One tiled SVG noise, no image request. Sits over
+   photography and colour panels to kill banding and add texture. --- */
+.grain::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.16;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+}
+
+/* --- Accent word: one word inside a headline gets the display italic and
+   the accent colour. The cheapest way to stop a headline reading as a
+   template. Never more than one word per headline. --- */
+.accent-word {
+  font-family: var(--font-heading), serif;
+  font-style: italic;
+  color: var(--accent);
+  padding-right: 0.06em;
+}
+
+/* --- Soft press: the tactile default for anything clickable. A small, quick
+   scale-down on press with a spring back. This is the "haptic" — you feel the
+   button take the click. Nothing sweeps, nothing flashes. --- */
+.press {
+  transition: transform 0.42s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.42s cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+.press:active { transform: scale(0.96); transition-duration: 0.09s; }
+
+/* --- Warm lift: cards rise on a soft, warm-tinted shadow rather than a hard
+   black one. Reads as paper on a table, not a UI panel. --- */
+.warm-lift { transition: transform 0.55s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.55s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.4s ease; }
+.warm-lift:hover { transform: translateY(-5px); box-shadow: 0 22px 45px -22px rgb(0 0 0 / 0.85), 0 0 34px -26px color-mix(in oklch, var(--accent) 70%, transparent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .press:active { transform: none; }
+  .warm-lift:hover { transform: none; }
+}

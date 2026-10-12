@@ -1,0 +1,817 @@
+/*
+ * The opening's move. Read Opening.tsx first for what it is; this file is how.
+ *
+ * ONE NUMBER. Everything that moves with the scroll reads `--ssop-p` — 0 the
+ * moment the stage pins to the top of the viewport, 1 the moment it releases —
+ * and expresses itself as transform and opacity only. Nothing downstream reads
+ * layout, nothing downstream is React state. Who writes it:
+ *   - a CSS scroll-driven animation on `.runway` (`animation-timeline: view()`)
+ *     wherever that is supported, so the browser samples the scroll position
+ *     itself and there is no listener at all;
+ *   - `use-scroll-progress.ts` everywhere else: one rAF-coalesced write per
+ *     frame. Both drivers produce the same value, so the rules below are the
+ *     same rules in every browser.
+ *
+ * REDUCED MOTION IS THE DEFAULT. The rules outside the
+ * `(prefers-reduced-motion: no-preference)` block ARE the reduced-motion
+ * composition: three tiles at rest on the colour field, no runway, no idle
+ * loops, and the paper section follows as a clean cut. The motion block layers
+ * the runway on top for everyone who has not asked for stillness. A browser too
+ * old to know the media query gets the still composition as well, which is the
+ * right failure.
+ *
+ * PHASES of --ssop-p (the runway is 190vh of scroll on desktop, 170vh on a phone):
+ *   before 0   the stage slides up under the headline with the tiles ALREADY
+ *              partly in — feed a third of the way into frame and leaning,
+ *              ticket's top a quarter of the way up from the stage's bottom
+ *              edge with its first lines printing, special faint and small — so
+ *              a visitor sees them peek up as screen one leaves, not a screen
+ *              of flat colour. (agentcy's tiles are rising while its hero goes.)
+ *   0.00–0.32  entries  — feed finishes drifting in from the left, ticket rises
+ *                          the rest of the way (paper out of a printer slot),
+ *                          special scales up. Staggered, each eased out.
+ *   0.32–0.50  hold     — the three sit and idle-animate.
+ *   0.50–0.72  converge — the flanks slide behind the ticket, shrink, fade.
+ *              0.50–0.62: a still, fully printed copy of the ticket crossfades
+ *                          over the idling one, so whatever phase the print loop
+ *                          is in, the tile that becomes the page is printed.
+ *   0.60–1.00  zoom     — the ticket scales (quadratic ease-in) until its paper
+ *                          fills the viewport; its print fades 0.80–0.94. The
+ *                          backing sheet of the same paper comes in late and
+ *                          fast, 0.86–0.94, so the strips beside the growing
+ *                          ticket stay paprika until the paper is visibly
+ *                          swallowing the frame.
+ *   0.88–1.00  heading  — the next section's eyebrow and headline rise inside
+ *                          the paper, in the stage's lower third, and hold at
+ *                          1.0 so the release carries them up with the paper.
+ *                          The copy is the SAME string the section renders
+ *                          (config.ts, one const); the section's own heading is
+ *                          screen-reader-only while motion is on, its top
+ *                          padding is dropped, and `scroll-margin-top` makes the
+ *                          #what-we-do anchor land with the risen heading in view.
+ *
+ * IDLE LOOPS START ON ARRIVAL. Every idle animation is paused at its first
+ * frame until the runway's top crosses the lower part of the viewport
+ * (Opening.tsx adds `.live` from one IntersectionObserver). So the feed card
+ * slides into its tile as the tile drifts in, the ticket prints as it rises,
+ * the special types as it scales up — instead of each loop being caught at a
+ * random phase by whoever happens to scroll.
+ */
+
+/* Registered so a scroll timeline can interpolate it. Registration is global by
+   nature, hence the prefix. */
+@property --ssop-p {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
+}
+
+/* The risen heading's box: a fixed height (content sits at its bottom) and the
+   gap between it and the section's first hairline. Global on purpose — the
+   stage (inside the runway) and the section after it (outside) both need them,
+   because the section's scroll-margin is their sum. */
+:root {
+  --ssop-rise-h: 9.5rem;
+  --ssop-rise-b: 2.5rem;
+}
+@media (min-width: 640px) {
+  :root { --ssop-rise-h: 11rem; --ssop-rise-b: 3rem; }
+}
+@media (min-width: 768px) {
+  :root { --ssop-rise-h: 12.5rem; }
+}
+
+/* ------------------------------------------------------------------------ */
+/* The still composition (default, and the reduced-motion branch)            */
+/* ------------------------------------------------------------------------ */
+
+.runway {
+  position: relative;
+  padding: 2rem 1.5rem 6rem;
+  /* Tunables, per breakpoint. Read by both the still and the moving layouts. */
+  --runway: 170vh;
+  --s1: 2.6;            /* the ticket's final scale: enough to cover the viewport */
+  --fw: 228px;          /* feed card width */
+  --mw: 236px;          /* special card width */
+  --tw: 268px;          /* ticket width, approximately (its true width is 32ch) */
+  --gap: 2.5rem;
+  --ty: 6svh;           /* the ticket sits a touch low so the fan can peek above it */
+  --ey: 40svh;          /* how far below its rest the ticket starts: its top a quarter of
+                           the way up from the stage's bottom edge, first lines showing
+                           before the pin. The phone ticket is taller relative to the
+                           stage, so it starts a little higher than the desktop one. */
+  --tkfs: 12.5px;       /* ticket type size; 32 columns of it sets the ticket width */
+  --tkd: 6.4s;          /* idle loop lengths — deliberately not multiples of one another */
+  --fdd: 7.6s;
+  --mnd: 8s;
+}
+@media (min-width: 640px) {
+  .runway { --s1: 3.4; --fw: 300px; --mw: 290px; --tw: 290px; --ty: 5svh; --tkfs: 13px; }
+}
+@media (min-width: 1024px) {
+  .runway { --runway: 190vh; --s1: 7; --fw: 340px; --mw: 320px; --ty: 0px; --ey: 48svh; }
+}
+@media (min-width: 1920px) {
+  .runway { --s1: 9.5; }
+}
+
+.stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2.5rem;
+  margin: 0 auto;
+  max-width: 72rem;
+}
+@media (min-width: 1024px) {
+  .stage { flex-direction: row; justify-content: center; align-items: center; gap: var(--gap); }
+}
+
+.tile { position: relative; flex: 0 0 auto; }
+.feed { width: var(--fw); }
+.menu { width: var(--mw); }
+.paper { display: none; }
+/* The risen heading and the section-side handoff classes only exist under
+   motion; in the still composition the section renders its own heading with
+   its normal padding, exactly as before. */
+.rise { display: none; }
+
+.caption {
+  margin-top: 1rem;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: color-mix(in oklch, var(--accent-foreground) 72%, transparent);
+}
+
+/* ------------------------------------------------------------------------ */
+/* The runway                                                                 */
+/* ------------------------------------------------------------------------ */
+
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .runway {
+      animation: progress linear both;
+      /* After the shorthand, which resets it. `view(0px)` rather than `view()`:
+         the default inset is the scroller's scroll-padding, and this page sets
+         scroll-padding-top for its anchors, which would start the timeline
+         5rem early. */
+      animation-timeline: view(0px);
+      /* For a subject taller than the viewport: 0% when its top edge reaches
+         the top of the viewport, 100% when its bottom edge reaches the bottom.
+         Exactly the sticky stage's pinned life. */
+      animation-range: contain 0% contain 100%;
+    }
+  }
+}
+@keyframes progress {
+  from { --ssop-p: 0; }
+  to { --ssop-p: 1; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .runway {
+    height: calc(100svh + var(--runway));
+    padding: 0;
+  }
+
+  .stage {
+    position: sticky;
+    top: 0;
+    display: block;
+    height: 100svh;
+    max-width: none;
+    margin: 0;
+    overflow: clip;
+
+    /* Phase variables. Unregistered on purpose: they stay token streams and are
+       evaluated where they are finally used, inside a transform or an opacity. */
+    --e1: clamp(0, calc(var(--ssop-p) / 0.2), 1);
+    --e2: clamp(0, calc((var(--ssop-p) - 0.06) / 0.22), 1);
+    --e3: clamp(0, calc((var(--ssop-p) - 0.12) / 0.2), 1);
+    --c: clamp(0, calc((var(--ssop-p) - 0.5) / 0.22), 1);
+    --hold: clamp(0, calc((var(--ssop-p) - 0.5) / 0.12), 1);
+    --z: clamp(0, calc((var(--ssop-p) - 0.6) / 0.4), 1);
+    --f: clamp(0, calc((var(--ssop-p) - 0.8) / 0.14), 1);
+    --b: clamp(0, calc((var(--ssop-p) - 0.86) / 0.08), 1);
+    --r: clamp(0, calc((var(--ssop-p) - 0.88) / 0.12), 1);
+    /* Eased: quadratic ease-out for the entries and the heading, smoothstep
+       for the converge. */
+    --e1o: calc(1 - (1 - var(--e1)) * (1 - var(--e1)));
+    --e2o: calc(1 - (1 - var(--e2)) * (1 - var(--e2)));
+    --e3o: calc(1 - (1 - var(--e3)) * (1 - var(--e3)));
+    --ro: calc(1 - (1 - var(--r)) * (1 - var(--r)));
+    --co: calc(var(--c) * var(--c) * (3 - 2 * var(--c)));
+  }
+
+  /* Every tile is placed from the stage centre by --fx/--fy (its resting spot)
+     and rotated --fr; the converge vector --cx/--cy is simply the way back to
+     the ticket's centre. `translate` does the placement, `transform` the move,
+     and the two compose without either knowing about the other. */
+  .tile {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    translate: calc(-50% + var(--fx, 0px)) calc(-50% + var(--fy, 0px));
+    will-change: transform, opacity;
+    --cx: calc(0px - var(--fx, 0px));
+    --cy: calc(var(--ty) - var(--fy, 0px));
+  }
+
+  /* Phone / tablet: a fan. The two flanks sit up and out behind the ticket,
+     rotated away from it, so what shows of each is the corner that carries its
+     motion — the chime on the feed, the price and the live dot on the special.
+
+     Below 640px the cards are a little narrower than in the still column (the
+     fan needs the room) and are placed from the viewport EDGES rather than the
+     centre, so a card's rotated outer corner stays inside the viewport on any
+     phone width: a card bleeding off the edge would be fine, a clipped glyph
+     reads as a bug. The feed's centre sits at 124px — a 216px card at -4deg
+     puts its top-left corner at x≈5px — and the special's at 100vw - 122px. */
+  .stage { --fw: 216px; --mw: 224px; }
+  .feed { --fx: calc(-50vw + 124px); --fy: -19svh; --fr: -4deg; z-index: 1; }
+  .menu { --fx: calc(50vw - 122px); --fy: -17svh; --fr: 5deg; z-index: 1; }
+  .ticket { --fx: 0px; --fy: var(--ty); z-index: 2; }
+  @media (max-width: 639px) {
+    .stage .mnEyebrow { letter-spacing: 0.18em; }
+  }
+  @media (min-width: 640px) {
+    .stage { --fw: inherit; --mw: inherit; }
+    .feed { --fx: -24vw; --fy: -17svh; --fr: -7deg; }
+    .menu { --fx: 24vw; --fy: -15svh; }
+  }
+  /* Desktop: a row. */
+  @media (min-width: 1024px) {
+    .feed { --fx: calc(0px - (var(--tw) / 2 + var(--gap) + var(--fw) / 2)); --fy: 0px; --fr: 0deg; }
+    .menu { --fx: calc(var(--tw) / 2 + var(--gap) + var(--mw) / 2); --fy: 0px; --fr: 0deg; }
+  }
+
+  /* The order arrives: in from the left, settling out of a lean. At p=0 a third
+     of the card is already inside the viewport — the start offset is measured
+     from the card's resting left edge (50vw + --fx - --fw/2), so it is the same
+     third at every width — at 0.6 opacity. */
+  .feed {
+    transform:
+      translate3d(
+        calc(-1 * (50vw + var(--fx) + 0.15 * var(--fw)) * (1 - var(--e1o)) + var(--cx) * var(--co)),
+        calc(var(--cy) * var(--co)),
+        0
+      )
+      rotate(calc(var(--fr) * (1 - var(--co)) - 6deg * (1 - var(--e1o))))
+      scale(calc(1 - 0.22 * var(--co)));
+    opacity: min(calc(0.6 + 0.4 * var(--e1)), calc(1 - var(--c) * 1.3));
+  }
+
+  /* The ticket prints: up from below, the way paper leaves a printer. At p=0
+     its top is already about a quarter of the way up from the stage's bottom
+     edge, first lines printing. */
+  .ticket {
+    transform: translate3d(0, calc(var(--ey) * (1 - var(--e2o))), 0);
+  }
+  /* …and becomes the page. Quadratic in --z: slow to start, then it swallows
+     the frame. Its own element, so the entry translate above and this scale
+     never fight over one transform. No `will-change` here on purpose: Chrome
+     rasterises a will-change layer once and scales the bitmap, which turned the
+     print soft by 2×; without it the ticket repaints at each scale and stays
+     crisp — measured, see the frame-time probe in the report. */
+  .zoom {
+    transform: scale(calc(1 + var(--z) * var(--z) * (var(--s1) - 1)));
+  }
+
+  /* The menu goes live: scales up from small, with a short lift. At p=0 it is
+     already there, faint, at 0.7. */
+  .menu {
+    transform:
+      translate3d(
+        calc(var(--cx) * var(--co)),
+        calc(6svh * (1 - var(--e3o)) + var(--cy) * var(--co)),
+        0
+      )
+      rotate(calc(var(--fr) * (1 - var(--co))))
+      scale(calc(0.7 + 0.3 * var(--e3o) - 0.22 * var(--co)));
+    opacity: min(calc(0.35 + 0.65 * var(--e3)), calc(1 - var(--c) * 1.3));
+  }
+
+  /* The next section's heading, risen inside the paper: bottom-anchored in
+     the stage's lower third, a fixed-height box with the type at its foot so
+     the section after the runway can compute where it is. Above the ticket
+     (z 2) and the backing sheet (z 0). Same ease as the entries. */
+  .rise {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: var(--ssop-rise-b);
+    height: var(--ssop-rise-h);
+    z-index: 3;
+    padding: 0 1.5rem;
+    transform: translate3d(0, calc(28px * (1 - var(--ro))), 0);
+    opacity: var(--r);
+    will-change: transform, opacity;
+  }
+
+  /* The section after the runway (Statement.tsx, `handoff`). Unlayered rules,
+     so they outrank the section's Tailwind utilities without !important: its
+     own heading goes screen-reader-only (the stage's copy is the visual one and
+     the stage is aria-hidden, so exactly one heading is exposed), the top
+     padding and the list's margin go, and the anchor lands with the risen
+     heading under the nav: scroll-padding-top (5rem, global) clears the nav,
+     this clears the heading and its gap. */
+  .handoffSection {
+    padding-top: 0;
+    scroll-margin-top: calc(var(--ssop-rise-h) + var(--ssop-rise-b));
+  }
+  .handoffHeading {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .handoffList { margin-top: 0; }
+
+  /* The backing sheet. Same paper as the ticket, behind everything; it only
+     ever shows where the ticket's scaled paper has not reached yet. */
+  .paper {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background: var(--background);
+    opacity: var(--b);
+    will-change: opacity;
+  }
+
+  .caption {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    margin-top: 1.1rem;
+    white-space: nowrap;
+  }
+  /* Gone with the converge, and gone the instant the zoom begins — the growing
+     paper would otherwise pass over a half-faded caption. */
+  .ticket .caption { opacity: min(calc(1 - var(--co)), calc(1 - var(--z) * 12)); }
+  @media (max-width: 1023px) {
+    .caption { display: none; }
+  }
+
+  /* The scroll-driven fade of the ticket's print. Its own element: the idle
+     feed-out animation below also animates opacity, and an animation would
+     override a declaration on the same box. */
+  .tkFade { opacity: calc(1 - var(--f)); }
+
+  /* The still copy: the finished ticket on its own opaque paper, laid exactly
+     over the idling print and brought up as the converge begins. Extends into
+     the paper's padding so a line mid feed-out cannot peek past its edge; the
+     paper's mask still cuts it at the perforation. */
+  /* `.stage` in the selector on purpose: the base vignette rules further down
+     the file hide this layer, and a same-specificity later rule would win. */
+  .stage .tkStill {
+    display: block;
+    position: absolute;
+    inset: -1.5em -1.2em -2.4em;
+    margin: 0;
+    padding: 1.5em 1.2em 2.4em;
+    background: var(--background);
+    opacity: var(--hold);
+  }
+
+  /* Idle loops wait, paused on their first frame, until the runway arrives. */
+  .runway:not(.live) .stage * { animation-play-state: paused; }
+
+  /* ---------------------------------------------------------------------- */
+  /* Idle loops. Time-driven, gentle, each pointed at what its tile depicts.  */
+  /* Base styles (outside this block) are the finished states, so the still   */
+  /* composition shows every vignette complete.                               */
+  /* ---------------------------------------------------------------------- */
+
+  /* Ticket: lines appear in order (printed text appears, it does not fade),
+     the finished ticket holds, then the printer feeds it out and a blank
+     length of roll waits for the next order. */
+  .tkPrint { animation: tkFeed var(--tkd) cubic-bezier(0.4, 0, 0.6, 1) infinite both; }
+  @keyframes tkFeed {
+    0%, 78% { transform: none; opacity: 1; }
+    84%, 100% { transform: translate3d(0, -16px, 0); opacity: 0; }
+  }
+  .tl {
+    animation: tkLine var(--tkd) steps(1, end) infinite both;
+    animation-delay: calc(var(--i) * 0.1s + 0.6s);
+  }
+  @keyframes tkLine {
+    0% { opacity: 0; }
+    1%, 82% { opacity: 1; }
+    82.01%, 100% { opacity: 0; }
+  }
+
+  /* Feed: the card slides into the feed, chimes three times (the rings), the
+     Accept pill takes the tap — the .press haptic, then the fill that marks it
+     committed — the status flips, the card's accent border goes quiet. */
+  .fdIn { animation: fdIn var(--fdd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes fdIn {
+    0% { transform: translate3d(28px, 0, 0); opacity: 0; }
+    6%, 90% { transform: none; opacity: 1; }
+    95%, 100% { transform: translate3d(-10px, 0, 0); opacity: 0; }
+  }
+  .fdCard { animation: fdBorder var(--fdd) linear infinite both; }
+  @keyframes fdBorder {
+    0%, 52% { border-color: var(--accent); }
+    56%, 100% { border-color: var(--border); }
+  }
+  .fdRing { animation: fdRing var(--fdd) cubic-bezier(0.2, 0.6, 0.4, 1) infinite both; }
+  .fdRing2 { animation-delay: calc(var(--fdd) * 0.035); }
+  @keyframes fdRing {
+    0%, 6% { transform: scale(0.4); opacity: 0; }
+    6.5% { transform: scale(0.4); opacity: 0.75; }
+    21% { transform: scale(3.2); opacity: 0; }
+    21.5% { transform: scale(0.4); opacity: 0.75; }
+    36% { transform: scale(3.2); opacity: 0; }
+    36.5% { transform: scale(0.4); opacity: 0.75; }
+    51% { transform: scale(3.2); opacity: 0; }
+    100% { transform: scale(0.4); opacity: 0; }
+  }
+  .fdNew { animation: fdNew var(--fdd) steps(1, end) infinite both; }
+  @keyframes fdNew {
+    0%, 53% { opacity: 1; }
+    53.01%, 100% { opacity: 0; }
+  }
+  .fdAcc { animation: fdAcc var(--fdd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes fdAcc {
+    0%, 53% { opacity: 0; transform: translateY(4px); }
+    57%, 100% { opacity: 1; transform: none; }
+  }
+  .fdBtn { animation: fdBtn var(--fdd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes fdBtn {
+    0%, 50% { transform: none; background-color: transparent; color: var(--accent); }
+    51.5% { transform: scale(0.93); background-color: var(--accent); color: var(--accent-foreground); }
+    54%, 100% { transform: none; background-color: var(--accent); color: var(--accent-foreground); }
+  }
+
+  /* Special: the name types (a steady caret, then two blinks), the price sets
+     itself digit by digit, the description lands, the allergen pill pops, the
+     live dot comes on with one soft ring. Then it clears for the next one. */
+  .mnIn { animation: mnIn var(--mnd) ease infinite both; }
+  @keyframes mnIn {
+    0%, 88% { opacity: 1; }
+    93%, 100% { opacity: 0; }
+  }
+  /* The typing layer only exists under motion: a hidden ghost sizes the box,
+     the visible copy sits on it clipped to an animated width, its right border
+     is the caret. The still composition renders the name as plain text. */
+  .stage .mnGhost { display: inline; }
+  .stage .mnName {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    border-right: 2px solid transparent;
+    animation:
+      mnType var(--mnd) steps(9, end) infinite both,
+      mnCaret var(--mnd) steps(1, end) infinite both;
+  }
+  @keyframes mnType {
+    0%, 4% { width: 0; }
+    24%, 100% { width: 100%; }
+  }
+  @keyframes mnCaret {
+    0%, 26% { border-right-color: var(--background); }
+    26.01%, 28% { border-right-color: transparent; }
+    28.01%, 30% { border-right-color: var(--background); }
+    30.01%, 32% { border-right-color: transparent; }
+    32.01%, 34% { border-right-color: var(--background); }
+    34.01%, 100% { border-right-color: transparent; }
+  }
+  .mnCol { animation: mnRoll var(--mnd) cubic-bezier(0.2, 0.7, 0.2, 1) infinite both; }
+  @keyframes mnRoll {
+    0%, 24% { transform: translateY(0); }
+    36%, 100% { transform: translateY(calc(var(--d) * -1em)); }
+  }
+  .mnDesc { animation: mnDesc var(--mnd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes mnDesc {
+    0%, 34% { opacity: 0; transform: translateY(6px); }
+    42%, 100% { opacity: 1; transform: none; }
+  }
+  .mnPill { animation: mnPop var(--mnd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes mnPop {
+    0%, 46% { opacity: 0; transform: scale(0.6); }
+    50% { opacity: 1; transform: scale(1.06); }
+    53%, 100% { opacity: 1; transform: none; }
+  }
+  .mnLiveDot { animation: mnLive var(--mnd) cubic-bezier(0.16, 1, 0.3, 1) infinite both; }
+  @keyframes mnLive {
+    0%, 58% { opacity: 0; transform: scale(0); }
+    61% { opacity: 1; transform: scale(1.35); }
+    64%, 100% { opacity: 1; transform: none; }
+  }
+  .mnLiveRing { animation: mnLiveRing var(--mnd) cubic-bezier(0.2, 0.6, 0.4, 1) infinite both; }
+  @keyframes mnLiveRing {
+    0%, 61% { transform: scale(0.5); opacity: 0; }
+    62% { transform: scale(0.5); opacity: 0.6; }
+    76%, 100% { transform: scale(3); opacity: 0; }
+  }
+  .mnLiveLabel { animation: mnLiveLabel var(--mnd) ease infinite both; }
+  @keyframes mnLiveLabel {
+    0%, 60% { opacity: 0; }
+    65%, 100% { opacity: 1; }
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* The three vignettes. Type and colour, inside the page's own palette.      */
+/* ------------------------------------------------------------------------ */
+
+/* --- The ticket. 32 columns of monospace on a torn length of paper. The
+   paper IS the page colour: that is what makes the fill seamless. The ink is
+   thermal — soft, not pure. No border, no shadow: nothing to fade but print. */
+.tkPaper {
+  position: relative;
+  width: calc(32ch + 2.4em);
+  padding: 1.5em 1.2em 2.4em;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: var(--tkfs);
+  line-height: 1.5;
+  color: color-mix(in oklch, var(--foreground) 84%, var(--background));
+  background: var(--background);
+  border-radius: 6px 6px 0 0;
+  /* The perforation: a sawtooth cut along the bottom edge. */
+  --zz: 7px;
+  mask:
+    linear-gradient(#000 0 0) top / 100% calc(100% - var(--zz)) no-repeat,
+    conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(var(--zz) * 2) var(--zz) repeat-x;
+}
+.tkFade { position: relative; }
+.tkPrint,
+.tkStill {
+  margin: 0;
+  font: inherit;
+  white-space: pre;
+}
+.tkStill { display: none; }
+.tl { display: block; }
+
+/* --- The feed card. Paper, ink, and the accent spent on exactly one thing:
+   the order is NEW. */
+.fdCard {
+  position: relative;
+  width: 100%;
+  padding: 1rem 1.05rem 1.05rem;
+  background: var(--background);
+  color: var(--foreground);
+  border: 1.5px solid var(--accent);
+  border-radius: 14px;
+  box-shadow: 0 30px 60px -36px rgb(0 0 0 / 0.55);
+}
+.fdEyebrow,
+.mnEyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+}
+.fdEyebrow { color: color-mix(in oklch, var(--foreground) 45%, transparent); }
+.fdTop {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  margin-top: 0.55rem;
+}
+.fdCode {
+  font-family: var(--font-heading), var(--font-body), sans-serif;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+.fdStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.fdDotWrap {
+  position: relative;
+  flex: none;
+  width: 8px;
+  height: 8px;
+}
+.fdDot {
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: var(--accent);
+}
+.fdRing {
+  position: absolute;
+  inset: -6px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--accent);
+  opacity: 0;
+  transform: scale(0.4);
+}
+.fdStatusText { display: grid; }
+.fdNew,
+.fdAcc { grid-area: 1 / 1; }
+.fdAcc { opacity: 0; }
+.fdWait {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: color-mix(in oklch, var(--foreground) 55%, transparent);
+}
+.fdWho {
+  margin: 0.4rem 0 0.75rem;
+  font-size: 12px;
+  color: color-mix(in oklch, var(--foreground) 55%, transparent);
+}
+.fdLines {
+  list-style: none;
+  margin: 0;
+  padding: 0.7rem 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 0.55rem;
+}
+.fdLine {
+  display: flex;
+  gap: 0.6rem;
+  font-size: 13.5px;
+  line-height: 1.3;
+}
+.fdQty {
+  flex: none;
+  min-width: 1.6rem;
+  font-weight: 700;
+}
+.fdDish { display: block; font-weight: 600; }
+.fdMods {
+  display: block;
+  margin-top: 0.1rem;
+  font-size: 12px;
+  color: color-mix(in oklch, var(--foreground) 58%, transparent);
+}
+.fdMoney {
+  margin: 0.7rem 0 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.fdBtns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+}
+.fdBtn,
+.fdBump {
+  display: inline-flex;
+  align-items: center;
+  height: 2rem;
+  padding: 0 0.9rem;
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.fdBtn {
+  border: 1.5px solid var(--accent);
+  color: var(--accent);
+  background-color: transparent;
+}
+.fdBump {
+  border: 1px solid var(--border);
+  color: color-mix(in oklch, var(--foreground) 55%, transparent);
+}
+/* The real board offers three bumps; a 228px card has room for one. */
+@media (max-width: 639px) {
+  .fdBumpWide { display: none; }
+  .mnEyebrow { letter-spacing: 0.2em; }
+}
+
+/* --- The special. Ink ground, paper type. */
+.mnCard {
+  position: relative;
+  width: 100%;
+  padding: 1.1rem 1.15rem 1.2rem;
+  background: var(--foreground);
+  color: var(--background);
+  border-radius: 14px;
+  box-shadow: 0 30px 60px -36px rgb(0 0 0 / 0.6);
+}
+.mnEyebrow { color: color-mix(in oklch, var(--background) 55%, transparent); }
+.mnIn {
+  position: relative;
+  margin-top: 1.1rem;
+}
+.mnLiveWrap {
+  position: absolute;
+  right: 0;
+  top: -2.2rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: color-mix(in oklch, var(--background) 80%, transparent);
+}
+.mnLiveDotWrap {
+  position: relative;
+  width: 8px;
+  height: 8px;
+}
+.mnLiveDot,
+.mnLiveRing {
+  position: absolute;
+  border-radius: 9999px;
+}
+.mnLiveDot {
+  inset: 0;
+  background: oklch(0.72 0.17 148);
+}
+.mnLiveRing {
+  inset: -5px;
+  border: 1.5px solid oklch(0.72 0.17 148);
+  opacity: 0;
+}
+.mnNameBox {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  font-family: var(--font-heading), var(--font-body), sans-serif;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+.mnGhost {
+  display: none;
+  visibility: hidden;
+  white-space: nowrap;
+  padding-right: 2px;
+}
+.mnName { white-space: nowrap; }
+.mnPrice {
+  display: flex;
+  align-items: baseline;
+  margin-top: 0.5rem;
+  font-family: var(--font-heading), var(--font-body), sans-serif;
+  font-size: 1.35rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+.mnDigit {
+  display: inline-block;
+  height: 1em;
+  overflow: hidden;
+  line-height: 1;
+}
+.mnCol {
+  display: block;
+  transform: translateY(calc(var(--d) * -1em));
+}
+.mnCol > span {
+  display: block;
+  height: 1em;
+  line-height: 1;
+}
+.mnDesc {
+  margin: 0.85rem 0 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: color-mix(in oklch, var(--background) 68%, transparent);
+}
+.mnTags {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.9rem;
+}
+.mnPill {
+  display: inline-flex;
+  align-items: center;
+  height: 1.6rem;
+  padding: 0 0.65rem;
+  border-radius: 9999px;
+  border: 1px solid color-mix(in oklch, var(--background) 32%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
